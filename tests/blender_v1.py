@@ -40,6 +40,17 @@ def _cube(name: str, location=(0.0, 0.0, 0.0)):
     return obj
 
 
+def _plane(name: str, location=(0.0, 0.0, 0.0)):
+    bpy.ops.mesh.primitive_plane_add(size=2.0, location=location)
+    obj = bpy.context.object
+    obj.name = name
+    while obj.data.uv_layers:
+        obj.data.uv_layers.remove(obj.data.uv_layers[0])
+    for edge in obj.data.edges:
+        edge.use_seam = False
+    return obj
+
+
 def _linked_copy(source, name: str, location):
     obj = source.copy()
     obj.data = source.data
@@ -68,6 +79,9 @@ def _configure() -> None:
     settings.create_new_uv_layer = True
     settings.uv_layer_name = "AutoUV"
     settings.island_margin = 0.003
+    settings.texture_resolution = "1024"
+    settings.padding_pixels = 12
+    settings.pack_shared_atlas = True
 
 
 def _assert_result(obj) -> None:
@@ -78,21 +92,124 @@ def _assert_result(obj) -> None:
     quality = json.loads(obj[QUALITY_PROPERTY])
     texture_job = json.loads(obj[TEXTURE_JOB_PROPERTY])
     assert quality["triangle_count"] > 0, f"{obj.name}: 품질 삼각형 수가 없습니다."
-    assert texture_job["schema_version"] == "1.2", f"{obj.name}: TextureJob 버전 오류"
+    assert texture_job["schema_version"] == "1.4", f"{obj.name}: TextureJob 버전 오류"
     assert texture_job["object_name"] == obj.name_full, f"{obj.name}: 객체 이름 계약 오류"
     assert texture_job["mesh_hash"], f"{obj.name}: mesh hash가 없습니다."
-    assert texture_job["target_resolution"] == [2048, 2048]
-    assert texture_job["requested_padding"] == 16
+    settings = bpy.context.scene.uvmapping_settings
+    resolution = int(settings.texture_resolution)
+    padding = int(settings.padding_pixels)
+    margin = padding / resolution
+    assert texture_job["target_resolution"] == [resolution, resolution]
+    assert texture_job["requested_padding"] == padding
     assert texture_job["requested_udim_tiles"] == [1001]
-    assert texture_job["packing_margin_method"] == "SCALED"
-    assert abs(texture_job["packing_margin_uv"] - 0.003) < 1.0e-6
+    assert texture_job["packing_margin_method"] == "FRACTION"
+    assert abs(texture_job["packing_margin_uv"] - margin) < 1.0e-6
     contract_settings = texture_job["settings"]
-    assert contract_settings["packing_margin_method"] == "SCALED"
-    assert abs(contract_settings["packing_margin_uv"] - 0.003) < 1.0e-6
+    assert contract_settings["packing_margin_method"] == "FRACTION"
+    assert abs(contract_settings["packing_margin_uv"] - margin) < 1.0e-6
+    assert contract_settings["pack_shared_atlas"] == settings.pack_shared_atlas
     generation_target = contract_settings["generation_target"]
-    assert generation_target["resolution"] == [2048, 2048]
-    assert generation_target["padding_pixels"] == 16
+    assert generation_target["resolution"] == [resolution, resolution]
+    assert generation_target["padding_pixels"] == padding
     assert generation_target["udim_tiles"] == [1001]
+    assert texture_job["atlas_id"], f"{obj.name}: atlas ID가 없습니다."
+    assert texture_job["atlas_hash"], f"{obj.name}: atlas hash가 없습니다."
+    assert texture_job["atlas_member_id"], f"{obj.name}: atlas member ID가 없습니다."
+    assert texture_job["atlas_overlap_status"] == "EXACT"
+    assert texture_job["atlas_overlap_count"] == 0
+    assert texture_job["atlas_valid"] is True
+    assert texture_job["atlas_out_of_bounds_count"] == 0
+    assert texture_job["atlas_member_count"] >= 1
+    assert texture_job["atlas_triangle_count"] > 0
+    atlas_bounds = texture_job["atlas_bounds"]
+    assert 0.0 <= atlas_bounds[0][0] <= atlas_bounds[1][0] <= 1.0
+    assert 0.0 <= atlas_bounds[0][1] <= atlas_bounds[1][1] <= 1.0
+    assert texture_job["atlas_members"], f"{obj.name}: atlas member manifest가 없습니다."
+    assert all("global_island_id" in island for island in texture_job["islands"])
+    _assert_no_atlas_proxies()
+
+
+def _assert_no_atlas_proxies() -> None:
+    proxies = [
+        obj.name_full
+        for obj in bpy.data.objects
+        if obj.name.startswith("_UVMappingAtlas_")
+        or bool(obj.get("_uvmapping_atlas_proxy", False))
+    ]
+    assert not proxies, f"Atlas 임시 proxy가 남았습니다: {proxies}"
+
+
+def _texture_job(obj):
+    return json.loads(obj[TEXTURE_JOB_PROPERTY])
+
+
+def _assert_shared_atlas_contract(first, second) -> None:
+    first_job = _texture_job(first)
+    second_job = _texture_job(second)
+    assert first_job["atlas_id"] == second_job["atlas_id"]
+    assert first_job["atlas_hash"] == second_job["atlas_hash"]
+    assert first_job["atlas_members"] == second_job["atlas_members"]
+    assert len(first_job["atlas_members"]) == 2
+    assert first_job["atlas_member_id"] != second_job["atlas_member_id"]
+    assert first_job["pack_shared_atlas"] is True
+    assert second_job["pack_shared_atlas"] is True
+    for member in first_job["atlas_members"]:
+        assert member["mesh_name"]
+        assert member["object_names"]
+        assert "object_name" not in member
+    first_global_ids = {
+        island["global_island_id"] for island in first_job["islands"]
+    }
+    second_global_ids = {
+        island["global_island_id"] for island in second_job["islands"]
+    }
+    assert first_global_ids
+    assert second_global_ids
+    assert first_global_ids.isdisjoint(second_global_ids)
+
+
+def _uv_triangles(obj):
+    quality = importlib.import_module(f"{MODULE_NAME}.uvmapping.quality")
+    layer = obj.data.uv_layers.active
+    _, faces, _ = quality._extract_faces(obj.data, layer.name)
+    return quality._triangulate(faces)
+
+
+def _cross_object_overlap_count(first, second) -> int:
+    quality = importlib.import_module(f"{MODULE_NAME}.uvmapping.quality")
+    return sum(
+        quality._triangle_intersection_area(first_triangle.uvs, second_triangle.uvs)
+        > 1.0e-10
+        for first_triangle in _uv_triangles(first)
+        for second_triangle in _uv_triangles(second)
+    )
+
+
+def _assert_uv_unit_bounds(obj) -> None:
+    layer = obj.data.uv_layers.active
+    for loop in layer.data:
+        assert -1.0e-6 <= loop.uv.x <= 1.0 + 1.0e-6
+        assert -1.0e-6 <= loop.uv.y <= 1.0 + 1.0e-6
+
+
+def _uv_bbox(obj):
+    layer = obj.data.uv_layers.active
+    values = [(float(loop.uv.x), float(loop.uv.y)) for loop in layer.data]
+    return (
+        min(value[0] for value in values),
+        min(value[1] for value in values),
+        max(value[0] for value in values),
+        max(value[1] for value in values),
+    )
+
+
+def _bbox_separation(first, second) -> float:
+    return max(
+        second[0] - first[2],
+        first[0] - second[2],
+        second[1] - first[3],
+        first[1] - second[3],
+    )
 
 
 def _test_register_rollback() -> None:
@@ -154,7 +271,72 @@ def _test_independent_and_context_restore() -> None:
     assert first.data != second.data
     _assert_result(first)
     _assert_result(second)
+    _assert_uv_unit_bounds(first)
+    _assert_uv_unit_bounds(second)
+    assert _cross_object_overlap_count(first, second) == 0, (
+        "공유 아틀라스의 서로 다른 Mesh UV가 겹칩니다."
+    )
+    _assert_shared_atlas_contract(first, second)
     print("[v1] 독립 Mesh 다중 처리와 Edit Mode 상태 복원 통과")
+
+
+def _test_independent_pack_mode() -> None:
+    _clear_scene()
+    settings = bpy.context.scene.uvmapping_settings
+    settings.pack_shared_atlas = False
+    try:
+        first = _cube("IndependentPackA", (-2.0, 0.0, 0.0))
+        second = _cube("IndependentPackB", (2.0, 0.0, 0.0))
+        _select((first, second), active=first)
+        result = bpy.ops.uvmapping.auto_unwrap()
+        assert result == {"FINISHED"}, f"독립 패킹 실패: {result}"
+        _assert_result(first)
+        _assert_result(second)
+        _assert_uv_unit_bounds(first)
+        _assert_uv_unit_bounds(second)
+        first_job = _texture_job(first)
+        second_job = _texture_job(second)
+        assert first_job["atlas_id"] != second_job["atlas_id"]
+        assert first_job["atlas_member_id"] != second_job["atlas_member_id"]
+        assert first_job["pack_shared_atlas"] is False
+        assert second_job["pack_shared_atlas"] is False
+        assert len(first_job["atlas_members"]) == 1
+        assert len(second_job["atlas_members"]) == 1
+        assert first_job["atlas_members"][0]["bounds"]
+        assert second_job["atlas_members"][0]["bounds"]
+    finally:
+        settings.pack_shared_atlas = True
+    print("[v1] 독립 FRACTION 패킹 통과")
+
+
+def _test_shared_atlas_pixel_padding() -> None:
+    _clear_scene()
+    settings = bpy.context.scene.uvmapping_settings
+    assert settings.texture_resolution == "1024"
+    assert settings.padding_pixels == 12
+    assert settings.pack_shared_atlas is True
+    first = _plane("AtlasPaddingA", (-2.0, 0.0, 0.0))
+    second = _plane("AtlasPaddingB", (2.0, 0.0, 0.0))
+    _select((first, second), active=first)
+
+    result = bpy.ops.uvmapping.auto_unwrap()
+
+    assert result == {"FINISHED"}, f"Plane 공유 Atlas 패킹 실패: {result}"
+    _assert_result(first)
+    _assert_result(second)
+    _assert_uv_unit_bounds(first)
+    _assert_uv_unit_bounds(second)
+    assert _cross_object_overlap_count(first, second) == 0
+    _assert_shared_atlas_contract(first, second)
+    separation_pixels = _bbox_separation(
+        _uv_bbox(first), _uv_bbox(second)
+    ) * int(settings.texture_resolution)
+    assert separation_pixels >= settings.padding_pixels * 2 - 1.5, (
+        f"Atlas 아일랜드 간격이 부족합니다: {separation_pixels:.3f}px"
+    )
+    print(
+        f"[v1] 공유 Atlas 1024/12px 패딩 통과: {separation_pixels:.3f}px"
+    )
 
 
 def _test_shared_all_selected() -> None:
@@ -280,15 +462,42 @@ def _test_commit_rollback_injection() -> None:
     print("[v1] commit 실패 주입의 전체 binding/속성 롤백 통과")
 
 
+def _test_atlas_pack_failure_cleanup() -> None:
+    _clear_scene()
+    first = _cube("AtlasFailureA", (-2.0, 0.0, 0.0))
+    second = _cube("AtlasFailureB", (2.0, 0.0, 0.0))
+    originals = {first.as_pointer(): first.data, second.as_pointer(): second.data}
+    _select((first, second), active=first)
+
+    try:
+        result = bpy.ops.uvmapping.auto_unwrap(debug_fail_atlas_pack=1)
+    except RuntimeError as exc:
+        assert "테스트용 Atlas 패킹 실패" in str(exc), f"예상하지 못한 오류: {exc}"
+        result = {"CANCELLED"}
+
+    assert result == {"CANCELLED"}, f"Atlas 실패 주입이 취소되지 않았습니다: {result}"
+    for obj in (first, second):
+        assert obj.data == originals[obj.as_pointer()]
+        assert QUALITY_PROPERTY not in obj
+        assert TEXTURE_JOB_PROPERTY not in obj
+    assert bpy.context.view_layer.objects.active == first
+    assert first.select_get() and second.select_get()
+    _assert_no_atlas_proxies()
+    print("[v1] Atlas 패킹 실패의 원본 불변과 proxy 정리 통과")
+
+
 def main() -> None:
     _test_register_rollback()
     _configure()
     try:
         _test_independent_and_context_restore()
+        _test_shared_atlas_pixel_padding()
+        _test_independent_pack_mode()
         _test_shared_all_selected()
         _test_shared_partial_selection()
         _test_preview_does_not_change_seams()
         _test_finalize_failure_does_not_rollback()
+        _test_atlas_pack_failure_cleanup()
         _test_commit_rollback_injection()
     finally:
         _clear_scene()

@@ -6,10 +6,11 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 import json
-from math import isfinite, sqrt
+from math import isclose, isfinite, sqrt
 from typing import Any, Sequence
 
 from .quality import (
+    AtlasQualityReport,
     UVQualityReport,
     _EPSILON,
     _FaceData,
@@ -17,6 +18,7 @@ from .quality import (
     _signed_uv_area,
     _triangle_area_3d,
     _triangulate,
+    evaluate_atlas_quality,
 )
 
 
@@ -42,7 +44,7 @@ class TextureJob:
     uv_bounds: tuple[Vec2, Vec2]
     texel_density: dict[str, Any]
     quality: dict[str, Any]
-    addon_version: str = "1.0.0"
+    addon_version: str = "1.1.0"
     job_id: str = ""
     topology_hash: str = ""
     geometry_hash: str = ""
@@ -65,8 +67,21 @@ class TextureJob:
     target_resolution: tuple[int, int] = (2048, 2048)
     requested_padding: int = 16
     requested_udim_tiles: tuple[int, ...] = (1001,)
-    packing_margin_method: str | None = None
-    packing_margin_uv: float | None = None
+    packing_margin_method: str = "FRACTION"
+    packing_margin_uv: float = 0.0078125
+    pack_shared_atlas: bool = True
+    atlas_id: str = ""
+    atlas_hash: str = ""
+    atlas_member_id: str = ""
+    atlas_members: tuple[dict[str, Any], ...] = ()
+    global_island_offset: int = 0
+    atlas_overlap_status: str = "EXACT"
+    atlas_overlap_count: int = 0
+    atlas_valid: bool = False
+    atlas_out_of_bounds_count: int = 0
+    atlas_bounds: tuple[Vec2, Vec2] = ((0.0, 0.0), (0.0, 0.0))
+    atlas_member_count: int = 0
+    atlas_triangle_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """중첩 dataclass와 tuple을 JSON 인코더가 처리할 사전으로 바꾼다."""
@@ -366,6 +381,251 @@ def _default_guide_map_manifest(coordinate_space: str) -> dict[str, Any]:
     return {"schema_version": "1.0", "maps": maps}
 
 
+def _atlas_descriptor(value: Any) -> dict[str, Any]:
+    if isinstance(value, TextureJob):
+        return {
+            "member_id": value.atlas_member_id or value.object_name,
+            "island_count": len(value.islands),
+            "object_name": value.object_name,
+            "uv_layer_name": value.uv_layer_name,
+        }
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        return {"member_id": value[0], "island_count": value[1]}
+    raise TypeError(
+        "Atlas member descriptor는 TextureJob, mapping 또는 "
+        "(member_id, island_count)여야 합니다."
+    )
+
+
+def build_atlas_context(
+    report: AtlasQualityReport,
+    member_jobs_or_descriptors: Sequence[Any],
+    shared: bool,
+    atlas_id: str | None = None,
+) -> dict[str, Any]:
+    """Atlas 품질 결과와 member별 island 수를 전역 manifest로 결합한다."""
+
+    descriptors = [_atlas_descriptor(value) for value in member_jobs_or_descriptors]
+    normalized: dict[str, dict[str, Any]] = {}
+    for descriptor in descriptors:
+        member_id = str(descriptor.get("member_id", "")).strip()
+        if not member_id:
+            raise ValueError("Atlas member descriptor의 member_id가 비어 있습니다.")
+        if member_id in normalized:
+            raise ValueError("Atlas member descriptor의 member_id는 고유해야 합니다.")
+        island_count = int(descriptor.get("island_count", 0))
+        if island_count < 0:
+            raise ValueError("Atlas member의 island_count는 0 이상이어야 합니다.")
+        normalized[member_id] = {**descriptor, "member_id": member_id, "island_count": island_count}
+
+    report_ids = set(report.member_uv_hashes)
+    if set(normalized) != report_ids:
+        raise ValueError("Atlas report와 member descriptor의 member_id가 일치해야 합니다.")
+    offset = 0
+    members: list[dict[str, Any]] = []
+    for member_id in sorted(normalized):
+        descriptor = normalized[member_id]
+        island_count = descriptor["island_count"]
+        member = {
+            "member_id": member_id,
+            "uv_hash": report.member_uv_hashes[member_id],
+            "bounds": report.member_bounds[member_id],
+            "island_count": island_count,
+            "global_island_offset": offset,
+            "global_island_ids": tuple(range(offset, offset + island_count)),
+        }
+        for optional in ("object_name", "uv_layer_name", "mesh_name"):
+            if optional in descriptor:
+                member[optional] = descriptor[optional]
+        if "object_names" in descriptor:
+            raw_object_names = descriptor["object_names"]
+            if isinstance(raw_object_names, str):
+                raw_object_names = (raw_object_names,)
+            if not isinstance(raw_object_names, (tuple, list, set, frozenset)):
+                raise ValueError("Atlas member의 object_names는 문자열 목록이어야 합니다.")
+            member["object_names"] = tuple(
+                sorted(
+                    {
+                        str(object_name).strip()
+                        for object_name in raw_object_names
+                        if str(object_name).strip()
+                    }
+                )
+            )
+        members.append(member)
+        offset += island_count
+    resolved_atlas_id = str(atlas_id).strip() if atlas_id is not None else ""
+    if not resolved_atlas_id:
+        resolved_atlas_id = f"atlas-{report.atlas_hash[:16]}"
+    return {
+        "schema_version": "1.0",
+        "atlas_id": resolved_atlas_id,
+        "atlas_hash": report.atlas_hash,
+        "shared": bool(shared),
+        "valid": report.valid,
+        "bounds": report.bounds,
+        "member_count": report.member_count,
+        "triangle_count": report.triangle_count,
+        "out_of_bounds_count": report.out_of_bounds_count,
+        "overlap_status": report.overlap_status,
+        "overlap_count": report.overlap_pairs,
+        "members": tuple(members),
+        "global_island_count": offset,
+    }
+
+
+def _validated_atlas_bounds(value: Any, field_name: str) -> tuple[Vec2, Vec2]:
+    try:
+        lower, upper = value
+        result = (
+            (float(lower[0]), float(lower[1])),
+            (float(upper[0]), float(upper[1])),
+        )
+    except (IndexError, TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} 형식이 올바르지 않습니다.") from exc
+    return result
+
+
+def _validate_atlas_context(
+    context: Mapping[str, Any],
+    current_member_id: str,
+    current_uv_hash: str,
+    current_island_count: int,
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], dict[str, Any]]:
+    normalized = dict(context)
+    if normalized.get("schema_version") != "1.0":
+        raise ValueError("지원하지 않는 Atlas context schema_version입니다.")
+    atlas_id = str(normalized.get("atlas_id", "")).strip()
+    atlas_hash = str(normalized.get("atlas_hash", ""))
+    if not atlas_id or len(atlas_hash) != 64:
+        raise ValueError("Atlas context의 id 또는 hash가 올바르지 않습니다.")
+    if not isinstance(normalized.get("valid"), bool):
+        raise ValueError("Atlas context의 valid 값은 bool이어야 합니다.")
+    if not isinstance(normalized.get("shared"), bool):
+        raise ValueError("Atlas context의 shared 값은 bool이어야 합니다.")
+    atlas_bounds = _validated_atlas_bounds(normalized.get("bounds"), "Atlas bounds")
+    overlap_status = normalized.get("overlap_status")
+    if overlap_status not in {"EXACT", "BUDGET_EXCEEDED"}:
+        raise ValueError("Atlas context의 overlap_status가 올바르지 않습니다.")
+    for name in (
+        "out_of_bounds_count",
+        "overlap_count",
+        "member_count",
+        "triangle_count",
+        "global_island_count",
+    ):
+        value = normalized.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"Atlas context의 {name} 값이 올바르지 않습니다.")
+
+    raw_members = normalized.get("members")
+    if not isinstance(raw_members, (tuple, list)):
+        raise ValueError("Atlas context의 members 형식이 올바르지 않습니다.")
+    members: list[dict[str, Any]] = []
+    member_bounds: list[tuple[Vec2, Vec2]] = []
+    member_ids: set[str] = set()
+    global_ids: set[int] = set()
+    current_member = None
+    for raw_member in raw_members:
+        if not isinstance(raw_member, Mapping):
+            raise ValueError("Atlas member manifest는 mapping이어야 합니다.")
+        member = dict(raw_member)
+        member_id = str(member.get("member_id", "")).strip()
+        uv_hash = str(member.get("uv_hash", ""))
+        if not member_id or member_id in member_ids or len(uv_hash) != 64:
+            raise ValueError("Atlas member id 또는 uv_hash가 올바르지 않습니다.")
+        member_ids.add(member_id)
+        normalized_member_bounds = _validated_atlas_bounds(
+            member.get("bounds"), "Atlas member bounds"
+        )
+        member_bounds.append(normalized_member_bounds)
+        island_count = member.get("island_count")
+        offset = member.get("global_island_offset")
+        ids_value = member.get("global_island_ids")
+        if (
+            not isinstance(island_count, int)
+            or isinstance(island_count, bool)
+            or island_count < 0
+            or not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or offset < 0
+            or not isinstance(ids_value, (tuple, list))
+            or any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in ids_value
+            )
+        ):
+            raise ValueError("Atlas member island manifest가 올바르지 않습니다.")
+        ids = tuple(ids_value)
+        expected_ids = tuple(range(offset, offset + island_count))
+        if ids != expected_ids or any(value in global_ids for value in ids):
+            raise ValueError("Atlas global island ID가 중복되거나 offset과 다릅니다.")
+        global_ids.update(ids)
+        member["member_id"] = member_id
+        member["uv_hash"] = uv_hash
+        member["bounds"] = normalized_member_bounds
+        member["global_island_ids"] = ids
+        members.append(member)
+        if member_id == current_member_id:
+            current_member = member
+
+    if len(members) != normalized["member_count"]:
+        raise ValueError("Atlas member_count가 manifest와 일치하지 않습니다.")
+    expected_atlas_hash = _stable_digest(
+        {
+            "members": [
+                {"member_id": member["member_id"], "uv_hash": member["uv_hash"]}
+                for member in sorted(members, key=lambda item: item["member_id"])
+            ]
+        }
+    )
+    if atlas_hash != expected_atlas_hash:
+        raise ValueError("Atlas context의 atlas_hash가 member manifest와 다릅니다.")
+    if member_bounds:
+        expected_bounds = (
+            (
+                min(bounds[0][0] for bounds in member_bounds),
+                min(bounds[0][1] for bounds in member_bounds),
+            ),
+            (
+                max(bounds[1][0] for bounds in member_bounds),
+                max(bounds[1][1] for bounds in member_bounds),
+            ),
+        )
+        if atlas_bounds != expected_bounds:
+            raise ValueError("Atlas bounds가 member bounds를 포함한 범위와 다릅니다.")
+    computed_out_of_bounds = sum(
+        lower[0] < -_EPSILON
+        or lower[1] < -_EPSILON
+        or upper[0] > 1.0 + _EPSILON
+        or upper[1] > 1.0 + _EPSILON
+        for lower, upper in member_bounds
+    )
+    if normalized["out_of_bounds_count"] != computed_out_of_bounds:
+        raise ValueError("Atlas out_of_bounds_count가 member bounds와 다릅니다.")
+    if sorted(global_ids) != list(range(normalized["global_island_count"])):
+        raise ValueError("Atlas global island ID가 연속 범위를 이루지 않습니다.")
+    expected_valid = bool(members) and normalized["triangle_count"] > 0 and not (
+        normalized["overlap_count"]
+        or normalized["overlap_status"] != "EXACT"
+        or normalized["out_of_bounds_count"]
+    )
+    if normalized["valid"] != expected_valid:
+        raise ValueError("Atlas context의 valid 값이 품질 지표와 일치하지 않습니다.")
+    if current_member is None:
+        raise ValueError("atlas_context에서 현재 atlas_member_id를 찾을 수 없습니다.")
+    if current_member["uv_hash"] != current_uv_hash:
+        raise ValueError("atlas_context의 member uv_hash가 현재 UV와 일치하지 않습니다.")
+    if current_member["island_count"] != current_island_count:
+        raise ValueError("atlas_context의 island_count가 현재 메시와 일치하지 않습니다.")
+    normalized["atlas_id"] = atlas_id
+    normalized["atlas_hash"] = atlas_hash
+    normalized["members"] = tuple(members)
+    return normalized, tuple(members), current_member
+
+
 def build_texture_job(
     mesh: Any,
     object_name: str,
@@ -373,7 +633,7 @@ def build_texture_job(
     quality_report: UVQualityReport,
     seam_edges: Sequence[int],
     *,
-    addon_version: str = "1.0.0",
+    addon_version: str = "1.1.0",
     resolution: int | Sequence[int] = (2048, 2048),
     padding: int = 16,
     udim_tiles: Sequence[int] = (1001,),
@@ -381,8 +641,11 @@ def build_texture_job(
     coordinate_space: str = "OBJECT",
     settings: Mapping[str, Any] | None = None,
     guide_map_manifest: Mapping[str, Any] | None = None,
-    packing_margin_method: str | None = None,
+    packing_margin_method: str | None = "FRACTION",
     packing_margin_uv: float | None = None,
+    pack_shared_atlas: bool | None = None,
+    atlas_context: Mapping[str, Any] | None = None,
+    atlas_member_id: str | None = None,
 ) -> TextureJob:
     """검증된 UV 메시에서 결정론적인 텍스처 작업 계약을 만든다."""
 
@@ -402,27 +665,31 @@ def build_texture_job(
     normalized_margin_method = (
         str(packing_margin_method).strip().upper()
         if packing_margin_method is not None
-        else None
+        else "FRACTION"
     )
     if normalized_margin_method == "":
         raise ValueError("packing_margin_method 값은 비어 있을 수 없습니다.")
+    derived_margin_uv = normalized_padding / min(normalized_resolution)
     normalized_margin_uv = (
-        float(packing_margin_uv) if packing_margin_uv is not None else None
+        float(packing_margin_uv)
+        if packing_margin_uv is not None
+        else derived_margin_uv
     )
-    if normalized_margin_uv is not None and normalized_margin_uv < 0.0:
+    if normalized_margin_uv < 0.0:
         raise ValueError("packing_margin_uv 값은 0 이상이어야 합니다.")
-    settings_payload = {
-        "target_resolution": normalized_resolution,
-        "requested_padding": normalized_padding,
-        "requested_udim_tiles": normalized_udims,
-        "packing_margin_method": normalized_margin_method,
-        "packing_margin_uv": normalized_margin_uv,
-        "object_transform": normalized_transform,
-        "coordinate_space": normalized_space,
-        "settings": dict(settings or {}),
-    }
-    topology_hash, geometry_hash, uv_hash, settings_hash, mesh_hash = (
-        _content_hashes(vertices, faces, settings_payload)
+    if normalized_margin_method == "FRACTION" and not isclose(
+        normalized_margin_uv,
+        derived_margin_uv,
+        abs_tol=1.0e-12,
+    ):
+        raise ValueError(
+            "packing_margin_uv는 padding / resolution 값과 일치해야 합니다."
+        )
+    normalized_settings = dict(settings or {})
+    requested_shared_atlas = bool(
+        normalized_settings.get("pack_shared_atlas", True)
+        if pack_shared_atlas is None
+        else pack_shared_atlas
     )
     face_to_island, adjacency = _island_topology(
         mesh,
@@ -430,8 +697,65 @@ def build_texture_job(
         normalized_seams,
     )
     islands = _island_manifest(faces, face_to_island, adjacency)
+    current_uv_hash = _content_hashes(vertices, faces, {})[2]
+    normalized_member_id = str(atlas_member_id or object_name).strip()
+    if not normalized_member_id:
+        raise ValueError("atlas_member_id는 비어 있을 수 없습니다.")
+    if atlas_context is None:
+        atlas_report = evaluate_atlas_quality(
+            [(normalized_member_id, mesh, resolved_layer_name)]
+        )
+        resolved_atlas_context = build_atlas_context(
+            atlas_report,
+            [
+                {
+                    "member_id": normalized_member_id,
+                    "island_count": len(islands),
+                    "object_name": str(object_name),
+                    "uv_layer_name": resolved_layer_name,
+                }
+            ],
+            shared=requested_shared_atlas,
+        )
+    else:
+        resolved_atlas_context = dict(atlas_context)
+    resolved_atlas_context, atlas_members, atlas_member = _validate_atlas_context(
+        resolved_atlas_context,
+        normalized_member_id,
+        current_uv_hash,
+        len(islands),
+    )
+    global_island_offset = int(atlas_member.get("global_island_offset", 0))
+    islands = tuple(
+        {
+            **island,
+            "global_island_id": global_island_offset + int(island["island_id"]),
+        }
+        for island in islands
+    )
+    normalized_shared_atlas = bool(
+        resolved_atlas_context.get("shared", requested_shared_atlas)
+    )
+    settings_payload = {
+        "target_resolution": normalized_resolution,
+        "requested_padding": normalized_padding,
+        "requested_udim_tiles": normalized_udims,
+        "packing_margin_method": normalized_margin_method,
+        "packing_margin_uv": normalized_margin_uv,
+        "pack_shared_atlas": normalized_shared_atlas,
+        "object_transform": normalized_transform,
+        "coordinate_space": normalized_space,
+        "settings": normalized_settings,
+    }
+    topology_hash, geometry_hash, uv_hash, settings_hash, mesh_hash = (
+        _content_hashes(vertices, faces, settings_payload)
+    )
+    if uv_hash != current_uv_hash:
+        raise RuntimeError("TextureJob UV hash 계산이 비결정적으로 변경되었습니다.")
     job_id = _stable_digest(
         {
+            "atlas_hash": resolved_atlas_context.get("atlas_hash", ""),
+            "atlas_member_id": normalized_member_id,
             "mesh_hash": mesh_hash,
             "object_name": str(object_name),
             "settings_hash": settings_hash,
@@ -443,7 +767,7 @@ def build_texture_job(
         else _default_guide_map_manifest(normalized_space)
     )
     return TextureJob(
-        schema_version="1.2",
+        schema_version="1.4",
         object_name=str(object_name),
         mesh_hash=mesh_hash,
         uv_layer_name=resolved_layer_name,
@@ -473,7 +797,26 @@ def build_texture_job(
         requested_udim_tiles=normalized_udims,
         packing_margin_method=normalized_margin_method,
         packing_margin_uv=normalized_margin_uv,
+        pack_shared_atlas=normalized_shared_atlas,
+        atlas_id=str(resolved_atlas_context.get("atlas_id", "")),
+        atlas_hash=str(resolved_atlas_context.get("atlas_hash", "")),
+        atlas_member_id=normalized_member_id,
+        atlas_members=atlas_members,
+        global_island_offset=global_island_offset,
+        atlas_overlap_status=str(
+            resolved_atlas_context.get("overlap_status", "EXACT")
+        ),
+        atlas_overlap_count=int(resolved_atlas_context.get("overlap_count", 0)),
+        atlas_valid=bool(resolved_atlas_context["valid"]),
+        atlas_out_of_bounds_count=int(
+            resolved_atlas_context["out_of_bounds_count"]
+        ),
+        atlas_bounds=_validated_atlas_bounds(
+            resolved_atlas_context["bounds"], "Atlas bounds"
+        ),
+        atlas_member_count=int(resolved_atlas_context["member_count"]),
+        atlas_triangle_count=int(resolved_atlas_context["triangle_count"]),
     )
 
 
-__all__ = ("TextureJob", "build_texture_job")
+__all__ = ("TextureJob", "build_atlas_context", "build_texture_job")

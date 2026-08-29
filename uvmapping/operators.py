@@ -13,17 +13,21 @@ from bpy.props import IntProperty
 from bpy.types import Operator
 
 from .analysis import analyze_mesh, generate_analysis_candidates
-from .contracts import build_texture_job
-from .quality import evaluate_uv_quality
+from .contracts import build_atlas_context, build_texture_job
+from .quality import (
+    OVERLAP_BUDGET_EXCEEDED,
+    OVERLAP_EXACT,
+    evaluate_atlas_quality,
+    evaluate_uv_quality,
+)
 from .types import AnalysisOptions
 
 
 PREVIEW_ATTRIBUTE = "_uvmapping_preview_seam"
 QUALITY_PROPERTY = "uvmapping_quality"
 TEXTURE_JOB_PROPERTY = "uvmapping_texture_job"
-TEXTURE_TARGET_RESOLUTION = (2048, 2048)
-TEXTURE_TARGET_PADDING = 16
 TEXTURE_TARGET_UDIMS = (1001,)
+ATLAS_PROXY_PROPERTY = "_uvmapping_atlas_proxy"
 _MISSING = object()
 
 
@@ -51,6 +55,9 @@ class _CandidateArtifact:
     uv_layer_name: str
     method: str
     candidate_index: int
+    atlas_member_id: str = ""
+    atlas_report: Any = None
+    atlas_context: dict[str, Any] | None = None
 
 
 def _active_mesh_object(context):
@@ -342,22 +349,49 @@ class _ContextState:
 
 
 def _remove_scratch_object(obj, remove_mesh):
-    mesh = obj.data if obj is not None else None
+    mesh = None
     if obj is not None:
+        try:
+            mesh = obj.data
+        except (ReferenceError, RuntimeError):
+            pass
         try:
             if bpy.context.view_layer.objects.active == obj:
                 bpy.context.view_layer.objects.active = None
-        except ReferenceError:
+        except (ReferenceError, RuntimeError):
             pass
         try:
             bpy.data.objects.remove(obj, do_unlink=True)
-        except ReferenceError:
+        except (ReferenceError, RuntimeError):
             pass
-    if remove_mesh and mesh is not None and mesh.users == 0:
+    try:
+        should_remove_mesh = remove_mesh and mesh is not None and mesh.users == 0
+    except (ReferenceError, RuntimeError):
+        should_remove_mesh = False
+    if should_remove_mesh:
         try:
             bpy.data.meshes.remove(mesh)
-        except ReferenceError:
+        except (ReferenceError, RuntimeError):
             pass
+
+
+def _cleanup_atlas_proxies(objects=()):
+    """알려진 proxy와 예약 표식이 남은 proxy를 두 번째 best-effort로 정리한다."""
+
+    candidates = {}
+    for obj in objects:
+        try:
+            candidates[obj.as_pointer()] = obj
+        except (AttributeError, ReferenceError, RuntimeError):
+            pass
+    for obj in tuple(bpy.data.objects):
+        try:
+            if bool(obj.get(ATLAS_PROXY_PROPERTY, False)):
+                candidates[obj.as_pointer()] = obj
+        except (ReferenceError, RuntimeError):
+            pass
+    for obj in tuple(candidates.values()):
+        _remove_scratch_object(obj, remove_mesh=False)
 
 
 def _remove_orphan_mesh(mesh):
@@ -488,6 +522,163 @@ def _evaluate_group(context, state, group, settings):
     return winner
 
 
+def _atlas_margin(settings):
+    resolution = int(settings.texture_resolution)
+    padding = int(settings.padding_pixels)
+    if resolution <= 0:
+        raise ValueError("텍스처 해상도는 0보다 커야 합니다.")
+    if padding < 0:
+        raise ValueError("패딩 픽셀은 0 이상이어야 합니다.")
+    margin = padding / resolution
+    if margin > 1.0:
+        raise ValueError("패딩 픽셀은 텍스처 해상도보다 클 수 없습니다.")
+    return resolution, padding, margin
+
+
+def _pack_selected_artifacts(context, state, objects, margin):
+    state.activate(objects[0])
+    for obj in objects[1:]:
+        obj.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    unique_meshes = tuple(getattr(context, "objects_in_mode_unique_data", ()))
+    if len(unique_meshes) != len(objects):
+        raise RuntimeError(
+            "아틀라스 Edit Mode의 고유 Mesh 수가 임시 객체 수와 일치하지 않습니다."
+        )
+    context.tool_settings.use_uv_select_sync = True
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.uv.select_all(action="SELECT")
+    _require_finished(
+        bpy.ops.uv.average_islands_scale(scale_uv=True, shear=True),
+        "공유 아틀라스 스케일 정규화",
+    )
+    _require_finished(
+        bpy.ops.uv.pack_islands(
+            rotate=True,
+            scale=True,
+            margin_method="FRACTION",
+            margin=margin,
+        ),
+        "공유 아틀라스 패킹",
+    )
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def _pack_artifacts(
+    context,
+    state,
+    artifacts,
+    settings,
+    fail_after_proxy_creation=False,
+):
+    """winner Mesh만 임시 객체로 연결해 최종 픽셀 기준 아틀라스를 패킹한다."""
+
+    if not artifacts:
+        return
+    _, _, margin = _atlas_margin(settings)
+    scratch_objects = []
+    try:
+        for index, artifact in enumerate(artifacts):
+            layer = artifact.mesh.uv_layers.get(artifact.uv_layer_name)
+            if layer is None:
+                raise RuntimeError(
+                    f"{artifact.mesh.name}: 최종 UV 레이어를 찾을 수 없습니다."
+                )
+            artifact.mesh.uv_layers.active_index = tuple(
+                artifact.mesh.uv_layers
+            ).index(layer)
+            obj = bpy.data.objects.new(
+                f"_UVMappingAtlas_{index}", artifact.mesh
+            )
+            scratch_objects.append(obj)
+            context.scene.collection.objects.link(obj)
+            obj.hide_render = True
+            obj[ATLAS_PROXY_PROPERTY] = True
+
+        if fail_after_proxy_creation:
+            raise RuntimeError("테스트용 Atlas 패킹 실패가 주입되었습니다.")
+
+        if settings.pack_shared_atlas:
+            _pack_selected_artifacts(
+                context, state, tuple(scratch_objects), margin
+            )
+        else:
+            for obj in scratch_objects:
+                _pack_selected_artifacts(context, state, (obj,), margin)
+
+        for artifact in artifacts:
+            artifact.quality = evaluate_uv_quality(
+                artifact.mesh,
+                uv_layer_name=artifact.uv_layer_name,
+                seam_count=len(artifact.analysis.seam_edges),
+                chart_count=getattr(artifact.analysis, "chart_count", 0),
+            )
+
+        for index, artifact in enumerate(artifacts):
+            artifact.atlas_member_id = (
+                f"mesh-{index:04d}:{artifact.group.source_mesh.name_full}"
+            )
+        if settings.pack_shared_atlas:
+            report_groups = (tuple(artifacts),)
+        else:
+            report_groups = tuple((artifact,) for artifact in artifacts)
+
+        for report_artifacts in report_groups:
+            report = evaluate_atlas_quality(
+                tuple(
+                    (
+                        artifact.atlas_member_id,
+                        artifact.mesh,
+                        artifact.uv_layer_name,
+                    )
+                    for artifact in report_artifacts
+                ),
+                max_pair_checks=1_000_000,
+            )
+            if report.out_of_bounds_count:
+                raise RuntimeError(
+                    "최종 Atlas UV가 0-1 범위를 벗어났습니다: "
+                    f"{report.out_of_bounds_count}개"
+                )
+            if report.overlap_status == OVERLAP_EXACT and not report.valid:
+                raise RuntimeError(
+                    "최종 Atlas member 간 UV 겹침이 검출되었습니다: "
+                    f"{report.overlap_pairs}쌍"
+                )
+            descriptors = tuple(
+                {
+                    "member_id": artifact.atlas_member_id,
+                    "island_count": max(
+                        0, int(getattr(artifact.analysis, "chart_count", 0))
+                    ),
+                    "mesh_name": artifact.group.source_mesh.name_full,
+                    "object_names": tuple(
+                        sorted(obj.name_full for obj in artifact.group.objects)
+                    ),
+                    "uv_layer_name": artifact.uv_layer_name,
+                }
+                for artifact in report_artifacts
+            )
+            atlas_context = build_atlas_context(
+                report,
+                descriptors,
+                shared=bool(settings.pack_shared_atlas),
+            )
+            for artifact in report_artifacts:
+                artifact.atlas_report = report
+                artifact.atlas_context = atlas_context
+    finally:
+        current = context.view_layer.objects.active
+        if current is not None and current.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except RuntimeError:
+                pass
+        for obj in reversed(scratch_objects):
+            _remove_scratch_object(obj, remove_mesh=False)
+        _cleanup_atlas_proxies(scratch_objects)
+
+
 def _json_text(value):
     return json.dumps(
         value,
@@ -516,6 +707,8 @@ def _restore_object_properties(obj, snapshot):
 
 
 def _prepare_payloads(artifacts, settings):
+    resolution, padding, packing_margin = _atlas_margin(settings)
+    target_resolution = (resolution, resolution)
     payloads = {}
     for artifact in artifacts:
         quality_json = _json_text(artifact.quality.to_dict())
@@ -528,12 +721,12 @@ def _prepare_payloads(artifacts, settings):
                     "seam_policy": settings.seam_policy,
                     "unwrap_method": artifact.method,
                     "unwrap_iterations": settings.unwrap_iterations,
-                    "packing_margin_method": "SCALED",
-                    "packing_margin_uv": settings.island_margin,
-                    # 이 값들은 실제 패킹 측정치가 아니라 후속 생성 요청의 목표값이다.
+                    "packing_margin_method": "FRACTION",
+                    "packing_margin_uv": packing_margin,
+                    "pack_shared_atlas": bool(settings.pack_shared_atlas),
                     "generation_target": {
-                        "resolution": TEXTURE_TARGET_RESOLUTION,
-                        "padding_pixels": TEXTURE_TARGET_PADDING,
+                        "resolution": target_resolution,
+                        "padding_pixels": padding,
                         "udim_tiles": TEXTURE_TARGET_UDIMS,
                     },
                 }
@@ -543,14 +736,17 @@ def _prepare_payloads(artifacts, settings):
                     artifact.uv_layer_name,
                     artifact.quality,
                     artifact.analysis.seam_edges,
-                    resolution=TEXTURE_TARGET_RESOLUTION,
-                    padding=TEXTURE_TARGET_PADDING,
+                    resolution=target_resolution,
+                    padding=padding,
                     udim_tiles=TEXTURE_TARGET_UDIMS,
                     object_transform=tuple(tuple(row) for row in obj.matrix_world),
                     coordinate_space="OBJECT",
                     settings=texture_settings,
-                    packing_margin_method="SCALED",
-                    packing_margin_uv=settings.island_margin,
+                    packing_margin_method="FRACTION",
+                    packing_margin_uv=packing_margin,
+                    pack_shared_atlas=bool(settings.pack_shared_atlas),
+                    atlas_context=artifact.atlas_context,
+                    atlas_member_id=artifact.atlas_member_id,
                 )
                 job_payload = job.to_dict()
                 job_payload["settings"] = texture_settings
@@ -793,6 +989,13 @@ class UVMAPPING_OT_auto_unwrap(Operator):
         min=0,
         options={"HIDDEN", "SKIP_SAVE"},
     )
+    debug_fail_atlas_pack: IntProperty(
+        name="테스트 Atlas 패킹 실패",
+        default=0,
+        min=0,
+        max=1,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
 
     @classmethod
     def poll(cls, context):
@@ -812,6 +1015,14 @@ class UVMAPPING_OT_auto_unwrap(Operator):
             for group in groups:
                 artifacts.append(_evaluate_group(context, state, group, settings))
 
+            _pack_artifacts(
+                context,
+                state,
+                artifacts,
+                settings,
+                fail_after_proxy_creation=bool(self.debug_fail_atlas_pack),
+            )
+            _cleanup_atlas_proxies()
             payloads = _prepare_payloads(artifacts, settings)
             _commit_artifacts(
                 artifacts,
@@ -821,7 +1032,9 @@ class UVMAPPING_OT_auto_unwrap(Operator):
                 fail_after_bindings=self.debug_fail_after_bindings,
             )
             state.restore()
+            _cleanup_atlas_proxies()
         except Exception as exc:
+            _cleanup_atlas_proxies()
             _rollback_commit(commit_snapshots, state)
             for artifact in artifacts:
                 _remove_orphan_mesh(artifact.mesh)
@@ -829,6 +1042,7 @@ class UVMAPPING_OT_auto_unwrap(Operator):
                 state.restore()
             except Exception as restore_exc:
                 self.report({"ERROR"}, f"상태 복구 실패: {restore_exc}")
+            _cleanup_atlas_proxies()
             settings.last_result = f"자동 언랩 실패: {exc}"
             self.report({"ERROR"}, settings.last_result)
             return {"CANCELLED"}
@@ -838,9 +1052,19 @@ class UVMAPPING_OT_auto_unwrap(Operator):
         seam_count = sum(len(artifact.analysis.seam_edges) for artifact in artifacts)
         valid_count = sum(bool(artifact.quality.valid) for artifact in artifacts)
         partial_count = sum(group.has_unselected_users for group in groups)
+        atlas_contexts = {
+            artifact.atlas_context["atlas_id"]: artifact.atlas_context
+            for artifact in artifacts
+            if artifact.atlas_context is not None
+        }
+        unverified_atlas_count = sum(
+            context["overlap_status"] == OVERLAP_BUDGET_EXCEEDED
+            for context in atlas_contexts.values()
+        )
         message = (
             f"객체 {len(targets)}개/메시 {len(groups)}개: Seam {seam_count}개, "
-            f"품질 통과 {valid_count}/{len(groups)}, 부분 공유 분리 {partial_count}개"
+            f"품질 통과 {valid_count}/{len(groups)}, 부분 공유 분리 {partial_count}개, "
+            f"Atlas 미검증 {unverified_atlas_count}개"
         )
         settings.last_result = message
         self.report({"INFO"}, message)

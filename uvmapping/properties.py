@@ -11,6 +11,13 @@ from bpy.props import (
 from bpy.types import PropertyGroup
 
 
+def _sync_island_margin(settings, _context) -> None:
+    """사용자용 픽셀 여백을 기존 연산자가 읽는 UV fraction으로 변환한다."""
+
+    resolution = max(1, int(settings.texture_resolution))
+    settings.island_margin = settings.padding_pixels / resolution
+
+
 class UVMAPPING_PG_settings(PropertyGroup):
     """씬에 저장되는 자동 언랩 설정."""
 
@@ -70,14 +77,41 @@ class UVMAPPING_PG_settings(PropertyGroup):
         min=1,
         max=10000,
     )
+    texture_resolution: EnumProperty(
+        name="텍스처 크기",
+        description="UV를 배치할 정사각형 텍스처의 가로세로 픽셀 크기입니다",
+        items=(
+            ("1024", "1024 px", "1K 텍스처를 대상으로 합니다"),
+            ("2048", "2048 px", "2K 텍스처를 대상으로 합니다"),
+            ("4096", "4096 px", "4K 텍스처를 대상으로 합니다"),
+            ("8192", "8192 px", "8K 텍스처를 대상으로 합니다"),
+        ),
+        default="2048",
+        update=_sync_island_margin,
+    )
+    padding_pixels: IntProperty(
+        name="UV 조각 여백",
+        description="각 UV 조각 둘레에 확보할 픽셀 여백입니다. 두 조각 사이 간격은 이 값의 약 두 배입니다",
+        default=16,
+        min=0,
+        max=256,
+        subtype="PIXEL",
+        update=_sync_island_margin,
+    )
+    pack_shared_atlas: BoolProperty(
+        name="선택 객체를 한 장에 배치",
+        description="선택한 모든 Mesh의 UV를 겹치지 않게 한 장의 텍스처 공간에 함께 배치합니다",
+        default=True,
+    )
     island_margin: FloatProperty(
-        name="아일랜드 여백",
-        description="UV 패킹 시 아일랜드 사이의 여백입니다",
-        default=0.003,
+        name="내부 UV 여백",
+        description="픽셀 패딩에서 자동 환산되는 내부 호환용 UV fraction입니다",
+        default=0.0078125,
         min=0.0,
         max=0.5,
         precision=4,
         subtype="FACTOR",
+        options={"HIDDEN"},
     )
     fill_holes: BoolProperty(
         name="구멍 채움 고려",

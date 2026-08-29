@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from hashlib import sha256
+from heapq import heappop, heappush
+import json
 from math import exp, isfinite, log, sqrt
-from typing import Any, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 _EPSILON = 1.0e-12
@@ -35,6 +38,27 @@ class UVQualityReport:
     valid: bool
     objective_score: float
     uv_bounds: tuple[Vec2, Vec2]
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON 인코더에 바로 전달할 수 있는 사전으로 변환한다."""
+
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class AtlasQualityReport:
+    """최종 Atlas 공간에서 member 간 충돌과 범위를 평가한 결과."""
+
+    member_count: int
+    triangle_count: int
+    overlap_pairs: int
+    overlap_status: str
+    out_of_bounds_count: int
+    bounds: tuple[Vec2, Vec2]
+    member_bounds: dict[str, tuple[Vec2, Vec2]]
+    member_uv_hashes: dict[str, str]
+    atlas_hash: str
+    valid: bool
 
     def to_dict(self) -> dict[str, Any]:
         """JSON 인코더에 바로 전달할 수 있는 사전으로 변환한다."""
@@ -380,6 +404,7 @@ def _triangle_intersection_area(subject: Sequence[Vec2], clip: Sequence[Vec2]) -
 def _count_overlaps(
     triangles: Sequence[_TriangleData],
     max_pair_checks: int | None,
+    pair_filter: Callable[[int, int], bool] | None = None,
 ) -> tuple[int, str]:
     """x축 sweep-line으로 AABB 후보를 줄이고 중복 없는 pair만 검사한다."""
 
@@ -399,32 +424,36 @@ def _count_overlaps(
             index,
         ),
     )
-    active: list[int] = []
-    checked_pairs: set[tuple[int, int]] = set()
-    pair_checks = 0
+    active: dict[int, None] = {}
+    expiry_heap: list[tuple[float, int]] = []
+    candidate_work = 0
     overlaps = 0
     for current_index in ordered:
         current_bounds = bounds[current_index]
-        active = [
-            index
-            for index in active
-            if bounds[index][2] - current_bounds[0] > _OVERLAP_EPSILON
-        ]
+        while (
+            expiry_heap
+            and expiry_heap[0][0] - current_bounds[0] <= _OVERLAP_EPSILON
+        ):
+            _, expired_index = heappop(expiry_heap)
+            active.pop(expired_index, None)
+        if (
+            max_pair_checks is not None
+            and candidate_work + len(active) > max_pair_checks
+        ):
+            return overlaps, OVERLAP_BUDGET_EXCEEDED
         for previous_index in active:
+            candidate_work += 1
+            # 이전 active와 새 current 조합은 sweep에서 한 번만 생성된다.
             pair = (
                 min(previous_index, current_index),
                 max(previous_index, current_index),
             )
-            if pair in checked_pairs:
+            if pair_filter is not None and not pair_filter(pair[0], pair[1]):
                 continue
             if not _aabb_has_positive_intersection(
                 bounds[previous_index], current_bounds
             ):
                 continue
-            checked_pairs.add(pair)
-            if max_pair_checks is not None and pair_checks >= max_pair_checks:
-                return overlaps, OVERLAP_BUDGET_EXCEEDED
-            pair_checks += 1
             if (
                 _triangle_intersection_area(
                     triangles[previous_index].uvs,
@@ -433,7 +462,8 @@ def _count_overlaps(
                 > _OVERLAP_EPSILON
             ):
                 overlaps += 1
-        active.append(current_index)
+        active[current_index] = None
+        heappush(expiry_heap, (current_bounds[2], current_index))
     return overlaps, OVERLAP_EXACT
 
 
@@ -610,9 +640,151 @@ def evaluate_uv_quality(
     )
 
 
+def _normalize_atlas_entry(entry: Any) -> tuple[str, Any, str | None]:
+    if isinstance(entry, Mapping):
+        member_id = entry.get("member_id")
+        mesh = entry.get("mesh")
+        uv_layer_name = entry.get("uv_layer_name")
+    elif isinstance(entry, (tuple, list)) and len(entry) == 3:
+        member_id, mesh, uv_layer_name = entry
+    else:
+        member_id = getattr(entry, "member_id", None)
+        mesh = getattr(entry, "mesh", None)
+        uv_layer_name = getattr(entry, "uv_layer_name", None)
+    normalized_id = str(member_id).strip() if member_id is not None else ""
+    if not normalized_id:
+        raise ValueError("Atlas member_id는 비어 있을 수 없습니다.")
+    if mesh is None:
+        raise ValueError(f"Atlas member {normalized_id!r}의 mesh가 없습니다.")
+    return normalized_id, mesh, None if uv_layer_name is None else str(uv_layer_name)
+
+
+def _member_uv_hash(faces: Sequence[_FaceData]) -> str:
+    topology_payload = {
+        "faces": [
+            {"index": face.index, "vertices": list(face.vertices)} for face in faces
+        ]
+    }
+    topology_hash = sha256(
+        json.dumps(
+            topology_payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    uv_payload = {
+        "topology_hash": topology_hash,
+        "faces": [
+            {
+                "index": face.index,
+                "uvs": [
+                    [
+                        format(component if component != 0.0 else 0.0, ".12g")
+                        for component in uv
+                    ]
+                    for uv in face.uvs
+                ],
+            }
+            for face in faces
+        ],
+    }
+    encoded = json.dumps(
+        uv_payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def evaluate_atlas_quality(
+    entries: Sequence[tuple[str, Any, str | None] | Mapping[str, Any] | Any],
+    max_pair_checks: int | None = _DEFAULT_MAX_PAIR_CHECKS,
+) -> AtlasQualityReport:
+    """최종 Atlas에서 서로 다른 member 사이의 overlap과 bounds를 평가한다.
+
+    기본 entry 형식은 ``(member_id, mesh, uv_layer_name)``이다. 같은 member의
+    내부 triangle pair는 단일 메시 품질 리포트의 책임이므로 여기서는 제외한다.
+    """
+
+    if max_pair_checks is not None and max_pair_checks < 0:
+        raise ValueError("max_pair_checks 값은 0 이상이거나 None이어야 합니다.")
+    normalized = sorted(
+        (_normalize_atlas_entry(entry) for entry in entries),
+        key=lambda item: item[0],
+    )
+    member_ids = [member_id for member_id, _, _ in normalized]
+    if len(set(member_ids)) != len(member_ids):
+        raise ValueError("Atlas member_id는 고유해야 합니다.")
+
+    triangles: list[_TriangleData] = []
+    triangle_members: list[str] = []
+    member_bounds: dict[str, tuple[Vec2, Vec2]] = {}
+    member_uv_hashes: dict[str, str] = {}
+    all_faces: list[_FaceData] = []
+    for member_id, mesh, uv_layer_name in normalized:
+        _, faces, _ = _extract_faces(mesh, uv_layer_name)
+        member_triangles = _triangulate(faces)
+        triangles.extend(member_triangles)
+        triangle_members.extend([member_id] * len(member_triangles))
+        member_bounds[member_id] = _uv_bounds(faces)
+        member_uv_hashes[member_id] = _member_uv_hash(faces)
+        all_faces.extend(faces)
+
+    overlap_pairs, overlap_status = _count_overlaps(
+        triangles,
+        max_pair_checks,
+        pair_filter=lambda first, second: (
+            triangle_members[first] != triangle_members[second]
+        ),
+    )
+    bounds = _uv_bounds(all_faces)
+    out_of_bounds = sum(
+        lower[0] < -_EPSILON
+        or lower[1] < -_EPSILON
+        or upper[0] > 1.0 + _EPSILON
+        or upper[1] > 1.0 + _EPSILON
+        for lower, upper in member_bounds.values()
+    )
+    atlas_hash_payload = {
+        "members": [
+            {"member_id": member_id, "uv_hash": member_uv_hashes[member_id]}
+            for member_id in member_ids
+        ]
+    }
+    atlas_hash = sha256(
+        json.dumps(
+            atlas_hash_payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    valid = bool(normalized) and bool(triangles) and not (
+        overlap_pairs
+        or overlap_status != OVERLAP_EXACT
+        or out_of_bounds
+    )
+    return AtlasQualityReport(
+        member_count=len(normalized),
+        triangle_count=len(triangles),
+        overlap_pairs=overlap_pairs,
+        overlap_status=overlap_status,
+        out_of_bounds_count=out_of_bounds,
+        bounds=bounds,
+        member_bounds=member_bounds,
+        member_uv_hashes=member_uv_hashes,
+        atlas_hash=atlas_hash,
+        valid=valid,
+    )
+
+
 __all__ = (
     "OVERLAP_BUDGET_EXCEEDED",
     "OVERLAP_EXACT",
+    "AtlasQualityReport",
     "UVQualityReport",
+    "evaluate_atlas_quality",
     "evaluate_uv_quality",
 )

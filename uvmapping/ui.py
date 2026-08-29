@@ -37,6 +37,12 @@ class UVMAPPING_PT_main(Panel):
             status = layout.box()
             status.label(text=settings.last_result, icon="INFO")
 
+        packing = layout.box()
+        packing.label(text="출력 텍스처", icon="TEXTURE")
+        packing.prop(settings, "texture_resolution")
+        packing.prop(settings, "padding_pixels")
+        packing.prop(settings, "pack_shared_atlas")
+
         advanced = layout.row(align=True)
         advanced.prop(
             settings,
@@ -55,7 +61,6 @@ class UVMAPPING_PT_main(Panel):
         column.prop(settings, "generate_texture_job")
         column.separator()
         column.prop(settings, "unwrap_iterations")
-        column.prop(settings, "island_margin")
         column.prop(settings, "fill_holes")
         column.prop(settings, "correct_aspect")
 
