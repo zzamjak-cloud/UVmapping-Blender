@@ -24,6 +24,26 @@ class UVMAPPING_PG_settings(PropertyGroup):
         ),
         default="BALANCED",
     )
+    quality_level: EnumProperty(
+        name="품질 단계",
+        description="비교할 자동 Seam 후보 수를 선택합니다",
+        items=(
+            ("FAST", "빠르게", "기본 후보 한 개만 평가합니다"),
+            ("BALANCED", "균형", "최대 세 후보를 비교합니다"),
+            ("QUALITY", "품질 우선", "최대 다섯 후보를 비교합니다"),
+        ),
+        default="BALANCED",
+    )
+    process_selected_objects: BoolProperty(
+        name="선택 객체 모두 처리",
+        description="활성 객체만이 아니라 선택된 편집 가능 Mesh 객체를 모두 처리합니다",
+        default=True,
+    )
+    generate_texture_job: BoolProperty(
+        name="TextureJob 생성",
+        description="AI 텍스처 단계가 사용할 품질과 UV 구조 계약을 객체 속성에 저장합니다",
+        default=True,
+    )
     seam_policy: EnumProperty(
         name="기존 Seam",
         description="기존 Seam을 자동 분석 결과와 합칠지 결정합니다",

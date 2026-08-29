@@ -19,15 +19,33 @@ def register():
     from . import operators, ui
     from .properties import UVMAPPING_PG_settings
 
+    if _registered_classes:
+        return
+
     classes = (
         UVMAPPING_PG_settings,
         *operators.classes,
         *ui.classes,
     )
-    for cls in classes:
-        bpy.utils.register_class(cls)
-    bpy.types.Scene.uvmapping_settings = PointerProperty(type=UVMAPPING_PG_settings)
-    _registered_classes = classes
+    registered = []
+    scene_property_registered = False
+    try:
+        for cls in classes:
+            bpy.utils.register_class(cls)
+            registered.append(cls)
+        bpy.types.Scene.uvmapping_settings = PointerProperty(type=UVMAPPING_PG_settings)
+        scene_property_registered = True
+    except Exception:
+        if scene_property_registered and hasattr(bpy.types.Scene, "uvmapping_settings"):
+            del bpy.types.Scene.uvmapping_settings
+        for cls in reversed(registered):
+            try:
+                bpy.utils.unregister_class(cls)
+            except RuntimeError:
+                pass
+        _registered_classes = ()
+        raise
+    _registered_classes = tuple(registered)
 
 
 def unregister():
@@ -36,6 +54,10 @@ def unregister():
     global _registered_classes
 
     import bpy
+
+    from . import operators
+
+    operators.clear_preview_attributes()
 
     if hasattr(bpy.types.Scene, "uvmapping_settings"):
         del bpy.types.Scene.uvmapping_settings

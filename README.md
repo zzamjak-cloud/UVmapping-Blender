@@ -6,11 +6,15 @@
 
 - 기존 Seam을 보존하거나 새 Seam 후보를 생성
 - 메시 경계, Sharp, 재질 경계, 이면각을 이용한 Seam 점수 계산
-- Blender 언랩 연산과 Island 패킹
+- 품질 수준에 따른 다중 Seam 후보 비교와 Blender 언랩·Island 패킹
+- UV 겹침, 퇴화, 국소 뒤집힘, 면적 왜곡, 활용률 품질 평가
+- 선택한 여러 Mesh와 공유 Mesh datablock의 안전한 일괄 처리
+- 원본 Seam을 바꾸지 않는 후보 미리보기와 명시적 지우기
+- 후속 AI 텍스처 매핑 단계가 사용할 `TextureJob` JSON 생성
 - 대표 메시를 이용한 실제 Blender 스모크 테스트
 
 자동 처리는 좋은 초안을 빠르게 만드는 도구입니다. 모든 메시에서 수작업 수정이 전혀 필요 없는 결과를 보장하지는 않습니다.
-현재 MVP는 UV 겹침 방지를 우선하므로 원통의 캡 경계나 토러스처럼 곡률이 반복되는 메시에서 Seam이 많이 생성될 수 있습니다. 이후 차트 단위 영역 성장과 왜곡 피드백으로 Seam 수를 줄일 예정입니다.
+품질 모드는 여러 후보를 실제로 언랩한 결과까지 비교하므로 빠른 모드보다 시간이 더 걸립니다. 결과 품질은 토폴로지와 메시 형상에 좌우되며, 특수한 제작 규칙이 있는 자산은 미리보기 후 수동 조정이 필요할 수 있습니다.
 
 ## 요구 사항
 
@@ -66,6 +70,7 @@ scripts\dev_run.bat --mode Background -- --python tests\blender_smoke.py
 ```bash
 python3 tests/check_project.py
 python3 tests/test_analysis_pure.py
+python3 tests/test_quality_pure.py
 ```
 
 실제 Blender에서는 격리 프로필로 등록, 대표 메시 자동 언랩, UV와 Seam, 유한 좌표, 등록 해제를 확인합니다.
@@ -73,6 +78,7 @@ python3 tests/test_analysis_pure.py
 ```bash
 bash scripts/dev_run.sh --background --python tests/blender_smoke.py
 bash scripts/dev_run.sh --background --python tests/blender_quality.py
+bash scripts/dev_run.sh --background --python tests/blender_v1.py
 ```
 
 품질 검사는 Cube, Cylinder, Sphere, Torus에서 UV 삼각형의 양의 면적 겹침이 없는지와 Seam 비율 상한을 데이터 API로 확인합니다. Blender의 `uv.select_overlap`은 백그라운드 모드에서 사용하지 않습니다.

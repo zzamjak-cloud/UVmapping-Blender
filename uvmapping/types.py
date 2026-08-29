@@ -142,3 +142,5 @@ class AnalysisResult:
     edge_scores: dict[int, float] = field(default_factory=dict)
     chart_count: int = 0
     warnings: list[str] = field(default_factory=list)
+    options: AnalysisOptions | None = None
+    candidate_label: str = ""

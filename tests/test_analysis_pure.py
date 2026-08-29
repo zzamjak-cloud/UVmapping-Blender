@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import cos, sin, tau
+from math import cos, radians, sin, tau
 from pathlib import Path
 import sys
 
@@ -11,7 +11,11 @@ import sys
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from uvmapping.analysis import AnalysisOptions, analyze_mesh
+from uvmapping.analysis import (
+    AnalysisOptions,
+    analyze_mesh,
+    generate_analysis_candidates,
+)
 
 
 @dataclass
@@ -285,6 +289,96 @@ def test_punctured_torus_handle_cut_is_a_disk() -> None:
 
     assert result.chart_count == 1
     assert _cut_euler_characteristic(mesh, result.seam_edges) == 1
+
+
+def test_fast_analysis_candidate_returns_only_base_result() -> None:
+    mesh = _punctured_torus()
+    options = AnalysisOptions(min_chart_faces=1)
+
+    candidates = generate_analysis_candidates(mesh, options, "FAST")
+
+    assert len(candidates) == 1
+    assert candidates[0].seam_edges == analyze_mesh(mesh, options).seam_edges
+    assert candidates[0].options == options
+    assert candidates[0].candidate_label == "기본"
+
+
+def test_analysis_candidates_are_monotonic_and_deterministic() -> None:
+    mesh = _punctured_torus()
+    options = AnalysisOptions(min_chart_faces=1)
+
+    first = generate_analysis_candidates(mesh, options, "QUALITY")
+    second = generate_analysis_candidates(mesh, options, "QUALITY")
+
+    assert [candidate.seam_edges for candidate in first] == [
+        candidate.seam_edges for candidate in second
+    ]
+    assert [candidate.candidate_label for candidate in first] == [
+        candidate.candidate_label for candidate in second
+    ]
+    seam_counts = [len(candidate.seam_edges) for candidate in first]
+    assert seam_counts == sorted(seam_counts, reverse=True)
+    assert len({frozenset(candidate.seam_edges) for candidate in first}) == len(first)
+    assert all(candidate.options is not None for candidate in first)
+
+
+def test_quality_candidates_include_dense_safe_candidate() -> None:
+    angle = radians(15.0)
+    mesh = _mesh(
+        [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, -cos(angle), sin(angle)),
+        ],
+        [(0, 1, 2), (1, 0, 3)],
+    )
+    options = AnalysisOptions(min_chart_faces=1)
+
+    first = generate_analysis_candidates(mesh, options, "QUALITY")
+    second = generate_analysis_candidates(mesh, options, "QUALITY")
+    by_label = {candidate.candidate_label: candidate for candidate in first}
+
+    assert len(first) <= 5
+    assert "기본" in by_label
+    assert "조밀 안전" in by_label
+    assert by_label["조밀 안전"].options is not None
+    assert by_label["조밀 안전"].options.seam_threshold < options.seam_threshold
+    assert by_label["조밀 안전"].seam_edges > by_label["기본"].seam_edges
+    assert [candidate.seam_edges for candidate in first] == [
+        candidate.seam_edges for candidate in second
+    ]
+    assert [len(candidate.seam_edges) for candidate in first] == sorted(
+        (len(candidate.seam_edges) for candidate in first), reverse=True
+    )
+
+
+def test_analysis_candidates_preserve_topology_cut_graph() -> None:
+    mesh = _punctured_torus()
+    options = AnalysisOptions(
+        angle_weight=0.0,
+        length_weight=0.0,
+        sharp_weight=0.0,
+        material_weight=0.0,
+        existing_seam_weight=0.0,
+        boundary_weight=0.0,
+        non_manifold_weight=0.0,
+        seam_threshold=1.0,
+        min_chart_faces=1,
+        preserve_existing_seams=False,
+    )
+    topology_edges = analyze_mesh(mesh, options).seam_edges
+
+    candidates = generate_analysis_candidates(mesh, options, "QUALITY")
+
+    assert all(
+        topology_edges <= candidate.seam_edges
+        for candidate in candidates
+    )
+    assert all(
+        _cut_euler_characteristic(mesh, candidate.seam_edges) == 1
+        for candidate in candidates
+    )
 
 
 if __name__ == "__main__":

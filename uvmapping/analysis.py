@@ -5,7 +5,7 @@ Blender 데이터는 읽기만 하며 Seam 속성이나 UV 레이어를 직접 �
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import heapq
 from math import atan2, exp, sqrt
 from statistics import median
@@ -736,4 +736,132 @@ def analyze_mesh(
     )
 
 
-__all__ = ["AnalysisOptions", "AnalysisResult", "analyze_mesh"]
+def generate_analysis_candidates(
+    mesh: Any,
+    base_options: AnalysisOptions | None = None,
+    quality_level: str = "BALANCED",
+) -> list[AnalysisResult]:
+    """보수성이 점진적으로 커지는 결정론적 Seam 후보를 반환한다.
+
+    ``FAST``는 기본 설정 한 개만 평가한다. ``BALANCED``와 ``QUALITY``는
+    각각 최대 3개와 5개를 평가하되, 동일한 Seam 집합은 한 번만 반환한다.
+    ``QUALITY``의 조밀 안전 후보는 기본 후보보다 낮은 임계값을 사용하고
+    기본 Seam을 합쳐 위상 필수 절단을 잃지 않는다.
+    """
+
+    resolved_options = base_options or AnalysisOptions()
+    if not isinstance(resolved_options, AnalysisOptions):
+        raise TypeError("base_options는 AnalysisOptions 또는 None이어야 합니다.")
+
+    raw_quality = getattr(quality_level, "value", quality_level)
+    normalized_quality = (
+        str(raw_quality).strip().upper().replace("-", "_").replace(" ", "_")
+    )
+    candidate_limits = {"FAST": 1, "BALANCED": 3, "QUALITY": 5}
+    try:
+        candidate_limit = candidate_limits[normalized_quality]
+    except KeyError as exc:
+        choices = ", ".join(candidate_limits)
+        raise ValueError(
+            f"지원하지 않는 품질 단계입니다: {quality_level!r} ({choices})"
+        ) from exc
+
+    base_result = analyze_mesh(mesh, resolved_options)
+    base_result.options = resolved_options
+    base_result.candidate_label = "기본"
+
+    candidate_specs: list[tuple[str, AnalysisOptions, str]] = []
+    if normalized_quality == "QUALITY":
+        candidate_specs.append(
+            (
+                "조밀 안전",
+                replace(
+                    resolved_options,
+                    seam_threshold=max(
+                        0.0, resolved_options.seam_threshold - 0.12
+                    ),
+                ),
+                "dense",
+            )
+        )
+
+    conservative_count = candidate_limit - 1
+    if normalized_quality == "QUALITY":
+        conservative_count -= 1
+    chart_face_increment = max(1, (resolved_options.min_chart_faces + 1) // 2)
+    for step in range(1, conservative_count + 1):
+        candidate_specs.append(
+            (
+                f"보수 {step}",
+                replace(
+                    resolved_options,
+                    seam_threshold=min(
+                        1.0, resolved_options.seam_threshold + 0.06 * step
+                    ),
+                    angle_reference=(
+                        resolved_options.angle_reference * (1.0 + 0.15 * step)
+                    ),
+                    min_chart_faces=(
+                        resolved_options.min_chart_faces
+                        + chart_face_increment * step
+                    ),
+                ),
+                "conservative",
+            )
+        )
+
+    candidates: list[tuple[int, AnalysisResult]] = [(0, base_result)]
+    seen_seam_sets: set[frozenset[int]] = set()
+    seen_seam_sets.add(frozenset(base_result.seam_edges))
+    previous_conservative_count = len(base_result.seam_edges)
+
+    for order, (label, options, candidate_kind) in enumerate(
+        candidate_specs, start=1
+    ):
+        result = analyze_mesh(mesh, options)
+        if candidate_kind == "dense":
+            original_edges = set(result.seam_edges)
+            result.seam_edges.update(base_result.seam_edges)
+            if result.seam_edges != original_edges:
+                data = _normalize_mesh(mesh)
+                positions_by_index = {
+                    edge.result_index: edge.position for edge in data.edges
+                }
+                seam_positions = {
+                    positions_by_index[index]
+                    for index in result.seam_edges
+                    if index in positions_by_index
+                }
+                result.chart_count = count_charts(
+                    len(data.faces), data.edge_faces, seam_positions
+                )
+
+        seam_key = frozenset(result.seam_edges)
+        seam_count = len(seam_key)
+
+        # 보수 후보가 직전 보수 단계보다 Seam을 늘리면 후보 계약에서 제외한다.
+        if (
+            candidate_kind == "conservative"
+            and seam_count > previous_conservative_count
+        ):
+            continue
+        if seam_key in seen_seam_sets:
+            continue
+
+        result.options = options
+        result.candidate_label = label
+        candidates.append((order, result))
+        seen_seam_sets.add(seam_key)
+        if candidate_kind == "conservative":
+            previous_conservative_count = seam_count
+
+    candidates.sort(key=lambda item: (-len(item[1].seam_edges), item[0]))
+    return [result for _, result in candidates]
+
+
+__all__ = [
+    "AnalysisOptions",
+    "AnalysisResult",
+    "analyze_mesh",
+    "generate_analysis_candidates",
+]

@@ -23,9 +23,15 @@ class UVMAPPING_PT_main(Panel):
         settings = context.scene.uvmapping_settings
 
         layout.prop(settings, "preset", text="")
+        layout.prop(settings, "quality_level", text="품질")
+        layout.prop(settings, "process_selected_objects")
         button = layout.column()
         button.scale_y = 1.6
         button.operator("uvmapping.auto_unwrap", icon="UV")
+
+        preview = layout.row(align=True)
+        preview.operator("uvmapping.preview_seams", icon="SHADING_WIRE")
+        preview.operator("uvmapping.clear_preview", text="지우기", icon="X")
 
         if settings.last_result:
             status = layout.box()
@@ -46,6 +52,7 @@ class UVMAPPING_PT_main(Panel):
         column.prop(settings, "seam_policy")
         column.prop(settings, "create_new_uv_layer")
         column.prop(settings, "uv_layer_name")
+        column.prop(settings, "generate_texture_job")
         column.separator()
         column.prop(settings, "unwrap_iterations")
         column.prop(settings, "island_margin")
