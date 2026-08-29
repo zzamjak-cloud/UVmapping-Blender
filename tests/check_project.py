@@ -164,12 +164,12 @@ def _check_extension_pages_workflow() -> None:
         "https://download.blender.org/release/Blender4.5",
         "blender-4.5.13-linux-x64.tar.xz",
         "blender-4.5.13.sha256",
-        "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
         "ref: ${{ github.event.repository.default_branch }}",
-        "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0",
-        "actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0",
-        "actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1",
-        "actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5",
+        "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+        "actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0",
+        "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0",
+        "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0",
         "${#checksum_matches[@]} != 1",
         "sha256sum -c -",
         "gh api --paginate --slurp",
@@ -196,11 +196,11 @@ def _check_extension_pages_workflow() -> None:
     )
     used_actions = set(re.findall(r"^\s+uses:\s+([^\s#]+)", workflow, flags=re.MULTILINE))
     expected_actions = {
-        "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
-        "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830",
-        "actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b",
-        "actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa",
-        "actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+        "actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d",
+        "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9",
+        "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128",
     }
     _require(used_actions == expected_actions, "Pages 워크플로우의 Action 집합 또는 고정 SHA가 다릅니다.")
     build_block, deploy_block = workflow.split("\n  deploy:\n", maxsplit=1)
