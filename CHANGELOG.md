@@ -2,6 +2,11 @@
 
 이 프로젝트는 [Semantic Versioning](https://semver.org/)을 따릅니다.
 
+## 다음 버전
+
+- GitHub Pages 기반 Blender Extension 원격 설치 및 자동 업데이트 저장소 추가
+- Release 자산 lock, SHA-256 검증과 공식 Blender 인덱스 자동 생성 워크플로우 추가
+
 ## 1.1.0 - 2026-08-30
 
 - 선택한 여러 Mesh의 UV를 하나의 0–1 공유 Atlas에 일괄 패킹

@@ -89,7 +89,15 @@ bash scripts/dev_run.sh --background --python tests/blender_v1.py
 
 ## 사용자용 원격 설치와의 구분
 
-위 개발 프로필은 로컬 소스 연결 전용이며 사용자 배포 URL이 아닙니다. 현재 공개 Extension 저장소, GitHub Release, 원격 `index.json`은 발행하지 않았습니다. 향후 릴리스가 승인되어 원격 저장소가 배포되면, 사용자는 Blender의 `Get Extensions` 저장소 설정에 공지된 URL을 추가해 설치·업데이트하게 됩니다.
+위 개발 프로필은 로컬 소스 연결 전용이며 사용자 배포 URL이 아닙니다. 실제 설치와 업데이트에는 다음 공개 Extension 저장소를 사용합니다.
+
+```text
+https://zzamjak-cloud.github.io/UVmapping-Blender/index.json
+```
+
+Blender의 `Preferences > Get Extensions > Repositories`에서 `Add Remote Repository`를 선택하고 위 URL을 등록한 뒤 동기화합니다. 목록에서 `UV Mapping Blender`를 설치하고 `Check for Updates on Startup`을 켜면 Blender 시작 시 새 버전을 확인해 알려줍니다. 업데이트 설치는 사용자가 승인해야 하며 무인으로 자동 설치되지 않습니다.
+
+원격 저장소를 사용할 수 없는 경우 [GitHub Releases](https://github.com/zzamjak-cloud/UVmapping-Blender/releases)에서 최신 ZIP을 받아 `Install from Disk`로 설치할 수 있습니다.
 
 ## 라이선스
 

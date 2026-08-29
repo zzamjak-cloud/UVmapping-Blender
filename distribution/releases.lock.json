@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0.0",
+  "releases": [
+    {
+      "tag": "v1.1.0",
+      "version": "1.1.0",
+      "asset_name": "uvmapping_blender-v1.1.0.zip",
+      "url": "https://github.com/zzamjak-cloud/UVmapping-Blender/releases/download/v1.1.0/uvmapping_blender-v1.1.0.zip",
+      "size": 44608,
+      "sha256": "0fa13ce9c3b71170636a286fa355c7ba60c45df8796efe58300fdf526a900de5",
+      "target_commit": "c74588ca9b3abe8ee9f1d644189f9491d8f6b065"
+    }
+  ]
+}
