@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+
+id = "uvmapping_blender"
+version = "0.1.0"
+name = "UV Mapping Blender"
+tagline = "메시 흐름을 분석해 Seam 생성부터 UV 패킹까지 자동화합니다"
+maintainer = "zzamjak-cloud"
+type = "add-on"
+
+blender_version_min = "4.5.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/.serena/",
+  "/*.zip",
+  "/tests/",
+  "/scripts/",
+  "/.gitattributes",
+  "/.gitignore",
+]

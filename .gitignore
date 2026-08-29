@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.zip
+dist/
+build/
+.serena/
+.blender/
+.dev-profile/
+
