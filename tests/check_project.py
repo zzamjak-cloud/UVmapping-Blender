@@ -40,6 +40,7 @@ REQUIRED_FILES = (
     "tests/test_analysis_pure.py",
     "tests/test_quality_pure.py",
     "tests/test_clipboard_image_pure.py",
+    "tests/test_extension_repository_pure.py",
     "tests/test_native_input_pure.py",
     "tests/test_openai_provider_pure.py",
     "tests/test_texture_bake_pure.py",
@@ -208,6 +209,10 @@ def _check_extension_pages_workflow() -> None:
         "release:",
         "types: [published]",
         "workflow_dispatch:",
+        "relay:",
+        "github.event_name == 'release'",
+        "actions: write",
+        "gh workflow run extension-pages.yml",
         "contents: read",
         "pages: write",
         "id-token: write",
@@ -217,12 +222,12 @@ def _check_extension_pages_workflow() -> None:
         "build:",
         "deploy:",
         "needs: build",
-        "github.event_name != 'pull_request'",
+        "github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+        "ref: ${{ github.sha }}",
         "https://download.blender.org/release/Blender4.5",
         "blender-4.5.13-linux-x64.tar.xz",
         "blender-4.5.13.sha256",
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
-        "ref: ${{ github.event.repository.default_branch }}",
         "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
         "actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0",
         "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0",
@@ -238,6 +243,10 @@ def _check_extension_pages_workflow() -> None:
         "--html",
         "scripts/check_extension_repository.py releases",
         "scripts/check_extension_repository.py repository",
+        "publish_latest",
+        "verified-releases",
+        "published_count",
+        "Pages에는 SemVer 최신 패키지 하나만 게시해야 합니다.",
     )
     for token in required_tokens:
         _require(token in workflow, f"Pages 워크플로우에 필수 요소가 없습니다: {token}")
@@ -260,7 +269,21 @@ def _check_extension_pages_workflow() -> None:
         "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128",
     }
     _require(used_actions == expected_actions, "Pages 워크플로우의 Action 집합 또는 고정 SHA가 다릅니다.")
-    build_block, deploy_block = workflow.split("\n  deploy:\n", maxsplit=1)
+    relay_block, remaining_jobs = workflow.split("\n  build:\n", maxsplit=1)
+    build_block, deploy_block = remaining_jobs.split("\n  deploy:\n", maxsplit=1)
+    _require("permissions:\n      actions: write" in relay_block, "Release 릴레이 작업에는 actions 쓰기 권한만 있어야 합니다.")
+    _require("contents: write" not in relay_block, "Release 릴레이가 저장소 내용을 수정하면 안 됩니다.")
+    _require("environment:" not in relay_block, "Release 태그 릴레이가 보호된 Pages 환경을 사용하면 안 됩니다.")
+    _require(workflow.count("actions: write") == 1, "actions 쓰기 권한은 Release 릴레이 하나에만 있어야 합니다.")
+    _require(
+        workflow.count(
+            "if: github.event_name == 'workflow_dispatch' && "
+            "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
+        )
+        == 2,
+        "Pages build와 deploy는 기본 브랜치 workflow_dispatch에서만 실행해야 합니다.",
+    )
+    _require("gh workflow run" not in build_block + deploy_block, "Pages 실행 릴레이는 release 작업에만 있어야 합니다.")
     _require("permissions:\n      contents: read" in build_block, "build 작업은 contents: read만 사용해야 합니다.")
     _require("pages: write" not in build_block, "build 작업에 Pages 쓰기 권한이 있으면 안 됩니다.")
     _require("permissions:\n      pages: write\n      id-token: write" in deploy_block, "deploy 작업의 Pages 권한이 올바르지 않습니다.")
@@ -426,6 +449,8 @@ def _check_extension_repository_script() -> None:
         "tomllib",
         "zipfile",
         "set(api_by_tag) == set(locked_by_tag)",
+        "_version_tuple",
+        "max(locked_releases",
         'asset.get("digest")',
         "package.testzip()",
         '".." not in member_path.parts',
@@ -434,6 +459,9 @@ def _check_extension_repository_script() -> None:
         "archive_hash",
         "blender_version_min",
         "package_sha256 == locked",
+        '"1" if str(locked["version"]) == latest_version else "0"',
+        "len(entry_ids) == len(set(entry_ids))",
+        "SemVer 최신 ZIP 하나만",
     )
     for token in required_tokens:
         _require(token in script, f"Extension 저장소 검사기에 필수 검사가 없습니다: {token}")

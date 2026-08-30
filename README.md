@@ -51,7 +51,9 @@ Blender의 Extension 저장소를 새로 고치면 사용 가능한 업데이트
 
 ## 릴리스 운영
 
-`v*` 태그를 push하면 전체 회귀 검사와 공식 Blender Extension 빌드를 거쳐 GitHub Release 초안과 ZIP 자산까지만 생성합니다. 초안은 자동으로 공개하지 않습니다. 자산의 크기, SHA-256, 태그 대상 커밋을 `distribution/releases.lock.json`에 반영해 기본 브랜치에 push한 뒤 초안을 공개해야 합니다. 공개 이벤트가 발생하면 Pages 워크플로우가 잠금 값과 자산을 다시 검증하고 원격 Extension 저장소를 갱신합니다.
+`v*` 태그를 push하면 전체 회귀 검사와 공식 Blender Extension 빌드를 거쳐 GitHub Release 초안과 ZIP 자산까지만 생성합니다. 초안은 자동으로 공개하지 않습니다. 자산의 크기, SHA-256, 태그 대상 커밋을 `distribution/releases.lock.json`에 반영해 기본 브랜치에 push한 뒤 초안을 공개해야 합니다.
+
+공개 이벤트는 보호된 Pages 환경에서 태그를 직접 배포하지 않고 기본 브랜치의 `workflow_dispatch`를 호출합니다. 배포 작업은 잠금 파일에 기록된 모든 공개 Release와 자산을 검증하지만, Blender 원격 저장소에는 SemVer상 최신 ZIP과 인덱스 항목 하나만 게시합니다. 따라서 과거 Release는 검증 가능한 이력으로 유지하면서도 동일 Extension ID의 중복 항목 때문에 업데이트가 이전 버전에 머무는 문제를 방지합니다.
 
 ## 라이선스
 

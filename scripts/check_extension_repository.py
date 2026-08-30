@@ -37,6 +37,13 @@ def _require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def _version_tuple(version: str) -> tuple[int, int, int]:
+    match = VERSION_PATTERN.fullmatch(version)
+    _require(bool(match), f"유효하지 않은 SemVer 버전: {version!r}")
+    major, minor, patch = version.split(".")
+    return int(major), int(minor), int(patch)
+
+
 def _load_json(path: Path, description: str) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -78,7 +85,7 @@ def _load_lock(lock_path: Path) -> tuple[dict[str, Any], ...]:
     for field in ("tag", "version", "asset_name"):
         values = [str(release[field]) for release in normalized]
         _require(len(values) == len(set(values)), f"잠금 파일에 중복된 {field} 값이 있습니다.")
-    return tuple(sorted(normalized, key=lambda release: str(release["version"])))
+    return tuple(sorted(normalized, key=lambda release: _version_tuple(str(release["version"]))))
 
 
 def _flatten_api_pages(api_data: Any) -> tuple[dict[str, Any], ...]:
@@ -92,7 +99,7 @@ def _flatten_api_pages(api_data: Any) -> tuple[dict[str, Any], ...]:
 
 
 def build_release_plan(lock_path: Path, api_path: Path) -> tuple[tuple[str, ...], ...]:
-    """안정 Release와 잠금 집합을 대조하고 다운로드용 TSV 레코드를 만듭니다."""
+    """안정 Release 전체를 검증하고 최신 버전을 표시한 TSV 레코드를 만듭니다."""
 
     locked_releases = _load_lock(lock_path)
     api_releases = _flatten_api_pages(_load_json(api_path, "GitHub Release API 응답"))
@@ -108,9 +115,13 @@ def build_release_plan(lock_path: Path, api_path: Path) -> tuple[tuple[str, ...]
         set(api_by_tag) == set(locked_by_tag),
         "GitHub 안정 Release 태그 집합과 releases.lock.json이 정확히 일치하지 않습니다.",
     )
+    latest_version = str(
+        max(locked_releases, key=lambda release: _version_tuple(str(release["version"])))['version']
+    )
 
     records: list[tuple[str, ...]] = []
-    for tag, locked in sorted(locked_by_tag.items()):
+    for locked in locked_releases:
+        tag = str(locked["tag"])
         release = api_by_tag[tag]
         assets = release.get("assets")
         _require(isinstance(assets, list), f"{tag}: GitHub 자산 목록이 없습니다.")
@@ -142,6 +153,7 @@ def build_release_plan(lock_path: Path, api_path: Path) -> tuple[tuple[str, ...]
                 str(locked["sha256"]),
                 str(locked["url"]),
                 str(locked["target_commit"]),
+                "1" if str(locked["version"]) == latest_version else "0",
             )
         )
     return tuple(records)
@@ -197,9 +209,13 @@ def _validate_archive_url(archive_url: Any, expected_name: str) -> None:
 
 
 def check_repository(repository_dir: Path, lock_path: Path) -> tuple[int, tuple[str, ...]]:
-    """생성 인덱스와 ZIP의 크기·해시·매니페스트를 잠금 파일과 대조합니다."""
+    """최신 한 버전만 포함한 인덱스와 ZIP을 잠금 파일에 대조합니다."""
 
     locked_releases = _load_lock(lock_path)
+    latest_locked = max(
+        locked_releases,
+        key=lambda release: _version_tuple(str(release["version"])),
+    )
     _require(repository_dir.is_dir(), f"저장소 디렉터리가 없습니다: {repository_dir}")
     index_path = repository_dir / "index.json"
     html_path = repository_dir / "index.html"
@@ -211,49 +227,46 @@ def check_repository(repository_dir: Path, lock_path: Path) -> tuple[int, tuple[
     _require(isinstance(index_entries, list), "index.json의 data는 배열이어야 합니다.")
     _require(all(isinstance(entry, dict) for entry in index_entries), "index.json의 패키지 항목은 객체여야 합니다.")
 
-    expected_names = {str(release["asset_name"]) for release in locked_releases}
+    expected_names = {str(latest_locked["asset_name"])}
     actual_paths = sorted(repository_dir.glob("*.zip"))
     actual_names = {path.name for path in actual_paths}
-    _require(actual_names == expected_names, "저장소 ZIP 집합과 releases.lock.json이 정확히 일치하지 않습니다.")
-    _require(len(index_entries) == len(locked_releases), "index.json 패키지 수와 잠금 Release 수가 다릅니다.")
-    entries_by_version = {str(entry.get("version", "")): entry for entry in index_entries}
-    _require(len(entries_by_version) == len(index_entries), "index.json에 중복된 버전이 있습니다.")
+    _require(actual_names == expected_names, "공개 저장소에는 SemVer 최신 ZIP 하나만 있어야 합니다.")
+    entry_ids = [str(entry.get("id", "")) for entry in index_entries]
+    _require(len(entry_ids) == len(set(entry_ids)), "index.json에 중복된 Extension id가 있습니다.")
+    _require(len(index_entries) == 1, "index.json에는 SemVer 최신 패키지 하나만 있어야 합니다.")
 
-    versions: list[str] = []
-    for locked in locked_releases:
-        version = str(locked["version"])
-        package_path = repository_dir / str(locked["asset_name"])
-        _require(package_path.stat().st_size == locked["size"], f"{package_path.name}: 실제 크기가 잠금 값과 다릅니다.")
-        package_sha256 = _sha256(package_path)
-        _require(package_sha256 == locked["sha256"], f"{package_path.name}: 실제 SHA-256이 잠금 값과 다릅니다.")
+    locked = latest_locked
+    version = str(locked["version"])
+    package_path = repository_dir / str(locked["asset_name"])
+    _require(package_path.stat().st_size == locked["size"], f"{package_path.name}: 실제 크기가 잠금 값과 다릅니다.")
+    package_sha256 = _sha256(package_path)
+    _require(package_sha256 == locked["sha256"], f"{package_path.name}: 실제 SHA-256이 잠금 값과 다릅니다.")
 
-        filename_match = PACKAGE_PATTERN.fullmatch(package_path.name)
-        _require(bool(filename_match), f"유효하지 않은 패키지 파일명입니다: {package_path.name}")
-        manifest = _read_manifest(package_path)
-        manifest_id = str(manifest.get("id", ""))
-        manifest_version = str(manifest.get("version", ""))
-        blender_min = str(manifest.get("blender_version_min", ""))
-        _require(manifest_id == ADDON_ID, f"{package_path.name}: 매니페스트 id가 올바르지 않습니다.")
-        _require(manifest_version == version, f"{package_path.name}: 매니페스트 버전이 잠금 값과 다릅니다.")
-        _require(filename_match.group("version") == version, f"{package_path.name}: 파일명 버전이 잠금 값과 다릅니다.")
-        _require(bool(blender_min), f"{package_path.name}: blender_version_min이 없습니다.")
+    filename_match = PACKAGE_PATTERN.fullmatch(package_path.name)
+    _require(bool(filename_match), f"유효하지 않은 패키지 파일명입니다: {package_path.name}")
+    manifest = _read_manifest(package_path)
+    manifest_id = str(manifest.get("id", ""))
+    manifest_version = str(manifest.get("version", ""))
+    blender_min = str(manifest.get("blender_version_min", ""))
+    _require(manifest_id == ADDON_ID, f"{package_path.name}: 매니페스트 id가 올바르지 않습니다.")
+    _require(manifest_version == version, f"{package_path.name}: 매니페스트 버전이 잠금 값과 다릅니다.")
+    _require(filename_match.group("version") == version, f"{package_path.name}: 파일명 버전이 잠금 값과 다릅니다.")
+    _require(bool(blender_min), f"{package_path.name}: blender_version_min이 없습니다.")
 
-        entry = entries_by_version.get(version)
-        _require(entry is not None, f"index.json에 버전이 없습니다: {version}")
-        _validate_archive_url(entry.get("archive_url"), package_path.name)
-        _require(entry.get("archive_size") == locked["size"], f"{package_path.name}: index archive_size가 다릅니다.")
-        _require(
-            entry.get("archive_hash") == f"sha256:{package_sha256}",
-            f"{package_path.name}: index archive_hash가 다릅니다.",
-        )
-        _require(entry.get("id") == manifest_id, f"{package_path.name}: index id가 매니페스트와 다릅니다.")
-        _require(entry.get("version") == manifest_version, f"{package_path.name}: index version이 매니페스트와 다릅니다.")
-        _require(
-            entry.get("blender_version_min") == blender_min,
-            f"{package_path.name}: index blender_version_min이 매니페스트와 다릅니다.",
-        )
-        versions.append(version)
-    return len(actual_paths), tuple(versions)
+    entry = index_entries[0]
+    _validate_archive_url(entry.get("archive_url"), package_path.name)
+    _require(entry.get("archive_size") == locked["size"], f"{package_path.name}: index archive_size가 다릅니다.")
+    _require(
+        entry.get("archive_hash") == f"sha256:{package_sha256}",
+        f"{package_path.name}: index archive_hash가 다릅니다.",
+    )
+    _require(entry.get("id") == manifest_id, f"{package_path.name}: index id가 매니페스트와 다릅니다.")
+    _require(entry.get("version") == manifest_version, f"{package_path.name}: index version이 매니페스트와 다릅니다.")
+    _require(
+        entry.get("blender_version_min") == blender_min,
+        f"{package_path.name}: index blender_version_min이 매니페스트와 다릅니다.",
+    )
+    return len(actual_paths), (version,)
 
 
 def _parse_args() -> argparse.Namespace:
