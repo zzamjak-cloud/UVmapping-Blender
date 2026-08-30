@@ -16,15 +16,22 @@ def register():
     import bpy
     from bpy.props import PointerProperty
 
-    from . import operators, preview, ui
-    from .properties import UVMAPPING_PG_settings
+    from . import operators, preview, texture_operators, ui
+    from .properties import (
+        UVMAPPING_AP_preferences,
+        UVMAPPING_PG_reference_image,
+        UVMAPPING_PG_settings,
+    )
 
     if _registered_classes:
         return
 
     classes = (
+        UVMAPPING_AP_preferences,
+        UVMAPPING_PG_reference_image,
         UVMAPPING_PG_settings,
         *operators.classes,
+        *texture_operators.classes,
         *ui.classes,
     )
     registered = []
@@ -57,8 +64,9 @@ def unregister():
 
     import bpy
 
-    from . import preview
+    from . import preview, texture_operators
 
+    texture_operators.shutdown()
     preview.unregister()
 
     if hasattr(bpy.types.Scene, "uvmapping_settings"):

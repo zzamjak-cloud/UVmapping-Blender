@@ -13,7 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 ADDON_ID = "uvmapping_blender"
 PROFILE_NAME = "UVmappingBlenderDev"
 REQUIRED_FILES = (
+    ".github/workflows/ci.yml",
     ".github/workflows/extension-pages.yml",
+    ".github/workflows/release.yml",
     "blender_manifest.toml",
     "distribution/releases.lock.json",
     "__init__.py",
@@ -23,11 +25,25 @@ REQUIRED_FILES = (
     "scripts/dev_run.bat",
     "scripts/dev_bootstrap.py",
     "uvmapping/preview.py",
+    "uvmapping/clipboard_image.py",
+    "uvmapping/native_input.py",
+    "uvmapping/openai_provider.py",
+    "uvmapping/texture_bake.py",
+    "uvmapping/texture_pipeline.py",
+    "uvmapping/texture_operators.py",
+    "uvmapping/texture_worker.py",
     "tests/blender_smoke.py",
     "tests/blender_quality.py",
     "tests/blender_v1.py",
+    "tests/blender_texture.py",
+    "tests/blender_texture_live.py",
     "tests/test_analysis_pure.py",
     "tests/test_quality_pure.py",
+    "tests/test_clipboard_image_pure.py",
+    "tests/test_native_input_pure.py",
+    "tests/test_openai_provider_pure.py",
+    "tests/test_texture_bake_pure.py",
+    "tests/test_texture_pipeline_pure.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
@@ -61,6 +77,9 @@ def _check_manifest() -> str:
             required_pattern in excluded,
             f"패키지 제외 패턴이 없습니다: {required_pattern}",
         )
+    permissions = manifest.get("permissions", {})
+    _require(bool(permissions.get("network")), "AI 호출용 network 권한 설명이 없습니다.")
+    _require(bool(permissions.get("files")), "참조와 결과용 files 권한 설명이 없습니다.")
     return version
 
 
@@ -158,6 +177,13 @@ def _check_bootstrap_and_user_docs() -> None:
         "선택된 모든 Mesh",
         "UV 언랩",
         "AutoUV",
+        "AI 손맵 텍스처",
+        "단일 3면도 생성",
+        "Gemini 또는 OpenAI API 키",
+        "GPT-Image-2",
+        "Blender 개인 환경설정",
+        "클립보드",
+        "한글 프롬프트 입력",
         "GPL-3.0-or-later",
     )
     for token in required_tokens:
@@ -253,6 +279,129 @@ def _check_extension_pages_workflow() -> None:
     )
 
 
+def _check_ci_workflow() -> None:
+    workflow = _read(".github/workflows/ci.yml")
+    required_tokens = (
+        "push:",
+        "branches: [main]",
+        "pull_request:",
+        "workflow_dispatch:",
+        "permissions: {}",
+        "contents: read",
+        "concurrency:",
+        "cancel-in-progress: true",
+        "python3 tests/check_project.py",
+        "tests/test_*_pure.py",
+        "https://download.blender.org/release/Blender4.5",
+        "blender-4.5.13-linux-x64.tar.xz",
+        "blender-4.5.13.sha256",
+        "${#checksum_matches[@]} != 1",
+        "sha256sum -c -",
+        "scripts/dev_bootstrap.py",
+        "tests/blender_smoke.py",
+        "tests/blender_v1.py",
+        "tests/blender_quality.py",
+        "tests/blender_texture.py",
+        "extension validate .",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+    )
+    for token in required_tokens:
+        _require(token in workflow, f"CI 워크플로우에 필수 요소가 없습니다: {token}")
+
+    _require("pull_request_target:" not in workflow, "CI는 pull_request_target에서 실행하면 안 됩니다.")
+    _require("contents: write" not in workflow, "CI에는 저장소 쓰기 권한이 필요하지 않습니다.")
+    _require(
+        not re.search(r"^\s+uses:\s+[^#\s]+@v\d+", workflow, flags=re.MULTILINE),
+        "CI Action은 변경 가능한 메이저 태그가 아닌 전체 커밋 SHA로 고정해야 합니다.",
+    )
+    used_actions = set(re.findall(r"^\s+uses:\s+([^\s#]+)", workflow, flags=re.MULTILINE))
+    expected_actions = {
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+    }
+    _require(used_actions == expected_actions, "CI Action 집합 또는 고정 SHA가 다릅니다.")
+    run_directives = re.findall(r"^\s+run:\s*(.*)$", workflow, flags=re.MULTILINE)
+    _require(run_directives and all(value == "|" for value in run_directives), "CI 실행 단계는 모두 블록 셸이어야 합니다.")
+    _require(
+        len(run_directives) == workflow.count("set -euo pipefail"),
+        "모든 CI 실행 단계는 set -euo pipefail로 시작해야 합니다.",
+    )
+
+
+def _check_release_workflow() -> None:
+    workflow = _read(".github/workflows/release.yml")
+    required_tokens = (
+        "push:",
+        "tags:",
+        '- "v*"',
+        "permissions: {}",
+        "contents: read",
+        "contents: write",
+        "cancel-in-progress: false",
+        "GITHUB_REF_TYPE",
+        "GITHUB_REF_NAME",
+        '"v${manifest_version}"',
+        "python3 tests/check_project.py",
+        "tests/test_*_pure.py",
+        "https://download.blender.org/release/Blender4.5",
+        "blender-4.5.13-linux-x64.tar.xz",
+        "blender-4.5.13.sha256",
+        "${#checksum_matches[@]} != 1",
+        "sha256sum -c -",
+        "scripts/dev_bootstrap.py",
+        "tests/blender_smoke.py",
+        "tests/blender_v1.py",
+        "tests/blender_quality.py",
+        "tests/blender_texture.py",
+        "extension validate .",
+        "extension build",
+        "--output-filepath",
+        'ASSET_NAME=uvmapping_blender-v${manifest_version}.zip',
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1",
+        "needs: verify",
+        "gh release create",
+        "--verify-tag",
+        "--draft",
+        "gh release upload",
+        "--clobber",
+        "isDraft",
+        "distribution/releases.lock.json",
+        "GITHUB_STEP_SUMMARY",
+    )
+    for token in required_tokens:
+        _require(token in workflow, f"Release 워크플로우에 필수 요소가 없습니다: {token}")
+
+    _require("pull_request_target:" not in workflow, "Release는 pull_request_target에서 실행하면 안 됩니다.")
+    _require("types: [published]" not in workflow, "태그 워크플로우가 공개 Release 이벤트를 사용하면 안 됩니다.")
+    _require("gh release edit" not in workflow, "태그 워크플로우가 Release를 공개하면 안 됩니다.")
+    _require("--draft=false" not in workflow, "태그 워크플로우가 초안을 공개하면 안 됩니다.")
+    _require(
+        not re.search(r"^\s+uses:\s+[^#\s]+@v\d+", workflow, flags=re.MULTILINE),
+        "Release Action은 변경 가능한 메이저 태그가 아닌 전체 커밋 SHA로 고정해야 합니다.",
+    )
+    used_actions = set(re.findall(r"^\s+uses:\s+([^\s#]+)", workflow, flags=re.MULTILINE))
+    expected_actions = {
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+    }
+    _require(used_actions == expected_actions, "Release Action 집합 또는 고정 SHA가 다릅니다.")
+    verify_block, draft_block = workflow.split("\n  draft:\n", maxsplit=1)
+    _require("contents: write" not in verify_block, "Release 검증 작업에는 쓰기 권한이 필요하지 않습니다.")
+    _require("permissions:\n      contents: write" in draft_block, "초안 생성 작업에만 contents 쓰기 권한이 있어야 합니다.")
+    run_directives = re.findall(r"^\s+run:\s*(.*)$", workflow, flags=re.MULTILINE)
+    _require(run_directives and all(value == "|" for value in run_directives), "Release 실행 단계는 모두 블록 셸이어야 합니다.")
+    _require(
+        len(run_directives) == workflow.count("set -euo pipefail"),
+        "모든 Release 실행 단계는 set -euo pipefail로 시작해야 합니다.",
+    )
+
+
 def _check_extension_repository_script() -> None:
     script = _read("scripts/check_extension_repository.py")
     compile(script, "scripts/check_extension_repository.py", "exec")
@@ -300,6 +449,8 @@ def main() -> None:
     _check_macos_launcher()
     _check_windows_launchers()
     _check_bootstrap_and_user_docs()
+    _check_ci_workflow()
+    _check_release_workflow()
     _check_extension_pages_workflow()
     _check_extension_repository_script()
     _check_release_lock()

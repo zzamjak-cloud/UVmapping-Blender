@@ -6,6 +6,7 @@
 
 - Blender 4.5 LTS 이상
 - 편집 가능한 Mesh 객체
+- AI 손맵 텍스처 기능 사용 시 Gemini 또는 OpenAI API 키와 Blender의 Online Access 허용
 
 ## 설치
 
@@ -33,6 +34,24 @@ Blender의 Extension 저장소를 새로 고치면 사용 가능한 업데이트
 5. `Seam 보기`를 눌러 후보를 확인합니다. 미리보기를 없애려면 `Seam 숨기기`를 누릅니다.
 6. `UV 언랩`을 누르면 선택된 모든 Mesh에 Seam 생성, 언랩, 패킹이 실행됩니다.
 7. 완료된 UV는 기본적으로 `AutoUV` UV 레이어에서 확인할 수 있습니다.
+
+### AI 손맵 텍스처 디자인
+
+1. 먼저 모델에 `UV 언랩`을 실행한 뒤 같은 Mesh 객체를 선택합니다.
+2. `AI 손맵 텍스처` 패널에서 Pinterest 등에서 저장한 JPG, PNG 또는 WebP 참조 이미지를 최대 5장 추가합니다. macOS와 Windows에서는 브라우저의 `이미지 복사` 후 `클립보드` 버튼으로 바로 붙여넣을 수도 있습니다.
+3. `Edit > Preferences > Add-ons > UV Mapping Blender`에서 사용할 Provider의 개인 API 키를 입력합니다. 키는 프로젝트나 `.blend`가 아닌 Blender 개인 환경설정에 저장되고 입력창에서는 가려지지만, OS Keychain 암호화 저장소는 아닙니다. 공유 PC에서는 환경 변수 `GEMINI_API_KEY` 또는 `OPENAI_API_KEY` 사용을 권장합니다.
+4. 패널 상단의 `이미지 생성 모델`에서 `Nano Banana Pro` 또는 `GPT-Image-2 (덕테이프)` 버튼을 선택하고 `참조 이미지 분석`을 누릅니다. 선택한 모델에 맞춰 분석 Provider와 3면도 생성 모델이 함께 전환됩니다.
+5. 참조 이미지에 없는 요구만 `추가 지시`에 한 문장으로 입력합니다. Blender의 한글 조합이 불안정하면 `한글 프롬프트 입력` 버튼을 눌러 OS 입력 창에서 작성합니다. 완료하면 한 줄로 정리되어 반영되고, 취소하면 기존 내용이 유지됩니다.
+6. `단일 3면도 생성`을 누르면 선택 모델을 FRONT, RIGHT, BACK 방향으로 로컬 캡처한 뒤 Nano Banana Pro 또는 GPT-Image-2를 한 번만 호출합니다. GPT-Image-2는 2352×1008 해상도와 결과 한 장으로 고정됩니다.
+7. 결과는 세 방향이 같은 폭으로 들어간 이미지 한 장과 로컬에서 분리한 세 이미지로 저장됩니다. 저장된 `.blend`는 옆의 `textures` 폴더, 저장하지 않은 파일은 임시 폴더를 사용합니다.
+8. `Diffuse/Albedo 적용`을 누르면 FRONT, RIGHT, BACK과 좌우 반전한 측면을 모델 표면에 깊이 인식 투영하고 현재 Auto UV Atlas로 베이크합니다. 이 단계는 로컬 처리이므로 AI를 다시 호출하거나 추가 비용을 사용하지 않습니다.
+9. 완성된 PNG와 sRGB Image Texture가 연결된 Principled BSDF 머티리얼이 선택 Mesh에 적용됩니다. 원본 머티리얼 슬롯은 삭제하지 않습니다.
+
+현재 CPU 베이크는 최대 4096×4096을 지원하며 기본 2048×2048을 권장합니다. 3면도에 직접 보이지 않는 상·하면은 인접 시점의 색을 확장해 채우므로, 의미 있는 상면 그림이 꼭 필요한 에셋은 추후 상면 참조 또는 별도 보정을 권장합니다. 모델 Transform, 메시 또는 UV가 3면도 생성 뒤 바뀌면 잘못 투영하지 않고 재생성을 안내합니다.
+
+## 릴리스 운영
+
+`v*` 태그를 push하면 전체 회귀 검사와 공식 Blender Extension 빌드를 거쳐 GitHub Release 초안과 ZIP 자산까지만 생성합니다. 초안은 자동으로 공개하지 않습니다. 자산의 크기, SHA-256, 태그 대상 커밋을 `distribution/releases.lock.json`에 반영해 기본 브랜치에 push한 뒤 초안을 공개해야 합니다. 공개 이벤트가 발생하면 Pages 워크플로우가 잠금 값과 자산을 다시 검증하고 원격 Extension 저장소를 갱신합니다.
 
 ## 라이선스
 

@@ -44,7 +44,7 @@ class TextureJob:
     uv_bounds: tuple[Vec2, Vec2]
     texel_density: dict[str, Any]
     quality: dict[str, Any]
-    addon_version: str = "1.1.0"
+    addon_version: str = "1.2.0"
     job_id: str = ""
     topology_hash: str = ""
     geometry_hash: str = ""
@@ -633,7 +633,7 @@ def build_texture_job(
     quality_report: UVQualityReport,
     seam_edges: Sequence[int],
     *,
-    addon_version: str = "1.1.0",
+    addon_version: str = "1.2.0",
     resolution: int | Sequence[int] = (2048, 2048),
     padding: int = 16,
     udim_tiles: Sequence[int] = (1001,),

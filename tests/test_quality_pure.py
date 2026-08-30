@@ -612,7 +612,7 @@ def test_texture_job_hash_and_islands_are_deterministic() -> None:
     assert first.texel_density["global"] > 0.0
     assert first.texel_density["unit"] == "uv_per_object_unit"
     assert first.overlap_status == report.overlap_status
-    assert first.addon_version == "1.1.0"
+    assert first.addon_version == "1.2.0"
     assert first.resolution == (2048, 2048)
     assert first.padding == 16
     assert first.udim_tiles == (1001,)

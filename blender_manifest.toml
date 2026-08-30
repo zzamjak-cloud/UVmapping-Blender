@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "uvmapping_blender"
-version = "1.1.0"
+version = "1.2.0"
 name = "UV Mapping Blender"
 tagline = "메시 흐름을 분석해 Seam 생성부터 UV 패킹까지 자동화합니다"
 maintainer = "zzamjak-cloud"
@@ -10,11 +10,19 @@ type = "add-on"
 blender_version_min = "4.5.0"
 license = ["SPDX:GPL-3.0-or-later"]
 
+[permissions]
+network = "AI 참조 분석과 텍스처 디자인 생성에 필요"
+files = "참조 이미지 읽기와 생성 결과 저장에 필요"
+clipboard = "브라우저에서 복사한 참조 이미지를 붙여넣는 데 필요"
+
 [build]
 paths_exclude_pattern = [
   "__pycache__/",
   "/.git/",
+  "/.github/",
+  "/.pytest_cache/",
   "/.serena/",
+  "/distribution/",
   "/*.zip",
   "/tests/",
   "/scripts/",
