@@ -572,6 +572,103 @@ def _test_independent_and_context_restore() -> None:
     print("[v1] 독립 Mesh 다중 처리와 Edit Mode 상태 복원 통과")
 
 
+def _test_uv_select_mode_restore_guard() -> None:
+    operators = importlib.import_module(f"{MODULE_NAME}.uvmapping.operators")
+
+    class TrackingToolSettings:
+        def __init__(self, uv_select_mode):
+            self.mesh_select_mode = (True, False, False)
+            self.use_uv_select_sync = False
+            self._uv_select_mode = uv_select_mode
+            self.uv_select_mode_writes = []
+
+        @property
+        def uv_select_mode(self):
+            return self._uv_select_mode
+
+        @uv_select_mode.setter
+        def uv_select_mode(self, value):
+            self.uv_select_mode_writes.append(value)
+            self._uv_select_mode = value
+
+    class EmptyObjects:
+        active = None
+
+        def __iter__(self):
+            return iter(())
+
+    class FakeContext:
+        def __init__(self, tool_settings):
+            self.tool_settings = tool_settings
+            self.view_layer = type("FakeViewLayer", (), {"objects": EmptyObjects()})()
+
+    def restored_state(current_mode, captured_mode):
+        tool_settings = TrackingToolSettings(current_mode)
+        state = operators._ContextState.__new__(operators._ContextState)
+        state.context = FakeContext(tool_settings)
+        state.targets = ()
+        state.active_object = None
+        state.active_mode = "OBJECT"
+        state.objects_in_mode = ()
+        state.object_selection = ()
+        state.mesh_select_mode = (True, False, False)
+        state.use_uv_select_sync = False
+        state.uv_select_mode = captured_mode
+        state.mesh_states = {}
+        state.mesh_replacements = {}
+        state.prepared = True
+        state.restore()
+        return tool_settings
+
+    unchanged = restored_state("VERTEX", "VERTEX")
+    assert unchanged.uv_select_mode_writes == [], (
+        "동일한 UV 선택 모드를 불필요하게 다시 설정했습니다."
+    )
+
+    changed = restored_state("EDGE", "VERTEX")
+    assert changed.uv_select_mode == "VERTEX"
+    assert changed.uv_select_mode_writes == ["VERTEX"]
+    print("[v1] UV 선택 모드의 조건부 상태 복원 통과")
+
+
+def _test_mesh_selection_restore_avoids_uv_loop_data() -> None:
+    operators = importlib.import_module(f"{MODULE_NAME}.uvmapping.operators")
+
+    class SelectionItem:
+        def __init__(self):
+            self.select = False
+
+    class ForbiddenUVLayers:
+        def __iter__(self):
+            raise AssertionError("교체 Mesh의 UV loop 선택 데이터에 접근했습니다.")
+
+    class FakeMesh:
+        def __init__(self):
+            self.vertices = [SelectionItem(), SelectionItem()]
+            self.edges = [SelectionItem()]
+            self.polygons = [SelectionItem()]
+            self.uv_layers = ForbiddenUVLayers()
+            self.update_count = 0
+
+        def update(self):
+            self.update_count += 1
+
+    mesh = FakeMesh()
+    operators._restore_mesh_selection(
+        mesh,
+        {
+            "vertices": (True, False),
+            "edges": (True,),
+            "polygons": (True,),
+        },
+    )
+    assert [item.select for item in mesh.vertices] == [True, False]
+    assert [item.select for item in mesh.edges] == [True]
+    assert [item.select for item in mesh.polygons] == [True]
+    assert mesh.update_count == 1
+    print("[v1] Mesh 선택 복원 중 UV loop 데이터 비접근 통과")
+
+
 def _test_independent_pack_mode() -> None:
     _clear_scene()
     settings = bpy.context.scene.uvmapping_settings
@@ -793,6 +890,8 @@ def main() -> None:
         _test_preview_overlay_registry_and_stale_cleanup()
         _test_partial_shared_preview_survives_other_user_unwrap()
         _test_padding_boundaries_and_small_resolutions()
+        _test_uv_select_mode_restore_guard()
+        _test_mesh_selection_restore_avoids_uv_loop_data()
         _test_independent_and_context_restore()
         _test_shared_atlas_pixel_padding()
         _test_independent_pack_mode()

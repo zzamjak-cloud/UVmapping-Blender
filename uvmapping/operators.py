@@ -153,20 +153,10 @@ def _write_seams(mesh, seam_edges, preserve):
 
 
 def _capture_mesh_selection(mesh):
-    uv_selection = {}
-    for layer in mesh.uv_layers:
-        uv_selection[layer.name] = tuple(
-            (
-                bool(getattr(loop, "select", False)),
-                bool(getattr(loop, "select_edge", False)),
-            )
-            for loop in layer.data
-        )
     return {
         "vertices": tuple(vertex.select for vertex in mesh.vertices),
         "edges": tuple(edge.select for edge in mesh.edges),
         "polygons": tuple(polygon.select for polygon in mesh.polygons),
-        "uv_selection": uv_selection,
     }
 
 
@@ -178,16 +168,9 @@ def _restore_mesh_selection(mesh, snapshot):
     for item, selected in zip(mesh.polygons, snapshot["polygons"], strict=False):
         item.select = selected
 
-    saved_layers = snapshot["uv_selection"]
-    for layer in mesh.uv_layers:
-        saved = saved_layers.get(layer.name)
-        if saved is None:
-            saved = ((False, False),) * len(layer.data)
-        for loop, (selected, edge_selected) in zip(layer.data, saved, strict=False):
-            if hasattr(loop, "select"):
-                loop.select = selected
-            if hasattr(loop, "select_edge"):
-                loop.select_edge = edge_selected
+    # Blender 4.5에서는 교체 Mesh의 ``MeshUVLoopLayer.data`` 선택값을 다시 쓰면
+    # 암시적 공유 CustomData가 손상될 수 있다. UV 연산 결과의 선택은 유지하고,
+    # 원본 Mesh 요소 선택과 ToolSettings만 복구한다.
     mesh.update()
 
 
@@ -313,7 +296,10 @@ class _ContextState:
 
         self.context.tool_settings.mesh_select_mode = self.mesh_select_mode
         self.context.tool_settings.use_uv_select_sync = self.use_uv_select_sync
-        if self.uv_select_mode is not None:
+        if (
+            self.uv_select_mode is not None
+            and self.context.tool_settings.uv_select_mode != self.uv_select_mode
+        ):
             self.context.tool_settings.uv_select_mode = self.uv_select_mode
 
         for key, (source_mesh, snapshot) in self.mesh_states.items():

@@ -22,6 +22,7 @@ jobs:
       BLENDER_CHECKSUM: blender-4.5.13.sha256
       BLENDER_DOWNLOAD_ROOT: https://download.blender.org/release/Blender4.5
       BLENDER_CACHE_DIR: /home/runner/.cache/blender
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: 태그 소스 체크아웃
@@ -141,8 +142,15 @@ jobs:
             tests/blender_quality.py \
             tests/blender_texture.py
           do
+            echo "::group::Blender 통합 회귀: ${test_file}"
             "${BLENDER_BIN}" --background --python-exit-code 1 \
-              --python "${test_file}"
+              --python "${test_file}" || {
+                exit_code=$?
+                echo "::endgroup::"
+                echo "Blender 통합 테스트 실패: ${test_file} (종료 코드 ${exit_code})" >&2
+                exit "${exit_code}"
+              }
+            echo "::endgroup::"
           done
 
       - name: Extension 소스 빌드 및 공식 검증
