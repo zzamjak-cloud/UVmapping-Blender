@@ -30,6 +30,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Blender headless EGL 런타임 설치
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libegl1
+
       - name: 태그와 매니페스트 버전 대조
         shell: bash
         run: |

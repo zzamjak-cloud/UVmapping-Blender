@@ -290,6 +290,9 @@ def _check_ci_workflow() -> None:
         "contents: read",
         "concurrency:",
         "cancel-in-progress: true",
+        "Blender headless EGL 런타임 설치",
+        "sudo apt-get update",
+        "sudo apt-get install --yes --no-install-recommends libegl1",
         "python3 tests/check_project.py",
         "tests/test_*_pure.py",
         "https://download.blender.org/release/Blender4.5",
@@ -314,6 +317,7 @@ def _check_ci_workflow() -> None:
 
     _require("pull_request_target:" not in workflow, "CI는 pull_request_target에서 실행하면 안 됩니다.")
     _require("contents: write" not in workflow, "CI에는 저장소 쓰기 권한이 필요하지 않습니다.")
+    _require("apt-get upgrade" not in workflow, "CI에서 시스템 패키지 전체 업그레이드를 실행하면 안 됩니다.")
     _require(
         not re.search(r"^\s+uses:\s+[^#\s]+@v\d+", workflow, flags=re.MULTILINE),
         "CI Action은 변경 가능한 메이저 태그가 아닌 전체 커밋 SHA로 고정해야 합니다.",
@@ -342,6 +346,9 @@ def _check_release_workflow() -> None:
         "contents: read",
         "contents: write",
         "cancel-in-progress: false",
+        "Blender headless EGL 런타임 설치",
+        "sudo apt-get update",
+        "sudo apt-get install --yes --no-install-recommends libegl1",
         "GITHUB_REF_TYPE",
         "GITHUB_REF_NAME",
         '"v${manifest_version}"',
@@ -383,6 +390,7 @@ def _check_release_workflow() -> None:
 
     _require("pull_request_target:" not in workflow, "Release는 pull_request_target에서 실행하면 안 됩니다.")
     _require("types: [published]" not in workflow, "태그 워크플로우가 공개 Release 이벤트를 사용하면 안 됩니다.")
+    _require("apt-get upgrade" not in workflow, "Release에서 시스템 패키지 전체 업그레이드를 실행하면 안 됩니다.")
     _require("gh release edit" not in workflow, "태그 워크플로우가 Release를 공개하면 안 됩니다.")
     _require("--draft=false" not in workflow, "태그 워크플로우가 초안을 공개하면 안 됩니다.")
     _require(
