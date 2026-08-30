@@ -1,4 +1,4 @@
-"""Blender 메시 분석과 자동 UV 언랩 연산자."""
+"""Blender 메시 분석과 UV 언랩 연산자."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import bpy
 from bpy.props import IntProperty
 from bpy.types import Operator
 
+from . import preview
 from .analysis import analyze_mesh, generate_analysis_candidates
 from .contracts import build_atlas_context, build_texture_job
 from .quality import (
@@ -23,7 +24,6 @@ from .quality import (
 from .types import AnalysisOptions
 
 
-PREVIEW_ATTRIBUTE = "_uvmapping_preview_seam"
 QUALITY_PROPERTY = "uvmapping_quality"
 TEXTURE_JOB_PROPERTY = "uvmapping_texture_job"
 TEXTURE_TARGET_UDIMS = (1001,)
@@ -60,21 +60,10 @@ class _CandidateArtifact:
     atlas_context: dict[str, Any] | None = None
 
 
-def _active_mesh_object(context):
-    obj = context.view_layer.objects.active
-    if obj is None or obj.type != "MESH" or obj.data is None:
-        return None
-    return obj
+def _target_objects(context):
+    """현재 선택된 편집 가능 Mesh만 결정론적 순서로 반환합니다."""
 
-
-def _target_objects(context, settings):
-    if settings.process_selected_objects:
-        candidates = getattr(context, "selected_editable_objects", None)
-        if candidates is None:
-            candidates = context.selected_objects
-    else:
-        active = _active_mesh_object(context)
-        candidates = (active,) if active is not None else ()
+    candidates = getattr(context, "selected_editable_objects", ())
 
     targets = {
         obj.as_pointer(): obj
@@ -226,6 +215,7 @@ def _require_finished(result, label):
 
 
 def _run_uv_pipeline(settings):
+    _, _, packing_margin = _atlas_margin(settings)
     method = _unwrap_method()
     unwrap_args = {
         "method": method,
@@ -251,8 +241,8 @@ def _run_uv_pipeline(settings):
         bpy.ops.uv.pack_islands(
             rotate=True,
             scale=True,
-            margin_method="SCALED",
-            margin=settings.island_margin,
+            margin_method="FRACTION",
+            margin=packing_margin,
         ),
         "UV 패킹",
     )
@@ -457,8 +447,6 @@ def _evaluate_candidate(context, state, group, analysis, settings, candidate_ind
             seam_count=len(analysis.seam_edges),
             chart_count=getattr(analysis, "chart_count", 0),
         )
-        # 원본의 미리보기 속성이 scratch에 복제됐더라도 결과 datablock에는 남기지 않는다.
-        _clear_preview(scratch_mesh)
         artifact = _CandidateArtifact(
             group=group,
             mesh=scratch_mesh,
@@ -529,9 +517,13 @@ def _atlas_margin(settings):
         raise ValueError("텍스처 해상도는 0보다 커야 합니다.")
     if padding < 0:
         raise ValueError("패딩 픽셀은 0 이상이어야 합니다.")
+    maximum_padding = max(0, resolution // 2 - 1)
+    if padding * 2 >= resolution:
+        raise ValueError(
+            f"{resolution}px 텍스처의 UV 패딩은 "
+            f"{maximum_padding}px 이하여야 합니다."
+        )
     margin = padding / resolution
-    if margin > 1.0:
-        raise ValueError("패딩 픽셀은 텍스처 해상도보다 클 수 없습니다.")
     return resolution, padding, margin
 
 
@@ -794,35 +786,6 @@ def _rollback_commit(snapshots, state):
     state.clear_mesh_replacements()
 
 
-def _preview_attribute(mesh):
-    attribute = mesh.attributes.get(PREVIEW_ATTRIBUTE)
-    if attribute is not None and (
-        attribute.domain != "EDGE" or attribute.data_type != "FLOAT"
-    ):
-        mesh.attributes.remove(attribute)
-        attribute = None
-    if attribute is None:
-        attribute = mesh.attributes.new(PREVIEW_ATTRIBUTE, "FLOAT", "EDGE")
-    return attribute
-
-
-def _write_preview(mesh, seam_edges):
-    seam_indices = set(seam_edges)
-    attribute = _preview_attribute(mesh)
-    attribute.data.foreach_set(
-        "value",
-        [1.0 if edge.index in seam_indices else 0.0 for edge in mesh.edges],
-    )
-    mesh.update()
-
-
-def _clear_preview(mesh):
-    attribute = mesh.attributes.get(PREVIEW_ATTRIBUTE)
-    if attribute is not None:
-        mesh.attributes.remove(attribute)
-        mesh.update()
-
-
 def _finalize_success(artifacts):
     """commit 이후의 이름·고아 정리는 실패해도 연산 성공을 되돌리지 않는다."""
 
@@ -831,7 +794,6 @@ def _finalize_success(artifacts):
         source_name = None
         try:
             source_name = source_mesh.name
-            _clear_preview(source_mesh)
         except (ReferenceError, RuntimeError):
             pass
         try:
@@ -844,17 +806,6 @@ def _finalize_success(artifacts):
             except (ReferenceError, RuntimeError):
                 pass
 
-
-def clear_preview_attributes(meshes=None):
-    """등록 해제와 Clear 연산자에서 reserved 미리보기 속성을 정리한다."""
-
-    for mesh in tuple(meshes) if meshes is not None else tuple(bpy.data.meshes):
-        try:
-            _clear_preview(mesh)
-        except (ReferenceError, RuntimeError):
-            pass
-
-
 class UVMAPPING_OT_analyze(Operator):
     """선택 메시를 변경하지 않고 Seam 후보를 분석합니다."""
 
@@ -866,11 +817,11 @@ class UVMAPPING_OT_analyze(Operator):
     @classmethod
     def poll(cls, context):
         settings = getattr(context.scene, "uvmapping_settings", None)
-        return settings is not None and bool(_target_objects(context, settings))
+        return settings is not None and bool(_target_objects(context))
 
     def execute(self, context):
         settings = context.scene.uvmapping_settings
-        targets = _target_objects(context, settings)
+        targets = _target_objects(context)
         groups = _group_targets(targets)
         state = _ContextState(context, targets)
         try:
@@ -903,21 +854,21 @@ class UVMAPPING_OT_analyze(Operator):
 
 
 class UVMAPPING_OT_preview_seams(Operator):
-    """실제 Seam을 바꾸지 않고 EDGE 속성에 기본 후보를 기록합니다."""
+    """실제 Seam을 바꾸지 않고 런타임 오버레이 후보를 등록합니다."""
 
     bl_idname = "uvmapping.preview_seams"
-    bl_label = "Seam 미리보기"
-    bl_description = "실제 Seam을 건드리지 않고 예약 EDGE 속성에 후보를 기록합니다"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_label = "Seam 보기"
+    bl_description = "선택한 메시에서 자동 생성될 Seam 위치를 미리 표시합니다"
+    bl_options = {"REGISTER"}
 
     @classmethod
     def poll(cls, context):
         settings = getattr(context.scene, "uvmapping_settings", None)
-        return settings is not None and bool(_target_objects(context, settings))
+        return settings is not None and bool(_target_objects(context))
 
     def execute(self, context):
         settings = context.scene.uvmapping_settings
-        targets = _target_objects(context, settings)
+        targets = _target_objects(context)
         groups = _group_targets(targets)
         state = _ContextState(context, targets)
         seam_snapshot = {
@@ -927,6 +878,7 @@ class UVMAPPING_OT_preview_seams(Operator):
         try:
             state.prepare()
             total = 0
+            mesh_edge_items = []
             for group in groups:
                 candidates = generate_analysis_candidates(
                     group.source_mesh,
@@ -935,17 +887,20 @@ class UVMAPPING_OT_preview_seams(Operator):
                 )
                 if not candidates:
                     raise RuntimeError(f"{group.source_mesh.name}: Seam 후보가 없습니다.")
-                _write_preview(group.source_mesh, candidates[0].seam_edges)
+                mesh_edge_items.append(
+                    (group.source_mesh, candidates[0].seam_edges)
+                )
                 total += len(candidates[0].seam_edges)
                 if _capture_seams(group.source_mesh) != seam_snapshot[group.source_mesh.as_pointer()]:
                     raise RuntimeError("미리보기가 실제 Seam을 변경했습니다.")
             state.restore()
-            message = f"메시 {len(groups)}개에 Seam 후보 {total}개를 미리보기 속성으로 기록했습니다."
+            preview.activate_targets(targets, mesh_edge_items)
+            message = f"메시 {len(groups)}개에서 Seam 후보 {total}개를 표시했습니다."
             settings.last_result = message
             self.report({"INFO"}, message)
             return {"FINISHED"}
         except Exception as exc:
-            clear_preview_attributes(group.source_mesh for group in groups)
+            preview.deactivate_targets(targets)
             try:
                 state.restore()
             except Exception:
@@ -956,21 +911,23 @@ class UVMAPPING_OT_preview_seams(Operator):
 
 
 class UVMAPPING_OT_clear_preview(Operator):
-    """예약된 Seam 미리보기 EDGE 속성을 제거합니다."""
+    """런타임 Seam 미리보기 오버레이를 숨깁니다."""
 
     bl_idname = "uvmapping.clear_preview"
-    bl_label = "미리보기 지우기"
-    bl_description = "선택 메시에서 Seam 미리보기 속성을 제거합니다"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_label = "Seam 숨기기"
+    bl_description = "Seam 미리보기를 숨깁니다"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "uvmapping_settings", None)
+        return settings is not None and preview.is_active()
 
     def execute(self, context):
         settings = context.scene.uvmapping_settings
-        targets = _target_objects(context, settings)
-        meshes = {obj.data.as_pointer(): obj.data for obj in targets}
-        if not meshes:
-            meshes = {mesh.as_pointer(): mesh for mesh in bpy.data.meshes}
-        clear_preview_attributes(meshes.values())
-        settings.last_result = f"미리보기 속성 {len(meshes)}개 메시에서 정리"
+        hidden_count = preview.target_count()
+        preview.deactivate_all()
+        settings.last_result = f"메시 {hidden_count}개의 Seam 미리보기를 숨겼습니다."
         self.report({"INFO"}, settings.last_result)
         return {"FINISHED"}
 
@@ -979,7 +936,7 @@ class UVMAPPING_OT_auto_unwrap(Operator):
     """후보 평가부터 UV 패킹과 TextureJob 생성까지 한 번에 수행합니다."""
 
     bl_idname = "uvmapping.auto_unwrap"
-    bl_label = "자동 UV 언랩"
+    bl_label = "UV 언랩"
     bl_description = "선택 메시의 후보를 비교해 최선의 UV를 원자적으로 적용합니다"
     bl_options = {"REGISTER", "UNDO"}
 
@@ -1000,17 +957,18 @@ class UVMAPPING_OT_auto_unwrap(Operator):
     @classmethod
     def poll(cls, context):
         settings = getattr(context.scene, "uvmapping_settings", None)
-        return settings is not None and bool(_target_objects(context, settings))
+        return settings is not None and bool(_target_objects(context))
 
     def execute(self, context):
         settings = context.scene.uvmapping_settings
-        targets = _target_objects(context, settings)
+        targets = _target_objects(context)
         groups = _group_targets(targets)
         state = _ContextState(context, targets)
         artifacts = []
         commit_snapshots = []
 
         try:
+            _atlas_margin(settings)
             state.prepare()
             for group in groups:
                 artifacts.append(_evaluate_group(context, state, group, settings))
@@ -1043,11 +1001,12 @@ class UVMAPPING_OT_auto_unwrap(Operator):
             except Exception as restore_exc:
                 self.report({"ERROR"}, f"상태 복구 실패: {restore_exc}")
             _cleanup_atlas_proxies()
-            settings.last_result = f"자동 언랩 실패: {exc}"
+            settings.last_result = f"UV 언랩 실패: {exc}"
             self.report({"ERROR"}, settings.last_result)
             return {"CANCELLED"}
 
         # 여기부터는 원본이 이미 제거될 수 있으므로 transaction rollback 범위 밖이다.
+        preview.deactivate_targets(targets)
         _finalize_success(artifacts)
         seam_count = sum(len(artifact.analysis.seam_edges) for artifact in artifacts)
         valid_count = sum(bool(artifact.quality.valid) for artifact in artifacts)
@@ -1080,11 +1039,9 @@ classes = (
 
 
 __all__ = (
-    "PREVIEW_ATTRIBUTE",
     "QUALITY_PROPERTY",
     "TEXTURE_JOB_PROPERTY",
     "classes",
-    "clear_preview_attributes",
     "UVMAPPING_OT_analyze",
     "UVMAPPING_OT_preview_seams",
     "UVMAPPING_OT_clear_preview",

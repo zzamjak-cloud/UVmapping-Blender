@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import importlib
+
 import bpy
+
+
+MODULE_NAME = "bl_ext.user_default.uvmapping_blender"
 
 
 def _clear_scene() -> None:
@@ -96,7 +101,7 @@ def _check(name: str, create_mesh) -> None:
     bpy.data.objects.remove(mesh_object, do_unlink=True)
 
 
-def main() -> None:
+def _run_quality_checks() -> None:
     _clear_scene()
     settings = bpy.context.scene.uvmapping_settings
     settings.preset = "BALANCED"
@@ -127,6 +132,21 @@ def main() -> None:
     for name, create_mesh in cases:
         _check(name, create_mesh)
     print("[quality] Seam 비율 및 UV overlap 검사 통과")
+
+
+def main() -> None:
+    """개발 프로필의 이전 등록 상태와 무관하게 품질 검사를 독립 실행합니다."""
+
+    module = importlib.import_module(MODULE_NAME)
+    registered_here = not hasattr(bpy.types.Scene, "uvmapping_settings")
+    if registered_here:
+        module.register()
+    try:
+        _run_quality_checks()
+    finally:
+        _clear_scene()
+        if registered_here:
+            module.unregister()
 
 
 if __name__ == "__main__":

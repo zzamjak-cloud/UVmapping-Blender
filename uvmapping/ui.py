@@ -3,11 +3,13 @@
 import bpy
 from bpy.types import Panel
 
+from . import preview
+
 
 class UVMAPPING_PT_main(Panel):
-    """자동 UV 언랩 기본 패널."""
+    """UV 언랩 기본 패널."""
 
-    bl_label = "자동 UV 언랩"
+    bl_label = "UV 언랩"
     bl_idname = "UVMAPPING_PT_main"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -15,8 +17,13 @@ class UVMAPPING_PT_main(Panel):
 
     @classmethod
     def poll(cls, context):
-        obj = context.view_layer.objects.active
-        return obj is not None and obj.type == "MESH"
+        candidates = getattr(context, "selected_editable_objects", ())
+        return preview.is_active() or any(
+            obj.type == "MESH"
+            and obj.data is not None
+            and len(obj.data.polygons) > 0
+            for obj in candidates
+        )
 
     def draw(self, context):
         layout = self.layout
@@ -24,14 +31,13 @@ class UVMAPPING_PT_main(Panel):
 
         layout.prop(settings, "preset", text="")
         layout.prop(settings, "quality_level", text="품질")
-        layout.prop(settings, "process_selected_objects")
         button = layout.column()
         button.scale_y = 1.6
         button.operator("uvmapping.auto_unwrap", icon="UV")
 
         preview = layout.row(align=True)
         preview.operator("uvmapping.preview_seams", icon="SHADING_WIRE")
-        preview.operator("uvmapping.clear_preview", text="지우기", icon="X")
+        preview.operator("uvmapping.clear_preview", icon="X")
 
         if settings.last_result:
             status = layout.box()

@@ -16,7 +16,7 @@ def register():
     import bpy
     from bpy.props import PointerProperty
 
-    from . import operators, ui
+    from . import operators, preview, ui
     from .properties import UVMAPPING_PG_settings
 
     if _registered_classes:
@@ -35,7 +35,9 @@ def register():
             registered.append(cls)
         bpy.types.Scene.uvmapping_settings = PointerProperty(type=UVMAPPING_PG_settings)
         scene_property_registered = True
+        preview.register()
     except Exception:
+        preview.unregister()
         if scene_property_registered and hasattr(bpy.types.Scene, "uvmapping_settings"):
             del bpy.types.Scene.uvmapping_settings
         for cls in reversed(registered):
@@ -55,9 +57,9 @@ def unregister():
 
     import bpy
 
-    from . import operators
+    from . import preview
 
-    operators.clear_preview_attributes()
+    preview.unregister()
 
     if hasattr(bpy.types.Scene, "uvmapping_settings"):
         del bpy.types.Scene.uvmapping_settings

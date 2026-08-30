@@ -22,6 +22,7 @@ REQUIRED_FILES = (
     "scripts/dev_run.ps1",
     "scripts/dev_run.bat",
     "scripts/dev_bootstrap.py",
+    "uvmapping/preview.py",
     "tests/blender_smoke.py",
     "tests/blender_quality.py",
     "tests/blender_v1.py",
@@ -123,7 +124,7 @@ def _check_windows_launchers() -> None:
     _require(all(ord(character) < 128 for character in batch), "배치 파일에는 코드페이지 의존 비 ASCII 문자가 없어야 합니다.")
 
 
-def _check_bootstrap_and_docs() -> None:
+def _check_bootstrap_and_user_docs() -> None:
     bootstrap = _read("scripts/dev_bootstrap.py")
     for token in (
         "bpy.utils.resource_path",
@@ -137,12 +138,42 @@ def _check_bootstrap_and_docs() -> None:
         _require(token in bootstrap, f"부트스트랩에 필수 검사가 없습니다: {token}")
 
     readme = _read("README.md")
-    _require("격리 개발 프로필" in readme, "README에 개발 프로필 설명이 없습니다.")
-    _require("사용자용 원격 설치와의 구분" in readme, "README가 로컬 개발과 원격 설치를 구분하지 않습니다.")
-    _require(
-        "https://zzamjak-cloud.github.io/UVmapping-Blender/index.json" in readme,
-        "README가 공개 Extension 저장소 URL을 명시하지 않습니다.",
+    required_tokens = (
+        "## 요구 사항",
+        "## 설치",
+        "## 사용법",
+        "## 라이선스",
+        "https://zzamjak-cloud.github.io/UVmapping-Blender/index.json",
+        "Check for Updates on Startup",
+        "무인으로 자동 설치되지 않습니다",
+        "3D Viewport > Sidebar(N) > UV Mapping",
+        "프리셋",
+        "품질",
+        "텍스처 크기",
+        "UV 패딩",
+        "선택 객체를 한 장에 배치",
+        "Seam 보기",
+        "Seam 숨기기",
+        "선택하지 않은 객체는 처리되지 않습니다",
+        "선택된 모든 Mesh",
+        "UV 언랩",
+        "AutoUV",
+        "GPL-3.0-or-later",
     )
+    for token in required_tokens:
+        _require(token in readme, f"README 사용자 안내에 필수 내용이 없습니다: {token}")
+
+    removed_development_tokens = (
+        "격리 개발 프로필",
+        "dev_run.sh",
+        "dev_run.ps1",
+        "tests/check_project.py",
+        "TextureJob",
+        "선택 객체 모두 처리",
+        "자동 UV 언랩",
+    )
+    for token in removed_development_tokens:
+        _require(token not in readme, f"README에 사용자와 무관한 개발 문서가 남아 있습니다: {token}")
 
 
 def _check_extension_pages_workflow() -> None:
@@ -268,7 +299,7 @@ def main() -> None:
     _check_operator_source()
     _check_macos_launcher()
     _check_windows_launchers()
-    _check_bootstrap_and_docs()
+    _check_bootstrap_and_user_docs()
     _check_extension_pages_workflow()
     _check_extension_repository_script()
     _check_release_lock()

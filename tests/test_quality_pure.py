@@ -681,15 +681,60 @@ def test_settings_ui_uses_pixel_padding_without_exposing_internal_margin() -> No
         encoding="utf-8"
     )
     ui_source = (root / "uvmapping" / "ui.py").read_text(encoding="utf-8")
+    operators_source = (root / "uvmapping" / "operators.py").read_text(
+        encoding="utf-8"
+    )
+    preview_source = (root / "uvmapping" / "preview.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "texture_resolution: EnumProperty" in properties_source
     assert "padding_pixels: IntProperty" in properties_source
     assert "pack_shared_atlas: BoolProperty" in properties_source
+    assert "process_selected_objects" not in properties_source
+    assert '("256", "256 px"' in properties_source
+    assert '("512", "512 px"' in properties_source
+    assert 'name="UV 패딩"' in properties_source
     assert 'default="2048"' in properties_source
     assert "default=16" in properties_source
     assert 'column.prop(settings, "island_margin")' not in ui_source
     assert 'packing.prop(settings, "texture_resolution")' in ui_source
     assert 'packing.prop(settings, "padding_pixels")' in ui_source
+    assert 'layout.prop(settings, "process_selected_objects")' not in ui_source
+    assert 'bl_label = "UV 언랩"' in ui_source
+    assert "def _target_objects(context):" in operators_source
+    assert "settings.process_selected_objects" not in operators_source
+    assert 'bl_label = "UV 언랩"' in operators_source
+    assert 'bl_label = "Seam 보기"' in operators_source
+    assert 'bl_label = "Seam 숨기기"' in operators_source
+    assert (
+        'bl_description = "선택한 메시에서 자동 생성될 Seam 위치를 미리 표시합니다"'
+        in operators_source
+    )
+    assert 'bl_description = "Seam 미리보기를 숨깁니다"' in operators_source
+    assert "PREVIEW_ATTRIBUTE" not in operators_source
+    assert "PREVIEW_ATTRIBUTE" not in preview_source
+    assert "mesh.attributes" not in preview_source
+    assert "_mesh_edges" in preview_source
+    assert "mesh_edge_indices" in preview_source
+    assert 'margin_method="SCALED"' not in operators_source
+    assert operators_source.count('margin_method="FRACTION"') >= 2
+    assert "padding * 2 >= resolution" in operators_source
+    for token in (
+        "SpaceView3D.draw_handler_add",
+        '"POST_VIEW"',
+        "batch_for_shader",
+        '"LINES"',
+        "session_uid",
+        "depsgraph_update_post",
+        "undo_post",
+        "redo_post",
+        "gpu.state.blend_get()",
+        "gpu.state.depth_mask_get()",
+        "gpu.state.depth_test_get()",
+        "gpu.state.line_width_get()",
+    ):
+        assert token in preview_source
 
 
 if __name__ == "__main__":

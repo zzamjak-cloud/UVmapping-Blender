@@ -8,7 +8,6 @@ import json
 import bpy
 
 
-PREVIEW_ATTRIBUTE = "_uvmapping_preview_seam"
 QUALITY_PROPERTY = "uvmapping_quality"
 TEXTURE_JOB_PROPERTY = "uvmapping_texture_job"
 MODULE_NAME = "bl_ext.user_default.uvmapping_blender"
@@ -73,7 +72,6 @@ def _configure() -> None:
     settings = bpy.context.scene.uvmapping_settings
     settings.preset = "BALANCED"
     settings.quality_level = "FAST"
-    settings.process_selected_objects = True
     settings.generate_texture_job = True
     settings.seam_policy = "REPLACE"
     settings.create_new_uv_layer = True
@@ -82,6 +80,292 @@ def _configure() -> None:
     settings.texture_resolution = "1024"
     settings.padding_pixels = 12
     settings.pack_shared_atlas = True
+
+
+def _test_sidebar_contract() -> None:
+    settings = bpy.context.scene.uvmapping_settings
+    properties = settings.bl_rna.properties
+    assert properties.get("process_selected_objects") is None, (
+        "선택 객체 처리 체크박스 속성이 남아 있습니다."
+    )
+    resolution_items = {
+        item.identifier
+        for item in properties["texture_resolution"].enum_items
+    }
+    assert {"256", "512", "1024", "2048", "4096", "8192"} <= resolution_items
+    assert properties["padding_pixels"].name == "UV 패딩"
+    assert properties["padding_pixels"].description == (
+        "각 UV 조각 가장자리에 확보할 여백을 픽셀 단위로 정합니다"
+    )
+
+    original_resolution = settings.texture_resolution
+    try:
+        for resolution in ("256", "512"):
+            settings.texture_resolution = resolution
+            expected_margin = settings.padding_pixels / int(resolution)
+            assert abs(settings.island_margin - expected_margin) < 1.0e-9
+    finally:
+        settings.texture_resolution = original_resolution
+
+    operators = importlib.import_module(f"{MODULE_NAME}.uvmapping.operators")
+    ui = importlib.import_module(f"{MODULE_NAME}.uvmapping.ui")
+    assert ui.UVMAPPING_PT_main.bl_label == "UV 언랩"
+    assert operators.UVMAPPING_OT_auto_unwrap.bl_idname == "uvmapping.auto_unwrap"
+    assert operators.UVMAPPING_OT_auto_unwrap.bl_label == "UV 언랩"
+    assert operators.UVMAPPING_OT_preview_seams.bl_label == "Seam 보기"
+    assert operators.UVMAPPING_OT_preview_seams.bl_description == (
+        "선택한 메시에서 자동 생성될 Seam 위치를 미리 표시합니다"
+    )
+    assert operators.UVMAPPING_OT_preview_seams.bl_options == {"REGISTER"}
+    assert operators.UVMAPPING_OT_clear_preview.bl_label == "Seam 숨기기"
+    assert operators.UVMAPPING_OT_clear_preview.bl_description == (
+        "Seam 미리보기를 숨깁니다"
+    )
+    assert operators.UVMAPPING_OT_clear_preview.bl_options == {"REGISTER"}
+    print("[v1] 사이드바 라벨, 툴팁, 256/512 해상도 계약 통과")
+
+
+def _test_selected_meshes_only() -> None:
+    _clear_scene()
+    preview = importlib.import_module(f"{MODULE_NAME}.uvmapping.preview")
+    selected = _cube("SelectedTarget", (-2.0, 0.0, 0.0))
+    untouched = _cube("UnselectedTarget", (2.0, 0.0, 0.0))
+    selected_mesh = selected.data
+    untouched_mesh = untouched.data
+    untouched_seams = tuple(edge.use_seam for edge in untouched.data.edges)
+    untouched_uv_count = len(untouched.data.uv_layers)
+    selected_attributes = tuple(attribute.name for attribute in selected.data.attributes)
+    untouched_attributes = tuple(attribute.name for attribute in untouched.data.attributes)
+    _select((selected,), active=selected)
+
+    result = bpy.ops.uvmapping.analyze()
+    assert result == {"FINISHED"}, f"선택 대상 분석 실패: {result}"
+    assert "객체 1개/메시 1개" in bpy.context.scene.uvmapping_settings.last_result
+    assert untouched.data == untouched_mesh
+    assert len(untouched.data.uv_layers) == untouched_uv_count
+
+    result = bpy.ops.uvmapping.preview_seams()
+    assert result == {"FINISHED"}, f"선택 대상 Seam 보기 실패: {result}"
+    assert preview.mesh_edge_indices(selected_mesh)
+    assert not preview.mesh_edge_indices(untouched_mesh)
+    assert tuple(attribute.name for attribute in selected.data.attributes) == selected_attributes
+    assert tuple(attribute.name for attribute in untouched.data.attributes) == untouched_attributes
+
+    result = bpy.ops.uvmapping.clear_preview()
+    assert result == {"FINISHED"}, f"선택 대상 Seam 숨기기 실패: {result}"
+    assert not preview.mesh_edge_indices(selected_mesh)
+    assert not preview.mesh_edge_indices(untouched_mesh)
+
+    result = bpy.ops.uvmapping.auto_unwrap()
+    assert result == {"FINISHED"}, f"선택 대상 UV 언랩 실패: {result}"
+    _assert_result(selected)
+    assert selected.data != untouched_mesh
+    assert untouched.data == untouched_mesh, "미선택 객체의 Mesh binding이 바뀌었습니다."
+    assert tuple(edge.use_seam for edge in untouched.data.edges) == untouched_seams
+    assert len(untouched.data.uv_layers) == untouched_uv_count
+    assert tuple(attribute.name for attribute in untouched.data.attributes) == untouched_attributes
+    assert selected.select_get() and not untouched.select_get()
+    print("[v1] 분석, Seam 보기/숨기기, UV 언랩의 미선택 Mesh 제외 통과")
+
+
+def _test_preview_overlay_registry_and_stale_cleanup() -> None:
+    _clear_scene()
+    preview = importlib.import_module(f"{MODULE_NAME}.uvmapping.preview")
+    ui = importlib.import_module(f"{MODULE_NAME}.uvmapping.ui")
+    selected = _cube("OverlaySelected")
+    unselected_user = _linked_copy(selected, "OverlayUnselected", (3.0, 0.0, 0.0))
+    _select((selected,), active=selected)
+
+    result = bpy.ops.uvmapping.preview_seams()
+    assert result == {"FINISHED"}, f"공유 Mesh Seam 보기 실패: {result}"
+    assert preview.is_active() and preview.draw_handler_active()
+    assert preview.target_count() == 1
+    assert preview.target_object_uids() == (selected.session_uid,)
+    assert unselected_user.session_uid not in preview.target_object_uids()
+    assert preview.mesh_edge_indices(selected.data)
+    original_attributes = tuple(
+        attribute.name for attribute in selected.data.attributes
+    )
+
+    original_get_shader = preview._get_shader
+    original_batch_for_shader = preview.batch_for_shader
+    preview._get_shader = lambda: object()
+    preview.batch_for_shader = lambda _shader, primitive, content: (
+        primitive,
+        tuple(content["pos"]),
+    )
+    try:
+        first_batch = preview._batch_for_mesh(selected.data)
+        second_batch = preview._batch_for_mesh(selected.data)
+        assert first_batch is not None and first_batch is second_batch
+        assert preview.batch_cache_size() == 1
+    finally:
+        preview._get_shader = original_get_shader
+        preview.batch_for_shader = original_batch_for_shader
+        preview._batch_cache.clear()
+    preview._draw_callback()
+
+    bpy.ops.object.select_all(action="DESELECT")
+    bpy.context.view_layer.objects.active = None
+    assert ui.UVMAPPING_PT_main.poll(bpy.context), (
+        "활성 미리보기 중 선택이 없으면 패널이 숨겨졌습니다."
+    )
+    assert bpy.ops.uvmapping.clear_preview.poll(), (
+        "선택 변경 뒤 Seam 숨기기를 실행할 수 없습니다."
+    )
+    result = bpy.ops.uvmapping.clear_preview()
+    assert result == {"FINISHED"}, f"선택 변경 뒤 Seam 숨기기 실패: {result}"
+    assert not preview.mesh_edge_indices(selected.data)
+    assert tuple(attribute.name for attribute in selected.data.attributes) == original_attributes
+    assert not preview.is_active() and not preview.draw_handler_active()
+    assert preview.batch_cache_size() == 0
+
+    _select((selected, unselected_user), active=selected)
+    result = bpy.ops.uvmapping.preview_seams()
+    assert result == {"FINISHED"}
+    shared_mesh = selected.data
+    assert preview.target_count() == 2
+    assert preview.has_mesh_targets(shared_mesh)
+    shared_edges = preview.mesh_edge_indices(shared_mesh)
+    assert shared_edges
+
+    selected.name = "OverlayRenamed"
+    assert preview.prune_stale_targets() == 0
+    renamed_target = preview._targets[selected.session_uid]
+    assert renamed_target.object_name == selected.name_full
+
+    selected.data = shared_mesh.copy()
+    assert preview.prune_stale_targets() == 1
+    assert preview.target_count() == 1
+    assert preview.target_object_uids() == (unselected_user.session_uid,)
+    assert preview.has_mesh_targets(shared_mesh)
+    assert preview.mesh_edge_indices(shared_mesh) == shared_edges
+
+    preview._history_update()
+    assert preview.target_count() == 1, "Undo 경계가 runtime target을 지웠습니다."
+    assert preview.has_mesh_targets(shared_mesh)
+    assert preview.mesh_edge_indices(shared_mesh) == shared_edges
+
+    bpy.ops.object.select_all(action="DESELECT")
+    bpy.context.view_layer.objects.active = None
+    result = bpy.ops.uvmapping.clear_preview()
+    assert result == {"FINISHED"}
+    assert not preview.mesh_edge_indices(shared_mesh)
+    assert not preview.is_active() and not preview.draw_handler_active()
+    preview._draw_callback()
+    print(
+        "[v1] GPU overlay registry, O(1) 이름 재해결, 공유 stale와 Undo tombstone 통과"
+    )
+
+
+def _test_partial_shared_preview_survives_other_user_unwrap() -> None:
+    _clear_scene()
+    preview = importlib.import_module(f"{MODULE_NAME}.uvmapping.preview")
+    first = _cube("PreviewPartialA")
+    second = _linked_copy(first, "PreviewPartialB", (3.0, 0.0, 0.0))
+    shared_mesh = first.data
+    _select((first, second), active=first)
+
+    result = bpy.ops.uvmapping.preview_seams()
+    assert result == {"FINISHED"}
+    assert preview.target_count() == 2
+    shared_edges = preview.mesh_edge_indices(shared_mesh)
+    assert shared_edges
+    original_attributes = tuple(
+        attribute.name for attribute in shared_mesh.attributes
+    )
+
+    _select((first,), active=first)
+    result = bpy.ops.uvmapping.auto_unwrap()
+    assert result == {"FINISHED"}, f"부분 공유 미리보기 뒤 UV 언랩 실패: {result}"
+    _assert_result(first)
+    assert first.data != shared_mesh
+    assert not preview.mesh_edge_indices(first.data)
+    assert second.data == shared_mesh
+    assert preview.mesh_edge_indices(shared_mesh) == shared_edges
+    assert preview.target_object_uids() == (second.session_uid,)
+    assert preview.has_mesh_targets(shared_mesh)
+    assert tuple(attribute.name for attribute in shared_mesh.attributes) == original_attributes
+
+    bpy.ops.object.select_all(action="DESELECT")
+    bpy.context.view_layer.objects.active = None
+    result = bpy.ops.uvmapping.clear_preview()
+    assert result == {"FINISHED"}
+    assert not preview.mesh_edge_indices(shared_mesh)
+    assert not preview.is_active()
+    print("[v1] 공유 Mesh 한 user 언랩 뒤 다른 user 미리보기 보존 통과")
+
+
+def _test_padding_boundaries_and_small_resolutions() -> None:
+    settings = bpy.context.scene.uvmapping_settings
+    operators = importlib.import_module(f"{MODULE_NAME}.uvmapping.operators")
+    original_resolution = settings.texture_resolution
+    original_padding = settings.padding_pixels
+    original_shared = settings.pack_shared_atlas
+    try:
+        settings.texture_resolution = "256"
+        settings.padding_pixels = 127
+        assert operators._atlas_margin(settings) == (256, 127, 127 / 256)
+
+        invalid_cases = (
+            ("256", 128, 127),
+            ("256", 256, 127),
+            ("512", 256, 255),
+        )
+        for resolution, padding, maximum in invalid_cases:
+            _clear_scene()
+            obj = _cube(f"InvalidPadding{resolution}_{padding}")
+            original_mesh = obj.data
+            original_seams = tuple(edge.use_seam for edge in obj.data.edges)
+            _select((obj,), active=obj)
+            settings.texture_resolution = resolution
+            settings.padding_pixels = padding
+            try:
+                result = bpy.ops.uvmapping.auto_unwrap()
+            except RuntimeError as exc:
+                assert f"{maximum}px 이하여야 합니다" in str(exc)
+                result = {"CANCELLED"}
+            assert result == {"CANCELLED"}, (
+                f"{resolution}/{padding}px 패딩이 거부되지 않았습니다: {result}"
+            )
+            assert f"{maximum}px 이하여야 합니다" in settings.last_result
+            assert obj.data == original_mesh
+            assert tuple(edge.use_seam for edge in obj.data.edges) == original_seams
+            assert len(obj.data.uv_layers) == 0
+            assert QUALITY_PROPERTY not in obj and TEXTURE_JOB_PROPERTY not in obj
+
+        for resolution in ("256", "512"):
+            for shared in (True, False):
+                _clear_scene()
+                first = _plane(f"Small{resolution}_{shared}A", (-2.0, 0.0, 0.0))
+                second = _plane(f"Small{resolution}_{shared}B", (2.0, 0.0, 0.0))
+                _select((first, second), active=first)
+                settings.texture_resolution = resolution
+                settings.padding_pixels = 16
+                settings.pack_shared_atlas = shared
+                result = bpy.ops.uvmapping.auto_unwrap()
+                assert result == {"FINISHED"}, (
+                    f"{resolution}/16px shared={shared} 패킹 실패: {result}"
+                )
+                for obj in (first, second):
+                    _assert_result(obj)
+                    job = _texture_job(obj)
+                    assert job["target_resolution"] == [int(resolution)] * 2
+                    assert job["requested_padding"] == 16
+                    assert job["packing_margin_method"] == "FRACTION"
+                    assert abs(job["packing_margin_uv"] - 16 / int(resolution)) < 1.0e-9
+                    assert job["pack_shared_atlas"] is shared
+                if shared:
+                    _assert_shared_atlas_contract(first, second)
+                    assert _cross_object_overlap_count(first, second) == 0
+                else:
+                    assert _texture_job(first)["atlas_id"] != _texture_job(second)["atlas_id"]
+    finally:
+        settings.texture_resolution = original_resolution
+        settings.padding_pixels = original_padding
+        settings.pack_shared_atlas = original_shared
+        _clear_scene()
+    print("[v1] 256/512 해상도 패딩 경계와 실제 Atlas 계약 통과")
 
 
 def _assert_result(obj) -> None:
@@ -215,7 +499,10 @@ def _bbox_separation(first, second) -> float:
 def _test_register_rollback() -> None:
     _clear_scene()
     module = importlib.import_module(MODULE_NAME)
+    preview = importlib.import_module(f"{MODULE_NAME}.uvmapping.preview")
     module.unregister()
+    assert not preview.is_registered()
+    assert not preview.draw_handler_active()
     original_register_class = bpy.utils.register_class
     calls = 0
 
@@ -242,6 +529,11 @@ def _test_register_rollback() -> None:
     module.register()
     assert hasattr(bpy.types.Scene, "uvmapping_settings")
     assert _auto_operator_registered(), "등록 롤백 뒤 정상 재등록에 실패했습니다."
+    assert preview.is_registered()
+    preview.register()
+    preview.register()
+    for handlers, callback in preview._HANDLERS:
+        assert handlers.count(callback) == 1, "미리보기 수명 주기 handler가 중복됐습니다."
     print("[v1] register 중간 실패의 클래스와 Scene 속성 롤백 통과")
 
 
@@ -376,34 +668,40 @@ def _test_shared_partial_selection() -> None:
 
 def _test_preview_does_not_change_seams() -> None:
     _clear_scene()
+    preview = importlib.import_module(f"{MODULE_NAME}.uvmapping.preview")
     obj = _cube("Preview")
     obj.data.edges[0].use_seam = True
     original = tuple(edge.use_seam for edge in obj.data.edges)
     _select((obj,))
+    bpy.ops.object.mode_set(mode="EDIT")
+    edit_attributes = tuple(attribute.name for attribute in obj.data.attributes)
     result = bpy.ops.uvmapping.preview_seams()
     assert result == {"FINISHED"}, f"미리보기 실패: {result}"
+    assert obj.mode == "EDIT", "Seam 보기가 원래 Edit Mode를 복원하지 않았습니다."
+    assert obj.select_get(), "Seam 보기가 객체 선택을 바꿨습니다."
+    assert tuple(attribute.name for attribute in obj.data.attributes) == edit_attributes
+    bpy.ops.object.mode_set(mode="OBJECT")
     assert tuple(edge.use_seam for edge in obj.data.edges) == original
-    attribute = obj.data.attributes.get(PREVIEW_ATTRIBUTE)
-    assert attribute is not None and attribute.domain == "EDGE"
-    values = [item.value for item in attribute.data]
-    assert any(value > 0.5 for value in values), "미리보기 후보 값이 없습니다."
+    assert preview.mesh_edge_indices(obj.data), "런타임 미리보기 후보가 없습니다."
 
     result = bpy.ops.uvmapping.auto_unwrap()
-    assert result == {"FINISHED"}, f"미리보기 뒤 자동 언랩 실패: {result}"
-    assert obj.data.attributes.get(PREVIEW_ATTRIBUTE) is None, (
-        "winner 결과 Mesh에 미리보기 속성이 복제됐습니다."
-    )
+    assert result == {"FINISHED"}, f"미리보기 뒤 UV 언랩 실패: {result}"
+    assert not preview.mesh_edge_indices(obj.data)
     _assert_result(obj)
 
     seams_after_unwrap = tuple(edge.use_seam for edge in obj.data.edges)
+    attributes_after_unwrap = tuple(attribute.name for attribute in obj.data.attributes)
     result = bpy.ops.uvmapping.preview_seams()
     assert result == {"FINISHED"}, f"두 번째 미리보기 실패: {result}"
     assert tuple(edge.use_seam for edge in obj.data.edges) == seams_after_unwrap
+    assert tuple(attribute.name for attribute in obj.data.attributes) == attributes_after_unwrap
+    assert preview.mesh_edge_indices(obj.data)
     result = bpy.ops.uvmapping.clear_preview()
-    assert result == {"FINISHED"}, f"미리보기 지우기 실패: {result}"
-    assert obj.data.attributes.get(PREVIEW_ATTRIBUTE) is None
+    assert result == {"FINISHED"}, f"Seam 숨기기 실패: {result}"
+    assert not preview.mesh_edge_indices(obj.data)
     assert tuple(edge.use_seam for edge in obj.data.edges) == seams_after_unwrap
-    print("[v1] Seam 불변 미리보기, winner 속성 제거와 Clear 통과")
+    assert tuple(attribute.name for attribute in obj.data.attributes) == attributes_after_unwrap
+    print("[v1] Seam/attribute 불변 런타임 미리보기와 숨기기 통과")
 
 
 def _test_finalize_failure_does_not_rollback() -> None:
@@ -490,6 +788,11 @@ def main() -> None:
     _test_register_rollback()
     _configure()
     try:
+        _test_sidebar_contract()
+        _test_selected_meshes_only()
+        _test_preview_overlay_registry_and_stale_cleanup()
+        _test_partial_shared_preview_survives_other_user_unwrap()
+        _test_padding_boundaries_and_small_resolutions()
         _test_independent_and_context_restore()
         _test_shared_atlas_pixel_padding()
         _test_independent_pack_mode()

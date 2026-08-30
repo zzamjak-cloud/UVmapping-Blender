@@ -41,11 +41,6 @@ class UVMAPPING_PG_settings(PropertyGroup):
         ),
         default="BALANCED",
     )
-    process_selected_objects: BoolProperty(
-        name="선택 객체 모두 처리",
-        description="활성 객체만이 아니라 선택된 편집 가능 Mesh 객체를 모두 처리합니다",
-        default=True,
-    )
     generate_texture_job: BoolProperty(
         name="TextureJob 생성",
         description="AI 텍스처 단계가 사용할 품질과 UV 구조 계약을 객체 속성에 저장합니다",
@@ -81,6 +76,8 @@ class UVMAPPING_PG_settings(PropertyGroup):
         name="텍스처 크기",
         description="UV를 배치할 정사각형 텍스처의 가로세로 픽셀 크기입니다",
         items=(
+            ("256", "256 px", "256 px 텍스처를 대상으로 합니다"),
+            ("512", "512 px", "512 px 텍스처를 대상으로 합니다"),
             ("1024", "1024 px", "1K 텍스처를 대상으로 합니다"),
             ("2048", "2048 px", "2K 텍스처를 대상으로 합니다"),
             ("4096", "4096 px", "4K 텍스처를 대상으로 합니다"),
@@ -90,8 +87,8 @@ class UVMAPPING_PG_settings(PropertyGroup):
         update=_sync_island_margin,
     )
     padding_pixels: IntProperty(
-        name="UV 조각 여백",
-        description="각 UV 조각 둘레에 확보할 픽셀 여백입니다. 두 조각 사이 간격은 이 값의 약 두 배입니다",
+        name="UV 패딩",
+        description="각 UV 조각 가장자리에 확보할 여백을 픽셀 단위로 정합니다",
         default=16,
         min=0,
         max=256,
