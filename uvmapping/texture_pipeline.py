@@ -165,8 +165,7 @@ class TurnaroundImageRequest:
             raise ValueError("비용 절감을 위해 Provider 1회 호출과 결과 1장만 허용합니다.")
         if self.contact_sheet.role != "geometry_contact_sheet":
             raise ValueError("실제 모델 contact sheet의 역할이 올바르지 않습니다.")
-        if not self.reference_images:
-            raise ValueError("최소 한 장의 참조 이미지가 필요합니다.")
+        # 참조 이미지는 선택 사항이다. 없으면 프롬프트만으로 스타일을 정한다.
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,26 +412,50 @@ def parse_reference_analysis(raw_text: str) -> ReferenceAnalysis:
 
 
 def compile_turnaround_prompt(
-    analysis: ReferenceAnalysis | Mapping[str, Any],
+    analysis: ReferenceAnalysis | Mapping[str, Any] | None,
     user_prompt: str = "",
 ) -> str:
-    """모델 형상과 참조 스타일을 한 장의 3면도에 결합하도록 지시한다."""
+    """모델 형상과 참조 스타일(또는 프롬프트만)을 한 장의 3면도에 결합하도록 지시한다.
 
-    normalized = (
-        analysis
-        if isinstance(analysis, ReferenceAnalysis)
-        else normalize_reference_analysis(analysis)
-    )
-    analysis_json = json.dumps(normalized.to_dict(), ensure_ascii=False, separators=(",", ":"))
+    ``analysis``가 ``None``이면 참조 이미지 없이 사용자 지시만으로 스타일을
+    정하는 프롬프트를 만든다. 이때 사용자 지시는 비어 있으면 안 된다.
+    """
+
     instruction = user_prompt.strip() or "추가 지시 없음"
+    if analysis is None:
+        if not user_prompt.strip():
+            raise ValueError("참조 분석이 없으면 사용자 지시가 필요합니다.")
+        role_section = (
+            "- 첫 번째 이미지(role=geometry_contact_sheet): Blender의 실제 모델 형상입니다. "
+            "실루엣, 비율, 부품 배치를 반드시 이 이미지에 맞춥니다. 이 외의 입력 이미지는 없습니다."
+        )
+        style_section = (
+            "스타일 근거:\n"
+            "- 참조 이미지가 없습니다. 아래 사용자 지시를 색, 재질 표현, 분위기의 유일한 근거로 사용합니다.\n"
+            "- 지시가 다루지 않는 부분은 깔끔한 캐주얼 게임 손맵 스타일로 절제해 표현합니다."
+        )
+    else:
+        normalized = (
+            analysis
+            if isinstance(analysis, ReferenceAnalysis)
+            else normalize_reference_analysis(analysis)
+        )
+        analysis_json = json.dumps(
+            normalized.to_dict(), ensure_ascii=False, separators=(",", ":")
+        )
+        role_section = (
+            "- 첫 번째 이미지(role=geometry_contact_sheet): Blender의 실제 모델 형상입니다. "
+            "실루엣, 비율, 부품 배치를 반드시 이 이미지에 맞춥니다.\n"
+            "- 두 번째 이후 이미지(role=reference): 외형, 색상, 붓질, 장식 스타일의 근거입니다. "
+            "참조의 다른 물체 형상은 복제하지 않습니다."
+        )
+        style_section = f"분석 JSON:\n{analysis_json}"
     return f"""캐주얼 게임용 스타일리시 손맵 diffuse/albedo 제작을 위한 3면도 한 장을 생성하세요.
 
 입력 이미지 역할:
-- 첫 번째 이미지(role=geometry_contact_sheet): Blender의 실제 모델 형상입니다. 실루엣, 비율, 부품 배치를 반드시 이 이미지에 맞춥니다.
-- 두 번째 이후 이미지(role=reference): 외형, 색상, 붓질, 장식 스타일의 근거입니다. 참조의 다른 물체 형상은 복제하지 않습니다.
+{role_section}
 
-분석 JSON:
-{analysis_json}
+{style_section}
 
 사용자 한 줄 지시:
 {instruction}
@@ -447,13 +470,13 @@ def compile_turnaround_prompt(
 - 조명 사진이나 렌더가 아니라 diffuse/albedo에 옮길 수 있는 손으로 그린 색과 명암을 표현합니다.
 - 배경은 투명 또는 완전히 균일한 단색으로 만듭니다.
 - 텍스트, 라벨, 구분선, 숫자, 로고, 워터마크, 받침대, 그림자는 넣지 않습니다.
-- 관찰되지 않은 뒷면은 분석 JSON의 inferred 항목을 절제해 사용하며 새 부품을 임의로 만들지 않습니다."""
+- 관찰되지 않은 뒷면은 주어진 근거(분석 JSON 또는 사용자 지시)와 일관되게 절제해 표현하며 새 부품을 임의로 만들지 않습니다."""
 
 
 def build_turnaround_request(
     contact_sheet: InlineImage,
     reference_images: Sequence[InlineImage],
-    analysis: ReferenceAnalysis | Mapping[str, Any],
+    analysis: ReferenceAnalysis | Mapping[str, Any] | None,
     user_instruction: str = "",
     *,
     model: str = DEFAULT_IMAGE_MODEL,

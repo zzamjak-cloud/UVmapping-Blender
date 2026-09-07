@@ -178,6 +178,35 @@ def test_turnaround_request_fixes_one_call_one_image_and_view_order() -> None:
     assert "낡은 나무 상자" in request.prompt
 
 
+def test_turnaround_request_allows_prompt_only_without_references() -> None:
+    request = build_turnaround_request(
+        InlineImage("image/png", "geometry-data", "geometry_contact_sheet", "model"),
+        [],
+        None,
+        "광택 있는 빨간 주사위, 흰색 눈금",
+    )
+
+    assert request.reference_images == ()
+    assert "광택 있는 빨간 주사위" in request.prompt
+    assert "참조 이미지가 없습니다" in request.prompt
+    assert "분석 JSON:" not in request.prompt
+    assert "FRONT | RIGHT SIDE | BACK" in request.prompt
+
+
+def test_prompt_only_turnaround_requires_user_instruction() -> None:
+    try:
+        build_turnaround_request(
+            InlineImage("image/png", "geometry-data", "geometry_contact_sheet"),
+            [],
+            None,
+            "   ",
+        )
+    except ValueError as error:
+        assert "사용자 지시가 필요" in str(error)
+    else:
+        raise AssertionError("빈 프롬프트의 참조 없는 생성이 거부되어야 합니다.")
+
+
 def test_turnaround_request_rejects_cost_contract_changes() -> None:
     request = build_turnaround_request(
         InlineImage("image/png", "geometry-data", "geometry_contact_sheet"),

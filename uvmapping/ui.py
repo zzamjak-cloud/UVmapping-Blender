@@ -34,8 +34,6 @@ class UVMAPPING_PT_main(Panel):
         layout = self.layout
         settings = context.scene.uvmapping_settings
 
-        layout.prop(settings, "preset", text="")
-        layout.prop(settings, "quality_level", text="품질")
         button = layout.column()
         button.scale_y = 1.6
         button.operator("uvmapping.auto_unwrap", icon="UV")
@@ -53,6 +51,8 @@ class UVMAPPING_PT_main(Panel):
         packing.prop(settings, "texture_resolution")
         packing.prop(settings, "padding_pixels")
         packing.prop(settings, "pack_shared_atlas")
+        packing.prop(settings, "auto_repack")
+        packing.operator("uvmapping.repack_uvs", icon="MOD_UVPROJECT")
 
         advanced = layout.row(align=True)
         advanced.prop(
@@ -66,6 +66,9 @@ class UVMAPPING_PT_main(Panel):
             return
 
         column = layout.column(align=True)
+        column.prop(settings, "preset", text="프리셋")
+        column.prop(settings, "quality_level", text="품질")
+        column.separator()
         column.prop(settings, "seam_policy")
         column.prop(settings, "create_new_uv_layer")
         column.prop(settings, "uv_layer_name")
@@ -131,6 +134,18 @@ class UVMAPPING_PT_ai_texture(Panel):
         layout = self.layout
         settings = context.scene.uvmapping_settings
 
+        if not bpy.app.online_access:
+            online_box = layout.box()
+            online_box.label(text="AI 기능은 온라인 접근이 필요합니다", icon="ERROR")
+            if getattr(bpy.app, "online_access_override", False):
+                online_box.label(text="--offline-mode로 실행되어 켤 수 없습니다")
+            else:
+                online_box.prop(
+                    context.preferences.system,
+                    "use_online_access",
+                    text="Allow Online Access 켜기",
+                )
+
         model_box = layout.box()
         model_box.label(text="이미지 생성 모델", icon="IMAGE_DATA")
         model_choices = model_box.column(align=True)
@@ -171,7 +186,14 @@ class UVMAPPING_PT_ai_texture(Panel):
             key_status.label(text=f"{provider_name} API 키가 필요합니다", icon="ERROR")
             key_status.label(text="환경설정 > 애드온에서 API 키를 입력하세요")
             key_status.operator("screen.userpref_show", text="환경설정 열기", icon="PREFERENCES")
-        reference_box.operator("uvmapping.analyze_references", icon="VIEWZOOM")
+        has_references = bool(settings.reference_images)
+        analyze = reference_box.row()
+        analyze.enabled = has_references
+        analyze.operator("uvmapping.analyze_references", icon="VIEWZOOM")
+        if not has_references:
+            reference_box.label(
+                text="참조 없이도 아래 프롬프트만으로 생성할 수 있습니다", icon="INFO"
+            )
 
         prompt_box = layout.box()
         prompt_box.label(text="추가 지시", icon="TEXT")
@@ -181,7 +203,11 @@ class UVMAPPING_PT_ai_texture(Panel):
         )
         generate = layout.column()
         generate.scale_y = 1.5
-        generate.enabled = bool(settings.texture_analysis_json)
+        if has_references:
+            # 참조가 있으면 분석 결과가 있어야 스타일 근거가 확정된다.
+            generate.enabled = bool(settings.texture_analysis_json)
+        else:
+            generate.enabled = bool(settings.texture_user_prompt.strip())
         generate.operator("uvmapping.generate_turnaround", icon="RENDER_STILL")
 
         apply_texture = layout.column()

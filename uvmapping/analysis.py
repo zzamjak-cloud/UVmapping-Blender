@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import heapq
-from math import atan2, exp, sqrt
+from math import atan2, cos, exp, pi, radians, sqrt
 from statistics import median
 from typing import Any
 
@@ -18,7 +18,7 @@ from .metrics import (
     face_chart_ids,
     face_components,
 )
-from .types import AnalysisOptions, AnalysisResult
+from .types import AnalysisOptions, AnalysisPreset, AnalysisResult
 
 Vec3 = tuple[float, float, float]
 
@@ -556,6 +556,158 @@ def _add_handle_cycles(
     return len(seam_positions) - before
 
 
+def _vertex_angle_defects(data: _MeshData) -> list[float]:
+    """Face 코너각을 누적해 Vertex별 각결손(이산 가우스 곡률)을 구한다."""
+
+    sums = [0.0] * len(data.vertices)
+    counts = [0] * len(data.vertices)
+    for face in data.faces:
+        corner_count = len(face.vertices)
+        if corner_count < 3:
+            continue
+        for offset, vertex in enumerate(face.vertices):
+            current = data.vertices[vertex]
+            toward_previous = _subtract(data.vertices[face.vertices[offset - 1]], current)
+            toward_next = _subtract(
+                data.vertices[face.vertices[(offset + 1) % corner_count]], current
+            )
+            angle = atan2(
+                _length(_cross(toward_previous, toward_next)),
+                _dot(toward_previous, toward_next),
+            )
+            sums[vertex] += angle
+            counts[vertex] += 1
+    return [
+        (2.0 * pi) - angle_sum if count else 0.0
+        for angle_sum, count in zip(sums, counts, strict=True)
+    ]
+
+
+def _normal_region_clusters(
+    data: _MeshData,
+    face_positions: list[int],
+    blocked_edges: set[int],
+    angle_limit: float,
+) -> dict[int, int]:
+    """법선 원뿔 한계 안에서 인접 Face를 결정론적으로 클러스터링한다."""
+
+    face_set = set(face_positions)
+    cosine_limit = cos(min(max(angle_limit, 1.0e-3), pi))
+    assignment: dict[int, int] = {}
+    cluster_id = 0
+    for seed in sorted(face_set):
+        if seed in assignment:
+            continue
+        normal_sum = list(data.faces[seed].normal)
+        assignment[seed] = cluster_id
+        frontier: list[int] = []
+        queued = {seed}
+
+        def push_neighbors(face_position: int) -> None:
+            for edge_position in data.faces[face_position].edge_positions:
+                edge = data.edges[edge_position]
+                if edge_position in blocked_edges or len(edge.linked_faces) != 2:
+                    continue
+                for neighbor in edge.linked_faces:
+                    if (
+                        neighbor != face_position
+                        and neighbor in face_set
+                        and neighbor not in assignment
+                        and neighbor not in queued
+                    ):
+                        queued.add(neighbor)
+                        heapq.heappush(frontier, neighbor)
+
+        push_neighbors(seed)
+        while frontier:
+            face_position = heapq.heappop(frontier)
+            if face_position in assignment:
+                continue
+            average = _normalized((normal_sum[0], normal_sum[1], normal_sum[2]))
+            if _dot(data.faces[face_position].normal, average) < cosine_limit:
+                # 이 클러스터에서는 거부하되, 이후 다른 시드의 클러스터에 남긴다.
+                continue
+            assignment[face_position] = cluster_id
+            normal = data.faces[face_position].normal
+            normal_sum[0] += normal[0]
+            normal_sum[1] += normal[1]
+            normal_sum[2] += normal[2]
+            push_neighbors(face_position)
+        cluster_id += 1
+    return assignment
+
+
+def _split_high_curvature_charts(
+    data: _MeshData,
+    seam_positions: set[int],
+    options: AnalysisOptions,
+    warnings: list[str],
+) -> None:
+    """누적 곡률이 큰 Chart를 법선 클러스터 경계 Seam으로 분할한다.
+
+    내부 각결손 총량이 큰 Chart는 어떤 언랩으로도 텍스처 밀도를 균일하게
+    만들 수 없으므로, 펼치기 전에 곡률이 경계로 방출되도록 절단한다.
+    """
+
+    if not options.split_curved_charts:
+        return
+    defects = _vertex_angle_defects(data)
+    seam_vertices: set[int] = set()
+    for position in seam_positions:
+        seam_vertices.update(data.edges[position].vertices)
+
+    chart_ids = face_chart_ids(len(data.faces), data.edge_faces, seam_positions)
+    chart_faces: dict[int, list[int]] = {}
+    vertex_face: dict[int, int] = {}
+    for face in data.faces:
+        chart_faces.setdefault(chart_ids[face.position], []).append(face.position)
+        for vertex in face.vertices:
+            vertex_face.setdefault(vertex, face.position)
+
+    # Seam(경계·비매니폴드 포함)에 닿지 않는 내부 Vertex의 곡률만 합산한다.
+    chart_curvature: dict[int, float] = {}
+    for vertex, face_position in vertex_face.items():
+        if vertex in seam_vertices:
+            continue
+        chart = chart_ids[face_position]
+        chart_curvature[chart] = chart_curvature.get(chart, 0.0) + abs(defects[vertex])
+
+    split_count = 0
+    added_edges = 0
+    for chart, face_positions in sorted(chart_faces.items()):
+        if len(face_positions) < 2:
+            continue
+        if chart_curvature.get(chart, 0.0) <= options.max_chart_curvature:
+            continue
+        clusters = _normal_region_clusters(
+            data, face_positions, seam_positions, options.segmentation_angle_limit
+        )
+        if len(set(clusters.values())) < 2:
+            continue
+        chart_edges = {
+            edge_position
+            for face_position in face_positions
+            for edge_position in data.faces[face_position].edge_positions
+        }
+        before = len(seam_positions)
+        for edge_position in sorted(chart_edges):
+            edge = data.edges[edge_position]
+            if edge_position in seam_positions or len(edge.linked_faces) != 2:
+                continue
+            first_face, second_face = edge.linked_faces
+            if clusters.get(first_face) != clusters.get(second_face):
+                seam_positions.add(edge_position)
+        added = len(seam_positions) - before
+        if added:
+            split_count += 1
+            added_edges += added
+    if split_count:
+        warnings.append(
+            f"누적 곡률이 높은 Chart {split_count}개를 "
+            f"법선 클러스터 경계 Seam {added_edges}개로 분할했습니다."
+        )
+
+
 def _component_genus(data: _MeshData, component: set[int], boundary_count: int) -> int:
     edge_positions = _component_edge_positions(data, component)
     vertices = {vertex for position in edge_positions for vertex in data.edges[position].vertices}
@@ -683,6 +835,59 @@ def _merge_small_charts(
     return removed
 
 
+def detect_analysis_preset(mesh: Any) -> AnalysisPreset:
+    """이면각·Sharp·재질 경계 비율로 메시 성격에 맞는 프리셋을 고른다.
+
+    피처 Edge(뚜렷한 이면각, Sharp 표시, 재질 경계)가 많으면 하드서페이스,
+    거의 없으면 유기체, 그 사이면 균형 프리셋을 반환한다. 평면 Edge가
+    많으면 베벨·서브디비전으로 매끄러워진 하드서페이스로 보고 유기체로
+    분류하지 않는다.
+    """
+
+    data = _normalize_mesh(mesh)
+    manifold_edges = [edge for edge in data.edges if len(edge.linked_faces) == 2]
+    if not manifold_edges:
+        return AnalysisPreset.BALANCED
+
+    feature_angle = radians(35.0)
+    planar_angle = radians(2.0)
+    feature_count = 0
+    planar_count = 0
+    for edge in manifold_edges:
+        first, second = edge.linked_faces
+        material_boundary = (
+            data.faces[first].material_index != data.faces[second].material_index
+        )
+        angle = abs(_signed_face_angle(edge, data))
+        if edge.is_sharp or material_boundary or angle >= feature_angle:
+            feature_count += 1
+        elif angle <= planar_angle:
+            planar_count += 1
+
+    feature_ratio = feature_count / len(manifold_edges)
+    planar_ratio = planar_count / len(manifold_edges)
+    if feature_ratio >= 0.15:
+        return AnalysisPreset.HARD_SURFACE
+    if planar_ratio >= 0.4:
+        return AnalysisPreset.BALANCED
+    if feature_ratio <= 0.03:
+        return AnalysisPreset.ORGANIC
+    return AnalysisPreset.BALANCED
+
+
+def resolve_auto_quality_level(face_count: int) -> str:
+    """Face 수에 맞춰 평가할 후보 수 단계를 고른다.
+
+    작은 메시는 후보 비교 비용이 싸므로 품질 우선, 큰 메시는 빠르게 처리한다.
+    """
+
+    if face_count <= 4000:
+        return "QUALITY"
+    if face_count <= 30000:
+        return "BALANCED"
+    return "FAST"
+
+
 def analyze_mesh(
     mesh: Any,
     options: AnalysisOptions | None = None,
@@ -715,6 +920,9 @@ def analyze_mesh(
 
     edge_scores = _score_edges(data, resolved_options)
     seam_positions = _initial_seams(data, edge_scores, resolved_options)
+    # 곡률 분할을 위상 절단보다 먼저 수행해, 매끈한 닫힌 메시가
+    # 지름 절단 경로 하나로 찌그러진 단일 Chart가 되는 것을 막는다.
+    _split_high_curvature_charts(data, seam_positions, resolved_options, warnings)
     _ensure_topology_cuts(
         data, seam_positions, edge_scores, resolved_options, warnings
     )
@@ -780,6 +988,12 @@ def generate_analysis_candidates(
                     seam_threshold=max(
                         0.0, resolved_options.seam_threshold - 0.12
                     ),
+                    max_chart_curvature=(
+                        resolved_options.max_chart_curvature * 0.75
+                    ),
+                    segmentation_angle_limit=(
+                        resolved_options.segmentation_angle_limit * 0.85
+                    ),
                 ),
                 "dense",
             )
@@ -804,6 +1018,14 @@ def generate_analysis_candidates(
                     min_chart_faces=(
                         resolved_options.min_chart_faces
                         + chart_face_increment * step
+                    ),
+                    max_chart_curvature=(
+                        resolved_options.max_chart_curvature * (1.0 + 0.3 * step)
+                    ),
+                    segmentation_angle_limit=min(
+                        radians(150.0),
+                        resolved_options.segmentation_angle_limit
+                        * (1.0 + 0.15 * step),
                     ),
                 ),
                 "conservative",
@@ -861,7 +1083,10 @@ def generate_analysis_candidates(
 
 __all__ = [
     "AnalysisOptions",
+    "AnalysisPreset",
     "AnalysisResult",
     "analyze_mesh",
+    "detect_analysis_preset",
     "generate_analysis_candidates",
+    "resolve_auto_quality_level",
 ]

@@ -52,6 +52,9 @@ class AnalysisOptions:
     seam_threshold: float = 0.68
     angle_reference: float = radians(50.0)
     min_chart_faces: int = 4
+    split_curved_charts: bool = True
+    max_chart_curvature: float = radians(120.0)
+    segmentation_angle_limit: float = radians(60.0)
     preserve_existing_seams: bool = True
     ensure_cut_paths: bool = True
     connect_boundary_loops: bool = True
@@ -69,6 +72,8 @@ class AnalysisOptions:
             "seam_threshold": 0.66,
             "angle_reference": radians(70.0),
             "min_chart_faces": 6,
+            "max_chart_curvature": radians(220.0),
+            "segmentation_angle_limit": radians(75.0),
         },
         AnalysisPreset.BALANCED: {
             "angle_weight": 1.8,
@@ -82,6 +87,8 @@ class AnalysisOptions:
             "seam_threshold": 0.68,
             "angle_reference": radians(50.0),
             "min_chart_faces": 4,
+            "max_chart_curvature": radians(120.0),
+            "segmentation_angle_limit": radians(60.0),
         },
         AnalysisPreset.HARD_SURFACE: {
             "angle_weight": 2.3,
@@ -95,6 +102,8 @@ class AnalysisOptions:
             "seam_threshold": 0.72,
             "angle_reference": radians(35.0),
             "min_chart_faces": 3,
+            "max_chart_curvature": radians(90.0),
+            "segmentation_angle_limit": radians(50.0),
         },
     }
 
@@ -117,6 +126,10 @@ class AnalysisOptions:
             raise ValueError("seam_threshold 값은 0과 1 사이여야 합니다.")
         if self.angle_reference <= 0.0:
             raise ValueError("angle_reference 값은 0보다 커야 합니다.")
+        if self.max_chart_curvature <= 0.0:
+            raise ValueError("max_chart_curvature 값은 0보다 커야 합니다.")
+        if self.segmentation_angle_limit <= 0.0:
+            raise ValueError("segmentation_angle_limit 값은 0보다 커야 합니다.")
         if self.min_chart_faces < 1:
             raise ValueError("min_chart_faces 값은 1 이상이어야 합니다.")
 

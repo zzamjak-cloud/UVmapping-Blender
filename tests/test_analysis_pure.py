@@ -13,8 +13,11 @@ if __package__ in {None, ""}:
 
 from uvmapping.analysis import (
     AnalysisOptions,
+    AnalysisPreset,
     analyze_mesh,
+    detect_analysis_preset,
     generate_analysis_candidates,
+    resolve_auto_quality_level,
 )
 
 
@@ -116,6 +119,7 @@ def test_closed_smooth_component_gets_deterministic_cut_path() -> None:
         existing_seam_weight=0.0,
         seam_threshold=1.0,
         min_chart_faces=1,
+        split_curved_charts=False,
     )
 
     first = analyze_mesh(mesh, options)
@@ -125,6 +129,127 @@ def test_closed_smooth_component_gets_deterministic_cut_path() -> None:
     assert first.seam_edges == second.seam_edges
     assert first.edge_scores == second.edge_scores
     assert any("닫힌 컴포넌트" in warning for warning in first.warnings)
+
+
+def _uv_sphere(segments: int = 16, rings: int = 8) -> _Mesh:
+    """자잘한 이면각 때문에 점수 기반 Seam이 생기지 않는 매끈한 구."""
+
+    coordinates: list[tuple[float, float, float]] = [(0.0, 0.0, 1.0)]
+    for ring in range(1, rings):
+        phi = (tau / 2.0) * ring / rings
+        for segment in range(segments):
+            theta = tau * segment / segments
+            coordinates.append(
+                (sin(phi) * cos(theta), sin(phi) * sin(theta), cos(phi))
+            )
+    coordinates.append((0.0, 0.0, -1.0))
+
+    def ring_vertex(ring: int, segment: int) -> int:
+        return 1 + (ring - 1) * segments + (segment % segments)
+
+    faces: list[tuple[int, ...]] = []
+    for segment in range(segments):
+        faces.append((0, ring_vertex(1, segment), ring_vertex(1, segment + 1)))
+    for ring in range(1, rings - 1):
+        for segment in range(segments):
+            faces.append(
+                (
+                    ring_vertex(ring, segment),
+                    ring_vertex(ring + 1, segment),
+                    ring_vertex(ring + 1, segment + 1),
+                    ring_vertex(ring, segment + 1),
+                )
+            )
+    bottom = len(coordinates) - 1
+    for segment in range(segments):
+        faces.append(
+            (ring_vertex(rings - 1, segment + 1), ring_vertex(rings - 1, segment), bottom)
+        )
+    return _mesh(coordinates, faces)
+
+
+def test_smooth_closed_mesh_is_split_by_curvature_clusters() -> None:
+    mesh = _uv_sphere()
+
+    first = analyze_mesh(mesh)
+    second = analyze_mesh(mesh)
+
+    assert first.seam_edges
+    assert first.chart_count >= 2
+    assert first.seam_edges == second.seam_edges
+    assert any("누적 곡률" in warning for warning in first.warnings)
+    # 곡률 분할이 지름 절단 경로보다 먼저 적용되어 중복 절단이 없어야 한다.
+    assert all("닫힌 컴포넌트" not in warning for warning in first.warnings)
+
+
+def test_curvature_split_can_be_disabled() -> None:
+    mesh = _uv_sphere()
+
+    result = analyze_mesh(mesh, AnalysisOptions(split_curved_charts=False, min_chart_faces=1))
+
+    assert result.chart_count == 1
+    assert any("닫힌 컴포넌트" in warning for warning in result.warnings)
+
+
+def test_developable_tube_is_not_split_by_curvature() -> None:
+    result = analyze_mesh(_tube(), AnalysisOptions(min_chart_faces=1))
+
+    # 원기둥 옆면은 각결손이 0이므로 곡률 분할이 개입하면 안 된다.
+    assert all("누적 곡률" not in warning for warning in result.warnings)
+
+
+def _tube(segments: int = 12, rings: int = 4, sharp: set[tuple[int, int]] | None = None) -> _Mesh:
+    coordinates = [
+        (cos(tau * segment / segments), sin(tau * segment / segments), float(ring))
+        for ring in range(rings)
+        for segment in range(segments)
+    ]
+    faces = [
+        (
+            ring * segments + segment,
+            ring * segments + (segment + 1) % segments,
+            (ring + 1) * segments + (segment + 1) % segments,
+            (ring + 1) * segments + segment,
+        )
+        for ring in range(rings - 1)
+        for segment in range(segments)
+    ]
+    return _mesh(coordinates, faces, sharp=sharp)
+
+
+def test_auto_preset_detects_hard_surface_for_sharp_cube() -> None:
+    mesh = _mesh(
+        [
+            (0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
+            (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1),
+        ],
+        [
+            (0, 1, 2, 3), (7, 6, 5, 4), (0, 4, 5, 1),
+            (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0),
+        ],
+    )
+
+    assert detect_analysis_preset(mesh) == AnalysisPreset.HARD_SURFACE
+
+
+def test_auto_preset_detects_organic_for_smooth_sphere() -> None:
+    assert detect_analysis_preset(_uv_sphere()) == AnalysisPreset.ORGANIC
+
+
+def test_auto_preset_detects_balanced_for_mixed_mesh() -> None:
+    # 완만한 튜브의 내부 링 엣지에 Sharp 몇 개만 섞으면 피처 비율이 중간 구간에 온다.
+    sharp = {(12, 13), (13, 14), (14, 15), (15, 16)}
+    mesh = _tube(sharp=sharp)
+
+    assert detect_analysis_preset(mesh) == AnalysisPreset.BALANCED
+
+
+def test_auto_quality_level_scales_with_face_count() -> None:
+    assert resolve_auto_quality_level(100) == "QUALITY"
+    assert resolve_auto_quality_level(4000) == "QUALITY"
+    assert resolve_auto_quality_level(4001) == "BALANCED"
+    assert resolve_auto_quality_level(30000) == "BALANCED"
+    assert resolve_auto_quality_level(30001) == "FAST"
 
 
 def test_material_boundary_is_selected_for_hard_surface() -> None:
@@ -283,6 +408,7 @@ def test_punctured_torus_handle_cut_is_a_disk() -> None:
         non_manifold_weight=0.0,
         seam_threshold=1.0,
         min_chart_faces=1,
+        split_curved_charts=False,
         preserve_existing_seams=False,
     )
     result = analyze_mesh(mesh, options)
@@ -365,6 +491,7 @@ def test_analysis_candidates_preserve_topology_cut_graph() -> None:
         non_manifold_weight=0.0,
         seam_threshold=1.0,
         min_chart_faces=1,
+        split_curved_charts=False,
         preserve_existing_seams=False,
     )
     topology_edges = analyze_mesh(mesh, options).seam_edges

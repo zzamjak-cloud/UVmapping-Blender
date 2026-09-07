@@ -1,5 +1,7 @@
 """UV 자동 언랩 설정 속성."""
 
+import time
+
 import bpy
 from bpy.props import (
     BoolProperty,
@@ -66,11 +68,44 @@ class UVMAPPING_AP_preferences(AddonPreferences):
         warning.label(text="공용 컴퓨터에서는 키를 입력하거나 저장하지 마세요.")
 
 
-def _sync_island_margin(settings, _context) -> None:
+_AUTO_REPACK_STATE = {"deadline": 0.0, "scheduled": False}
+
+
+def _auto_repack_tick() -> float | None:
+    """디바운스가 끝나면 자동 언랩 결과를 현재 설정으로 재배치한다."""
+
+    remaining = _AUTO_REPACK_STATE["deadline"] - time.monotonic()
+    if remaining > 0.0:
+        return remaining
+    _AUTO_REPACK_STATE["scheduled"] = False
+    # Edit Mode 등 다른 작업 중에는 모드를 바꾸지 않도록 건너뛴다.
+    if getattr(bpy.context, "mode", "OBJECT") != "OBJECT":
+        return None
+    try:
+        if bpy.ops.uvmapping.repack_uvs.poll():
+            bpy.ops.uvmapping.repack_uvs()
+    except Exception:
+        pass
+    return None
+
+
+def _request_auto_repack(settings, _context) -> None:
+    """패딩류 설정 변경을 하나로 묶어 자동 UV 재배치를 예약한다."""
+
+    if bpy.app.background or not getattr(settings, "auto_repack", False):
+        return
+    _AUTO_REPACK_STATE["deadline"] = time.monotonic() + 0.35
+    if not _AUTO_REPACK_STATE["scheduled"]:
+        _AUTO_REPACK_STATE["scheduled"] = True
+        bpy.app.timers.register(_auto_repack_tick, first_interval=0.35)
+
+
+def _sync_island_margin(settings, context) -> None:
     """사용자용 픽셀 여백을 기존 연산자가 읽는 UV fraction으로 변환한다."""
 
     resolution = max(1, int(settings.texture_resolution))
     settings.island_margin = settings.padding_pixels / resolution
+    _request_auto_repack(settings, context)
 
 
 class UVMAPPING_PG_reference_image(PropertyGroup):
@@ -93,21 +128,23 @@ class UVMAPPING_PG_settings(PropertyGroup):
         name="프리셋",
         description="메시 유형에 맞는 Seam 분석 가중치를 선택합니다",
         items=(
+            ("AUTO", "자동", "이면각·Sharp·재질 경계를 분석해 메시별로 프리셋을 고릅니다"),
             ("ORGANIC", "Organic", "부드러운 곡률과 오목한 영역을 우선합니다"),
             ("BALANCED", "Balanced", "유기체와 하드서페이스에 균형 잡힌 설정입니다"),
             ("HARD_SURFACE", "Hard Surface", "Sharp Edge와 재질 경계를 강하게 반영합니다"),
         ),
-        default="BALANCED",
+        default="AUTO",
     )
     quality_level: EnumProperty(
         name="품질 단계",
         description="비교할 자동 Seam 후보 수를 선택합니다",
         items=(
+            ("AUTO", "자동", "메시 크기에 맞춰 비교할 후보 수를 고릅니다"),
             ("FAST", "빠르게", "기본 후보 한 개만 평가합니다"),
             ("BALANCED", "균형", "최대 세 후보를 비교합니다"),
             ("QUALITY", "품질 우선", "최대 다섯 후보를 비교합니다"),
         ),
-        default="BALANCED",
+        default="AUTO",
     )
     generate_texture_job: BoolProperty(
         name="TextureJob 생성",
@@ -166,6 +203,12 @@ class UVMAPPING_PG_settings(PropertyGroup):
     pack_shared_atlas: BoolProperty(
         name="선택 객체를 한 장에 배치",
         description="선택한 모든 Mesh의 UV를 겹치지 않게 한 장의 텍스처 공간에 함께 배치합니다",
+        default=True,
+        update=_request_auto_repack,
+    )
+    auto_repack: BoolProperty(
+        name="설정 변경 시 자동 재배치",
+        description="패딩·텍스처 크기를 바꾸면 생성된 UV를 즉시 다시 배치합니다",
         default=True,
     )
     island_margin: FloatProperty(

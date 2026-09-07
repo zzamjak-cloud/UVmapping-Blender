@@ -13,7 +13,12 @@ from bpy.props import IntProperty
 from bpy.types import Operator
 
 from . import preview
-from .analysis import analyze_mesh, generate_analysis_candidates
+from .analysis import (
+    analyze_mesh,
+    detect_analysis_preset,
+    generate_analysis_candidates,
+    resolve_auto_quality_level,
+)
 from .contracts import build_atlas_context, build_texture_job
 from .quality import (
     OVERLAP_BUDGET_EXCEEDED,
@@ -109,8 +114,25 @@ def _group_targets(objects):
     )
 
 
-def _build_analysis_options(settings):
-    options = AnalysisOptions.for_preset(settings.preset)
+def _resolve_preset(settings, mesh):
+    """AUTO 프리셋을 메시 특성 분석 결과로 치환한다."""
+
+    if settings.preset == "AUTO":
+        return detect_analysis_preset(mesh)
+    return settings.preset
+
+
+def _resolve_quality_level(settings, mesh):
+    """AUTO 품질 단계를 메시 크기에 맞는 단계로 치환한다."""
+
+    if settings.quality_level == "AUTO":
+        return resolve_auto_quality_level(len(mesh.polygons))
+    return settings.quality_level
+
+
+def _build_analysis_options(settings, mesh, preset=None):
+    resolved_preset = preset if preset is not None else _resolve_preset(settings, mesh)
+    options = AnalysisOptions.for_preset(resolved_preset)
     overrides = {
         "preserve_existing_seams": settings.seam_policy == "PRESERVE",
         "ensure_cut_paths": settings.ensure_cut_paths,
@@ -455,14 +477,39 @@ def _evaluate_candidate(context, state, group, analysis, settings, candidate_ind
 
 
 def _evaluate_group(context, state, group, settings):
-    options = _build_analysis_options(settings)
+    quality_level = _resolve_quality_level(settings, group.source_mesh)
+    options = _build_analysis_options(settings, group.source_mesh)
     candidates = generate_analysis_candidates(
         group.source_mesh,
         options,
-        settings.quality_level,
+        quality_level,
     )
     if not candidates:
         raise RuntimeError(f"{group.source_mesh.name}: Seam 후보가 없습니다.")
+
+    # AUTO 프리셋은 분류 휴리스틱에 승부를 걸지 않는다. 다른 프리셋의 기본
+    # 후보도 함께 실측 평가해 품질 비교가 최종 승자를 고르게 한다.
+    if (
+        settings.preset == "AUTO"
+        and not settings.use_custom_analysis
+        and quality_level != "FAST"
+    ):
+        seen = {frozenset(candidate.seam_edges) for candidate in candidates}
+        for other_preset in ("ORGANIC", "BALANCED", "HARD_SURFACE"):
+            other_options = _build_analysis_options(
+                settings, group.source_mesh, other_preset
+            )
+            if other_options.preset == options.preset:
+                continue
+            extra = generate_analysis_candidates(
+                group.source_mesh, other_options, "FAST"
+            )[0]
+            key = frozenset(extra.seam_edges)
+            if key in seen:
+                continue
+            extra.candidate_label = f"{other_preset} 기본"
+            candidates.append(extra)
+            seen.add(key)
 
     winner = None
     winner_key = None
@@ -694,8 +741,15 @@ def _prepare_payloads(artifacts, settings):
             texture_job_json = None
             if settings.generate_texture_job:
                 texture_settings = {
-                    "preset": settings.preset,
-                    "quality_level": settings.quality_level,
+                    # AUTO는 메시별로 해석되므로 실제 적용된 값을 기록한다.
+                    "preset": (
+                        artifact.analysis.options.preset.value
+                        if artifact.analysis.options is not None
+                        else settings.preset
+                    ),
+                    "quality_level": _resolve_quality_level(
+                        settings, artifact.group.source_mesh
+                    ),
                     "seam_policy": settings.seam_policy,
                     "unwrap_method": artifact.method,
                     "unwrap_iterations": settings.unwrap_iterations,
@@ -817,7 +871,7 @@ class UVMAPPING_OT_analyze(Operator):
             for group in groups:
                 result = analyze_mesh(
                     group.source_mesh,
-                    _build_analysis_options(settings),
+                    _build_analysis_options(settings, group.source_mesh),
                 )
                 seam_count += len(result.seam_edges)
                 chart_count += getattr(result, "chart_count", 0)
@@ -868,8 +922,8 @@ class UVMAPPING_OT_preview_seams(Operator):
             for group in groups:
                 candidates = generate_analysis_candidates(
                     group.source_mesh,
-                    _build_analysis_options(settings),
-                    settings.quality_level,
+                    _build_analysis_options(settings, group.source_mesh),
+                    _resolve_quality_level(settings, group.source_mesh),
                 )
                 if not candidates:
                     raise RuntimeError(f"{group.source_mesh.name}: Seam 후보가 없습니다.")
@@ -1016,11 +1070,91 @@ class UVMAPPING_OT_auto_unwrap(Operator):
         return {"FINISHED"}
 
 
+def _repack_targets(context):
+    """자동 언랩 결과 마커가 있는 Mesh 객체를 선택 우선으로 반환합니다."""
+
+    def valid(obj):
+        return (
+            obj is not None
+            and obj.type == "MESH"
+            and obj.data is not None
+            and len(obj.data.polygons) > 0
+            and obj.data.uv_layers.active is not None
+            and QUALITY_PROPERTY in obj
+        )
+
+    selected = tuple(obj for obj in _target_objects(context) if valid(obj))
+    if selected:
+        return selected
+    marked = {
+        obj.as_pointer(): obj
+        for obj in getattr(context.scene, "objects", ())
+        if valid(obj)
+    }
+    return tuple(sorted(marked.values(), key=lambda obj: obj.name_full))
+
+
+class UVMAPPING_OT_repack_uvs(Operator):
+    """이미 생성된 UV를 현재 패딩·해상도 설정으로 다시 배치합니다."""
+
+    bl_idname = "uvmapping.repack_uvs"
+    bl_label = "UV 재배치"
+    bl_description = (
+        "Seam과 UV 아일랜드 형태를 유지한 채 현재 패딩·텍스처 설정으로 "
+        "자동 언랩 결과를 다시 배치합니다"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "uvmapping_settings", None)
+        return settings is not None and bool(_repack_targets(context))
+
+    def execute(self, context):
+        settings = context.scene.uvmapping_settings
+        targets = _repack_targets(context)
+        if not targets:
+            self.report({"WARNING"}, "재배치할 자동 언랩 결과가 없습니다.")
+            return {"CANCELLED"}
+        try:
+            _, _, margin = _atlas_margin(settings)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        groups = _group_targets(targets)
+        representatives = tuple(group.objects[0] for group in groups)
+        state = _ContextState(context, targets)
+        try:
+            state.prepare()
+            if settings.pack_shared_atlas and len(representatives) > 1:
+                _pack_selected_artifacts(context, state, representatives, margin)
+            else:
+                for obj in representatives:
+                    _pack_selected_artifacts(context, state, (obj,), margin)
+            state.restore()
+        except Exception as exc:
+            try:
+                state.restore()
+            except Exception:
+                pass
+            settings.last_result = f"UV 재배치 실패: {exc}"
+            self.report({"ERROR"}, settings.last_result)
+            return {"CANCELLED"}
+        message = (
+            f"메시 {len(representatives)}개의 UV를 "
+            f"패딩 {settings.padding_pixels}px 기준으로 재배치했습니다."
+        )
+        settings.last_result = message
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
 classes = (
     UVMAPPING_OT_analyze,
     UVMAPPING_OT_preview_seams,
     UVMAPPING_OT_clear_preview,
     UVMAPPING_OT_auto_unwrap,
+    UVMAPPING_OT_repack_uvs,
 )
 
 
@@ -1032,4 +1166,5 @@ __all__ = (
     "UVMAPPING_OT_preview_seams",
     "UVMAPPING_OT_clear_preview",
     "UVMAPPING_OT_auto_unwrap",
+    "UVMAPPING_OT_repack_uvs",
 )

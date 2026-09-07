@@ -131,6 +131,15 @@ def _run_quality_checks() -> None:
     )
     for name, create_mesh in cases:
         _check(name, create_mesh)
+
+    # 기본값인 AUTO 프리셋/품질이 메시별 판별을 거쳐 같은 기준을 통과해야 한다.
+    settings.preset = "AUTO"
+    settings.quality_level = "AUTO"
+    _check("Cube(AUTO)", lambda: bpy.ops.mesh.primitive_cube_add(size=2.0))
+    _check(
+        "Sphere(AUTO)",
+        lambda: bpy.ops.mesh.primitive_uv_sphere_add(segments=24, ring_count=12),
+    )
     print("[quality] Seam 비율 및 UV overlap 검사 통과")
 
 

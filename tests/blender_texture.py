@@ -278,6 +278,39 @@ def main() -> None:
     assert not texture_module._ACTIVE_OPERATORS
     assert not texture_module._ACTIVE_PROCESSES
 
+    # Blender 종료 시 RNA가 먼저 해제된 연산자: 어떤 속성 접근도
+    # ReferenceError가 되지만 shutdown은 레지스트리로 전부 정리해야 한다.
+    class DeadOperator:
+        def __getattribute__(self, name):
+            raise ReferenceError("StructRNA of type X has been removed")
+
+    def dead_timer():
+        return 30.0
+
+    bpy.app.timers.register(dead_timer, first_interval=30.0)
+    dead_process = subprocess.Popen(
+        (
+            bpy.app.binary_path,
+            "--background",
+            "--factory-startup",
+            "--python-expr",
+            "import time; time.sleep(30)",
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    texture_module._ACTIVE_OPERATORS.append(DeadOperator())
+    texture_module._ACTIVE_TIMERS.add(dead_timer)
+    texture_module._ACTIVE_PROCESSES.add(dead_process)
+    texture_module.shutdown()
+    assert not bpy.app.timers.is_registered(dead_timer)
+    assert dead_process.poll() is not None
+    assert not texture_module._ACTIVE_OPERATORS
+    assert not texture_module._ACTIVE_TIMERS
+    assert not texture_module._ACTIVE_PROCESSES
+    print("[texture] RNA 해제 후 shutdown 정리 통과")
+
     reference = settings.reference_images.add()
     reference.path = str(Path(__file__))
     reference.label = "분석 무효화 테스트"

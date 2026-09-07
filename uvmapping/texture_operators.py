@@ -35,18 +35,22 @@ TEXTURE_DESIGN_STATE_PROPERTY = "uvmapping_texture_design_state"
 _ACTIVE_PROCESSES: set[subprocess.Popen] = set()
 _ACTIVE_JOB_DIRS: set[Path] = set()
 _ACTIVE_OPERATORS: list = []
+# 연산자 RNA가 해제된 뒤에도 타이머를 안전하게 해제하기 위한 모듈 레지스트리.
+_ACTIVE_TIMERS: set = set()
 
 
 def _absolute_path(path: str) -> Path:
     return Path(bpy.path.abspath(path)).expanduser().resolve()
 
 
-def _reference_paths(settings) -> tuple[Path, ...]:
+def _reference_paths(settings, *, allow_empty: bool = False) -> tuple[Path, ...]:
     raw_paths = tuple(
         Path(bpy.path.abspath(item.path)).expanduser()
         for item in settings.reference_images
     )
     if not raw_paths:
+        if allow_empty:
+            return ()
         raise ValueError("참조 이미지를 한 장 이상 추가해 주세요.")
     if len(raw_paths) > MAX_REFERENCE_IMAGES:
         raise ValueError(f"참조 이미지는 최대 {MAX_REFERENCE_IMAGES}장까지 사용할 수 있습니다.")
@@ -596,9 +600,22 @@ class _AsyncTextureMixin:
         _ACTIVE_OPERATORS.append(self)
         self._scene_pointer = context.scene.as_pointer()
         context.scene.uvmapping_settings.texture_status = status
-        self._app_timer = self._poll_process
+
+        # Blender가 연산자 RNA를 먼저 해제해도(종료·리로드) 타이머가
+        # ReferenceError 없이 스스로 정리되도록 closure로 감싼다.
+        def timer_callback():
+            try:
+                result = self._poll_process()
+            except ReferenceError:
+                result = None
+            if result is None:
+                _ACTIVE_TIMERS.discard(timer_callback)
+            return result
+
+        self._app_timer = timer_callback
+        _ACTIVE_TIMERS.add(timer_callback)
         bpy.app.timers.register(
-            self._app_timer,
+            timer_callback,
             first_interval=0.2,
             persistent=True,
         )
@@ -677,24 +694,30 @@ def shutdown() -> None:
 
     native_input.shutdown()
 
-    for operator in tuple(_ACTIVE_OPERATORS):
-        timer = getattr(operator, "_app_timer", None)
-        if timer is not None and bpy.app.timers.is_registered(timer):
+    for timer in tuple(_ACTIVE_TIMERS):
+        if bpy.app.timers.is_registered(timer):
             bpy.app.timers.unregister(timer)
-        operator._app_timer = None
-        process = getattr(operator, "_process", None)
-        if process is not None and process.poll() is None:
+        _ACTIVE_TIMERS.discard(timer)
+    for operator in tuple(_ACTIVE_OPERATORS):
+        try:
+            timer = operator._app_timer
+            if timer is not None and bpy.app.timers.is_registered(timer):
+                bpy.app.timers.unregister(timer)
+            operator._app_timer = None
+            operator._cleanup_job_files()
+        except ReferenceError:
+            # 연산자 RNA가 이미 해제됨 — 타이머·프로세스·작업 파일은
+            # 모듈 레지스트리(_ACTIVE_TIMERS 등)가 정리한다.
+            pass
+        _ACTIVE_OPERATORS.remove(operator)
+    for process in tuple(_ACTIVE_PROCESSES):
+        if process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
-        operator._cleanup_job_files()
-        _ACTIVE_OPERATORS.remove(operator)
-    for process in tuple(_ACTIVE_PROCESSES):
-        if process.poll() is None:
-            process.terminate()
         _ACTIVE_PROCESSES.discard(process)
     for job_dir in tuple(_ACTIVE_JOB_DIRS):
         for name in ("request.json", "response.json"):
@@ -871,7 +894,9 @@ class UVMAPPING_OT_analyze_references(_AsyncTextureMixin, Operator):
         try:
             paths = _reference_paths(settings)
             if not bpy.app.online_access:
-                raise ValueError("Blender의 Online Access를 먼저 허용해 주세요.")
+                raise ValueError(
+                    "Blender 환경설정 > 시스템에서 'Allow Online Access'를 켜 주세요."
+                )
             provider, model, _image_model = _provider_models(settings)
             api_key = _provider_api_key(context, provider)
             self._analysis_reference_digest = _reference_digest(paths)
@@ -912,14 +937,26 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
         settings = context.scene.uvmapping_settings
         try:
             if not bpy.app.online_access:
-                raise ValueError("Blender의 Online Access를 먼저 허용해 주세요.")
+                raise ValueError(
+                    "Blender 환경설정 > 시스템에서 'Allow Online Access'를 켜 주세요."
+                )
             objects = _validated_texture_targets(context)
-            reference_paths = _reference_paths(settings)
-            if settings.texture_analysis_reference_hash != _reference_digest(reference_paths):
-                settings.texture_analysis_json = ""
-                settings.texture_analysis_reference_hash = ""
-                raise ValueError("참조 이미지가 변경되었습니다. 다시 분석해 주세요.")
-            analysis = parse_reference_analysis(settings.texture_analysis_json)
+            reference_paths = _reference_paths(settings, allow_empty=True)
+            if reference_paths:
+                if settings.texture_analysis_reference_hash != _reference_digest(
+                    reference_paths
+                ):
+                    settings.texture_analysis_json = ""
+                    settings.texture_analysis_reference_hash = ""
+                    raise ValueError("참조 이미지가 변경되었습니다. 다시 분석해 주세요.")
+                analysis = parse_reference_analysis(settings.texture_analysis_json)
+            elif settings.texture_user_prompt.strip():
+                # 참조 이미지가 없으면 사용자 프롬프트만으로 스타일을 정한다.
+                analysis = None
+            else:
+                raise ValueError(
+                    "참조 이미지가 없을 때는 추가 지시 프롬프트를 입력해 주세요."
+                )
             provider, _analysis_model, model = _provider_models(settings)
             api_key = _provider_api_key(context, provider)
             projection = _projection_contract(context, objects)
@@ -972,6 +1009,9 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
             self._user_prompt = user_prompt
             self._model = model
             self._provider = provider
+            self._analysis_payload = (
+                analysis.to_dict() if analysis is not None else None
+            )
         except (ValueError, RuntimeError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1005,7 +1045,7 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
             "projection": self._projection,
             "references": self._reference_state,
             "user_prompt": self._user_prompt,
-            "analysis": json.loads(settings.texture_analysis_json),
+            "analysis": self._analysis_payload,
             "geometry_contact_sheet": self._contact_sheet_path,
             "geometry_sha256": hashlib.sha256(
                 Path(self._contact_sheet_path).read_bytes()
