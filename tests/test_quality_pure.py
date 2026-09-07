@@ -675,66 +675,59 @@ def test_texture_job_hash_and_islands_are_deterministic() -> None:
     assert rectangular.packing_margin_uv == 16 / 1024
 
 
-def test_settings_ui_uses_pixel_padding_without_exposing_internal_margin() -> None:
+def test_settings_ui_exposes_only_ai_texturing_controls() -> None:
     root = Path(__file__).resolve().parents[1]
     properties_source = (root / "uvmapping" / "properties.py").read_text(
         encoding="utf-8"
     )
     ui_source = (root / "uvmapping" / "ui.py").read_text(encoding="utf-8")
-    operators_source = (root / "uvmapping" / "operators.py").read_text(
-        encoding="utf-8"
-    )
-    preview_source = (root / "uvmapping" / "preview.py").read_text(
-        encoding="utf-8"
-    )
 
     assert "texture_resolution: EnumProperty" in properties_source
     assert "padding_pixels: IntProperty" in properties_source
-    assert "pack_shared_atlas: BoolProperty" in properties_source
-    assert "process_selected_objects" not in properties_source
     assert '("256", "256 px"' in properties_source
     assert '("512", "512 px"' in properties_source
     assert 'name="UV 패딩"' in properties_source
     assert 'default="2048"' in properties_source
     assert "default=16" in properties_source
-    assert 'column.prop(settings, "island_margin")' not in ui_source
-    assert 'packing.prop(settings, "texture_resolution")' in ui_source
-    assert 'packing.prop(settings, "padding_pixels")' in ui_source
-    assert 'layout.prop(settings, "process_selected_objects")' not in ui_source
-    assert 'bl_label = "UV 언랩"' in ui_source
-    assert "def _target_objects(context):" in operators_source
-    assert "settings.process_selected_objects" not in operators_source
-    assert 'bl_label = "UV 언랩"' in operators_source
-    assert 'bl_label = "Seam 보기"' in operators_source
-    assert 'bl_label = "Seam 숨기기"' in operators_source
-    assert (
-        'bl_description = "선택한 메시에서 자동 생성될 Seam 위치를 미리 표시합니다"'
-        in operators_source
-    )
-    assert 'bl_description = "Seam 미리보기를 숨깁니다"' in operators_source
-    assert "PREVIEW_ATTRIBUTE" not in operators_source
-    assert "PREVIEW_ATTRIBUTE" not in preview_source
-    assert "mesh.attributes" not in preview_source
-    assert "_mesh_edges" in preview_source
-    assert "mesh_edge_indices" in preview_source
-    assert 'margin_method="SCALED"' not in operators_source
-    assert operators_source.count('margin_method="FRACTION"') >= 2
-    assert "padding * 2 >= resolution" in operators_source
-    for token in (
-        "SpaceView3D.draw_handler_add",
-        '"POST_VIEW"',
-        "batch_for_shader",
-        '"LINES"',
-        "session_uid",
-        "depsgraph_update_post",
-        "undo_post",
-        "redo_post",
-        "gpu.state.blend_get()",
-        "gpu.state.depth_mask_get()",
-        "gpu.state.depth_test_get()",
-        "gpu.state.line_width_get()",
+
+    # 자동 언랩 기능을 제거했으므로 관련 설정이 되살아나면 안 된다.
+    for removed in (
+        "preset: EnumProperty",
+        "quality_level: EnumProperty",
+        "seam_policy: EnumProperty",
+        "island_margin: FloatProperty",
+        "unwrap_iterations: IntProperty",
+        "use_custom_analysis",
+        "generate_texture_job",
+        "pack_shared_atlas",
+        "auto_repack",
     ):
-        assert token in preview_source
+        assert removed not in properties_source
+
+    assert 'output_box.prop(settings, "texture_resolution")' in ui_source
+    assert 'output_box.prop(settings, "padding_pixels")' in ui_source
+    assert 'bl_label = "AI 손맵 텍스처"' in ui_source
+    for removed in (
+        "uvmapping.auto_unwrap",
+        "uvmapping.repack_uvs",
+        "uvmapping.preview_seams",
+        '"uvmapping.analyze"',
+        'bl_label = "UV 언랩"',
+    ):
+        assert removed not in ui_source
+
+
+def test_texture_job_module_builds_contract_from_existing_uv() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "uvmapping" / "texture_job.py").read_text(encoding="utf-8")
+
+    assert "def build_texture_jobs(" in source
+    assert "def ensure_texture_jobs(" in source
+    assert "USER_AUTHORED" in source
+    assert "count_uv_islands" in source
+    # UV를 직접 만들지 않고 활성 레이어를 읽기만 해야 한다.
+    for forbidden in ("bpy.ops.uv.", "smart_project", "unwrap("):
+        assert forbidden not in source
 
 
 if __name__ == "__main__":

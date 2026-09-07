@@ -21,6 +21,7 @@ from mathutils import Vector
 from . import clipboard_image, native_input, texture_bake
 from .properties import get_addon_preferences
 from .quality import evaluate_atlas_quality
+from .texture_job import TEXTURE_JOB_PROPERTY, ensure_texture_jobs
 from .texture_pipeline import (
     build_reference_analysis_prompt,
     compile_turnaround_prompt,
@@ -30,7 +31,6 @@ from .texture_pipeline import (
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 MAX_REFERENCE_IMAGES = 5
-TEXTURE_JOB_PROPERTY = "uvmapping_texture_job"
 TEXTURE_DESIGN_STATE_PROPERTY = "uvmapping_texture_design_state"
 _ACTIVE_PROCESSES: set[subprocess.Popen] = set()
 _ACTIVE_JOB_DIRS: set[Path] = set()
@@ -115,21 +115,16 @@ def _selected_meshes(context) -> tuple:
 
 
 def _validated_texture_targets(context) -> tuple:
+    """선택 객체의 현재 UV에서 TextureJob 계약을 새로 계산해 기록한다.
+
+    계약은 UV·메시 내용만으로 결정되므로, 3면도 생성 시점과 베이크 시점에 각각
+    다시 계산해 비교하면 그 사이에 UV가 바뀌었는지 확인할 수 있다.
+    """
+
     objects = _selected_meshes(context)
     if not objects:
         raise ValueError("텍스처를 만들 Mesh 객체를 선택해 주세요.")
-    jobs = []
-    for obj in objects:
-        raw_job = obj.get(TEXTURE_JOB_PROPERTY)
-        if not raw_job:
-            raise ValueError(f"{obj.name}: 먼저 Auto UV Unwrap을 실행해 주세요.")
-        try:
-            jobs.append(json.loads(raw_job))
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"{obj.name}: TextureJob 정보가 올바르지 않습니다.") from exc
-    atlas_ids = {str(job.get("atlas_id", "")) for job in jobs}
-    if len(objects) > 1 and (len(atlas_ids) != 1 or "" in atlas_ids):
-        raise ValueError("선택 객체들이 같은 TextureJob Atlas에 속하지 않습니다.")
+    ensure_texture_jobs(objects, context.scene.uvmapping_settings)
     return objects
 
 
@@ -1090,7 +1085,7 @@ def _diffuse_output_path(state: dict, objects: tuple) -> Path:
 
 
 class UVMAPPING_OT_bake_diffuse(Operator):
-    """생성된 3면도를 현재 Auto UV Atlas에 투영하고 머티리얼로 적용한다."""
+    """생성된 3면도를 현재 UV Atlas에 투영하고 머티리얼로 적용한다."""
 
     bl_idname = "uvmapping.bake_diffuse"
     bl_label = "Diffuse/Albedo 적용"

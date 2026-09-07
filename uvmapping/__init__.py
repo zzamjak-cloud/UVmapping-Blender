@@ -1,7 +1,7 @@
-"""UV Mapping Blender 등록 모듈.
+"""AI 텍스처링 Blender 애드온 등록 모듈.
 
-코어 분석기는 Blender 밖에서도 테스트할 수 있도록 ``bpy``를 등록 시점에만
-가져옵니다.
+텍스처 계약·품질 코어는 Blender 밖에서도 테스트할 수 있도록 ``bpy``를 등록
+시점에만 가져옵니다.
 """
 
 
@@ -16,7 +16,7 @@ def register():
     import bpy
     from bpy.props import PointerProperty
 
-    from . import operators, preview, texture_operators, ui
+    from . import texture_operators, ui
     from .properties import (
         UVMAPPING_AP_preferences,
         UVMAPPING_PG_reference_image,
@@ -30,7 +30,6 @@ def register():
         UVMAPPING_AP_preferences,
         UVMAPPING_PG_reference_image,
         UVMAPPING_PG_settings,
-        *operators.classes,
         *texture_operators.classes,
         *ui.classes,
     )
@@ -42,9 +41,7 @@ def register():
             registered.append(cls)
         bpy.types.Scene.uvmapping_settings = PointerProperty(type=UVMAPPING_PG_settings)
         scene_property_registered = True
-        preview.register()
     except Exception:
-        preview.unregister()
         if scene_property_registered and hasattr(bpy.types.Scene, "uvmapping_settings"):
             del bpy.types.Scene.uvmapping_settings
         for cls in reversed(registered):
@@ -64,10 +61,9 @@ def unregister():
 
     import bpy
 
-    from . import preview, texture_operators
+    from . import texture_operators
 
     texture_operators.shutdown()
-    preview.unregister()
 
     if hasattr(bpy.types.Scene, "uvmapping_settings"):
         del bpy.types.Scene.uvmapping_settings

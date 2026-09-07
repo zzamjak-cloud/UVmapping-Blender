@@ -23,7 +23,7 @@ Vec3 = tuple[float, float, float]
 
 @dataclass(frozen=True, slots=True)
 class UVQualityReport:
-    """자동 언랩 결과를 비교할 수 있는 정규화된 품질 지표."""
+    """UV 결과를 비교할 수 있는 정규화된 품질 지표."""
 
     triangle_count: int
     overlap_pairs: int

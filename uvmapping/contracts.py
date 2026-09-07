@@ -381,6 +381,23 @@ def _default_guide_map_manifest(coordinate_space: str) -> dict[str, Any]:
     return {"schema_version": "1.0", "maps": maps}
 
 
+def count_uv_islands(
+    mesh: Any,
+    uv_layer_name: str | None,
+    seam_edges: Sequence[int],
+) -> int:
+    """``build_texture_job``과 동일한 규칙으로 UV 아일랜드 수만 계산한다.
+
+    Atlas manifest를 먼저 만들어야 하는 호출자가 TextureJob 전체를 만들지 않고도
+    member별 island_count를 확정할 수 있게 한다.
+    """
+
+    _, faces, _ = _extract_faces(mesh, uv_layer_name)
+    normalized_seams = tuple(sorted({int(index) for index in seam_edges}))
+    face_to_island, adjacency = _island_topology(mesh, faces, normalized_seams)
+    return len(_island_manifest(faces, face_to_island, adjacency))
+
+
 def _atlas_descriptor(value: Any) -> dict[str, Any]:
     if isinstance(value, TextureJob):
         return {
@@ -819,4 +836,9 @@ def build_texture_job(
     )
 
 
-__all__ = ("TextureJob", "build_atlas_context", "build_texture_job")
+__all__ = (
+    "TextureJob",
+    "build_atlas_context",
+    "build_texture_job",
+    "count_uv_islands",
+)

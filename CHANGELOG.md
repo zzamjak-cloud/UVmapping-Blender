@@ -2,6 +2,21 @@
 
 이 프로젝트는 [Semantic Versioning](https://semver.org/)을 따릅니다.
 
+## 2.0.0 - 2026-09-08
+
+### 제거 (호환성 깨짐)
+
+- 자동 Seam 분석, 자동 UV 언랩, Seam 미리보기, UV 재패킹 기능 전체 제거
+- `uvmapping.auto_unwrap`, `uvmapping.analyze`, `uvmapping.preview_seams`, `uvmapping.clear_preview`, `uvmapping.repack_uvs` 연산자 삭제
+- `UV 언랩` 패널과 프리셋·품질·Seam 정책·분석 가중치 등 관련 설정 삭제
+
+### 변경
+
+- AI 텍스처 파이프라인이 사용자가 이미 펼쳐 둔 활성 UV에서 TextureJob 계약을 직접 생성
+- 3면도 생성과 베이크 시점에 각각 현재 UV로 계약을 다시 계산해 그 사이의 UV·메시 변경을 감지
+- UV 맵 누락, 0-1 범위 이탈, 객체 간 UV 겹침을 생성 전에 안내와 함께 차단
+- 텍스처 크기와 UV 패딩 설정을 `AI 손맵 텍스처` 패널로 이동
+
 ## 1.2.0 - 2026-08-30
 
 - 자유 참조 이미지의 공통 손맵 스타일을 구조화해 분석하는 Gemini 연동 추가

@@ -144,9 +144,6 @@ jobs:
         run: |
           set -euo pipefail
           for test_file in \
-            tests/blender_smoke.py \
-            tests/blender_v1.py \
-            tests/blender_quality.py \
             tests/blender_texture.py
           do
             echo "::group::Blender 통합 회귀: ${test_file}"

@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "uvmapping_blender"
-version = "1.2.0"
+version = "2.0.0"
 name = "UV Mapping Blender"
-tagline = "메시 흐름을 분석해 Seam 생성부터 UV 패킹까지 자동화합니다"
+tagline = "AI 3면도로 기존 UV에 손맵 텍스처를 만들어 베이크합니다"
 maintainer = "zzamjak-cloud"
 type = "add-on"
 

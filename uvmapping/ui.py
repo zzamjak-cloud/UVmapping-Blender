@@ -6,91 +6,30 @@ from pathlib import Path
 import bpy
 from bpy.types import Panel, UIList
 
-from . import preview
 from .properties import get_addon_preferences
 from .texture_operators import can_bake_diffuse
 
 
-class UVMAPPING_PT_main(Panel):
-    """UV 언랩 기본 패널."""
+def _has_texture_target(context) -> bool:
+    """폴리곤이 있는 Mesh가 선택되어 있어야 텍스처 단계를 노출한다."""
 
-    bl_label = "UV 언랩"
-    bl_idname = "UVMAPPING_PT_main"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "UV Mapping"
+    candidates = getattr(context, "selected_editable_objects", ())
+    return any(
+        obj.type == "MESH" and obj.data is not None and len(obj.data.polygons) > 0
+        for obj in candidates
+    )
 
-    @classmethod
-    def poll(cls, context):
-        candidates = getattr(context, "selected_editable_objects", ())
-        return preview.is_active() or any(
-            obj.type == "MESH"
-            and obj.data is not None
-            and len(obj.data.polygons) > 0
-            for obj in candidates
-        )
 
-    def draw(self, context):
-        layout = self.layout
-        settings = context.scene.uvmapping_settings
+def _missing_uv_names(context) -> tuple[str, ...]:
+    """활성 UV 맵이 없는 선택 객체 이름을 모은다."""
 
-        button = layout.column()
-        button.scale_y = 1.6
-        button.operator("uvmapping.auto_unwrap", icon="UV")
-
-        preview = layout.row(align=True)
-        preview.operator("uvmapping.preview_seams", icon="SHADING_WIRE")
-        preview.operator("uvmapping.clear_preview", icon="X")
-
-        if settings.last_result:
-            status = layout.box()
-            status.label(text=settings.last_result, icon="INFO")
-
-        packing = layout.box()
-        packing.label(text="출력 텍스처", icon="TEXTURE")
-        packing.prop(settings, "texture_resolution")
-        packing.prop(settings, "padding_pixels")
-        packing.prop(settings, "pack_shared_atlas")
-        packing.prop(settings, "auto_repack")
-        packing.operator("uvmapping.repack_uvs", icon="MOD_UVPROJECT")
-
-        advanced = layout.row(align=True)
-        advanced.prop(
-            settings,
-            "show_advanced",
-            text="고급 설정",
-            emboss=False,
-            icon="TRIA_DOWN" if settings.show_advanced else "TRIA_RIGHT",
-        )
-        if not settings.show_advanced:
-            return
-
-        column = layout.column(align=True)
-        column.prop(settings, "preset", text="프리셋")
-        column.prop(settings, "quality_level", text="품질")
-        column.separator()
-        column.prop(settings, "seam_policy")
-        column.prop(settings, "create_new_uv_layer")
-        column.prop(settings, "uv_layer_name")
-        column.prop(settings, "generate_texture_job")
-        column.separator()
-        column.prop(settings, "unwrap_iterations")
-        column.prop(settings, "fill_holes")
-        column.prop(settings, "correct_aspect")
-
-        analysis = layout.box()
-        analysis.prop(settings, "use_custom_analysis")
-        if settings.use_custom_analysis:
-            grid = analysis.grid_flow(columns=2, even_columns=True, align=True)
-            grid.prop(settings, "angle_weight")
-            grid.prop(settings, "concave_multiplier")
-            grid.prop(settings, "sharp_weight")
-            grid.prop(settings, "material_weight")
-            grid.prop(settings, "seam_threshold")
-            grid.prop(settings, "min_chart_faces")
-        analysis.prop(settings, "ensure_cut_paths")
-        analysis.prop(settings, "connect_boundary_loops")
-        analysis.operator("uvmapping.analyze", icon="VIEWZOOM")
+    names = []
+    for obj in getattr(context, "selected_editable_objects", ()):
+        if obj.type != "MESH" or obj.data is None or not len(obj.data.polygons):
+            continue
+        if obj.data.uv_layers.active is None:
+            names.append(obj.name)
+    return tuple(names)
 
 
 class UVMAPPING_UL_reference_images(UIList):
@@ -118,17 +57,10 @@ class UVMAPPING_PT_ai_texture(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "UV Mapping"
-    bl_options = {"DEFAULT_CLOSED"}
 
     @classmethod
     def poll(cls, context):
-        candidates = getattr(context, "selected_editable_objects", ())
-        return any(
-            obj.type == "MESH"
-            and obj.data is not None
-            and len(obj.data.polygons) > 0
-            for obj in candidates
-        )
+        return _has_texture_target(context)
 
     def draw(self, context):
         layout = self.layout
@@ -145,6 +77,13 @@ class UVMAPPING_PT_ai_texture(Panel):
                     "use_online_access",
                     text="Allow Online Access 켜기",
                 )
+
+        missing_uv = _missing_uv_names(context)
+        if missing_uv:
+            uv_box = layout.box()
+            uv_box.label(text="UV 맵이 없는 객체가 있습니다", icon="ERROR")
+            uv_box.label(text=", ".join(missing_uv))
+            uv_box.label(text="UV Editing에서 UV를 펼친 뒤 0-1 안에 배치해 주세요")
 
         model_box = layout.box()
         model_box.label(text="이미지 생성 모델", icon="IMAGE_DATA")
@@ -201,6 +140,12 @@ class UVMAPPING_PT_ai_texture(Panel):
         prompt_box.operator(
             "uvmapping.edit_texture_prompt", text="한글 프롬프트 입력", icon="TEXT"
         )
+
+        output_box = layout.box()
+        output_box.label(text="출력 텍스처", icon="TEXTURE")
+        output_box.prop(settings, "texture_resolution")
+        output_box.prop(settings, "padding_pixels")
+
         generate = layout.column()
         generate.scale_y = 1.5
         if has_references:
@@ -242,7 +187,6 @@ class UVMAPPING_PT_ai_texture(Panel):
 
 
 classes = (
-    UVMAPPING_PT_main,
     UVMAPPING_UL_reference_images,
     UVMAPPING_PT_ai_texture,
 )
@@ -250,7 +194,6 @@ classes = (
 
 __all__ = (
     "classes",
-    "UVMAPPING_PT_main",
     "UVMAPPING_PT_ai_texture",
     "UVMAPPING_UL_reference_images",
 )

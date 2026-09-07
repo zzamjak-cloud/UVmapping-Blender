@@ -148,9 +148,6 @@ def main() -> None:
 
     bpy.ops.mesh.primitive_cube_add(size=2.0)
     cube = bpy.context.object
-    cube["uvmapping_texture_job"] = json.dumps(
-        {"schema_version": "1.4", "atlas_id": "atlas-test"}
-    )
     texture_module = importlib.import_module(f"{MODULE_NAME}.uvmapping.texture_operators")
     assert texture_module._provider_models(settings) == (
         "GEMINI",
@@ -397,22 +394,33 @@ def main() -> None:
             for image in gray_images:
                 bpy.data.images.remove(image)
 
-        uv_name = cube.data.uv_layers.active.name
-        texture_job = {
-            "schema_version": "1.4",
-            "atlas_id": "atlas-bake-test",
-            "atlas_hash": "atlas-hash-test",
-            "uv_hash": "uv-hash-test",
-            "mesh_hash": "mesh-hash-test",
-            "uv_layer_name": uv_name,
-            "target_resolution": [64, 64],
-            "requested_padding": 2,
-        }
-        cube["uvmapping_texture_job"] = json.dumps(texture_job)
+        # 애드온이 UV를 만들지 않으므로 큐브의 기본 UV에서 계약을 그대로 생성한다.
+        settings.texture_resolution = "256"
+        settings.padding_pixels = 2
+        job_module = importlib.import_module(f"{MODULE_NAME}.uvmapping.texture_job")
+        texture_job = job_module.ensure_texture_jobs((cube,), settings)[0]
+        assert texture_job["uv_layer_name"] == cube.data.uv_layers.active.name
+        assert texture_job["settings"]["uv_source"] == "USER_AUTHORED"
         turnaround_path = bake_dir / "turnaround.png"
         turnaround_path.write_bytes(sheet_path.read_bytes())
         projection = texture_module._projection_contract(bpy.context, (cube,))
-        source_job = {"object_name": cube.name, **texture_job}
+        source_job = {
+            "object_name": cube.name,
+            **{
+                key: texture_job.get(key, "")
+                for key in (
+                    "job_id",
+                    "atlas_id",
+                    "atlas_hash",
+                    "atlas_member_id",
+                    "uv_hash",
+                    "mesh_hash",
+                    "uv_layer_name",
+                    "target_resolution",
+                    "requested_padding",
+                )
+            },
+        }
         design_state = {
             "schema_version": "1.1",
             "status": "TURNAROUND_READY",
@@ -440,7 +448,7 @@ def main() -> None:
             for image in bpy.data.images
             if image.get("uvmapping_output_path") == str(diffuse_path.resolve())
         )
-        assert tuple(baked_image.size) == (64, 64)
+        assert tuple(baked_image.size) == (256, 256)
         assert baked_image.colorspace_settings.name == "sRGB"
         baked_material = next(
             material
