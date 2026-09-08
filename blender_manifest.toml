@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "uvmapping_blender"
-version = "2.0.0"
+version = "2.1.0"
 name = "UV Mapping Blender"
 tagline = "AI 3면도로 기존 UV에 손맵 텍스처를 만들어 베이크합니다"
 maintainer = "zzamjak-cloud"
@@ -11,7 +11,7 @@ blender_version_min = "4.5.0"
 license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
-network = "AI 참조 분석과 텍스처 디자인 생성에 필요"
+network = "OpenRouter 참조 분석과 텍스처 디자인 생성에 필요"
 files = "참조 이미지 읽기와 생성 결과 저장에 필요"
 clipboard = "브라우저에서 복사한 참조 이미지를 붙여넣는 데 필요"
 

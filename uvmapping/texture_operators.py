@@ -21,6 +21,7 @@ from mathutils import Vector
 from . import clipboard_image, native_input, texture_bake
 from .properties import get_addon_preferences
 from .quality import evaluate_atlas_quality
+from .openrouter_provider import validate_model_slug
 from .texture_job import TEXTURE_JOB_PROPERTY, ensure_texture_jobs
 from .texture_pipeline import (
     build_reference_analysis_prompt,
@@ -69,40 +70,27 @@ def _reference_digest(paths: tuple[Path, ...]) -> str:
     return digest.hexdigest()
 
 
-def _provider_api_key(context, provider: str) -> str:
+def resolve_api_key(context) -> str:
+    """환경설정에 저장된 OpenRouter 키를 읽고 없으면 환경 변수로 대체한다."""
+
     preferences = get_addon_preferences(context)
-    if provider == "OPENAI":
-        api_key = getattr(preferences, "openai_api_key", "").strip() or os.environ.get(
-            "OPENAI_API_KEY", ""
-        ).strip()
-        provider_name = "OpenAI"
-    else:
-        api_key = getattr(preferences, "gemini_api_key", "").strip() or os.environ.get(
-            "GEMINI_API_KEY", ""
-        ).strip()
-        provider_name = "Gemini"
+    api_key = (
+        getattr(preferences, "openrouter_api_key", "").strip()
+        or os.environ.get("OPENROUTER_API_KEY", "").strip()
+    )
     if not api_key:
         raise ValueError(
-            f"Blender 애드온 환경설정에 {provider_name} API 키를 입력해 주세요."
+            "Blender 애드온 환경설정에 OpenRouter API 키를 입력해 주세요."
         )
     return api_key
 
 
-def _provider_models(settings) -> tuple[str, str, str]:
-    """UI에서 선택한 모델에 대응하는 Provider·분석·이미지 모델을 반환한다."""
+def _resolved_models(settings) -> tuple[str, str]:
+    """UI에서 고른 (분석 모델, 이미지 모델) OpenRouter 식별자를 검증해 반환한다."""
 
-    provider = str(settings.texture_image_provider)
-    if provider == "OPENAI":
-        return (
-            provider,
-            settings.texture_openai_analysis_model.strip(),
-            settings.texture_openai_image_model.strip(),
-        )
-    return (
-        "GEMINI",
-        settings.texture_analysis_model.strip(),
-        settings.texture_image_model.strip(),
-    )
+    analysis_model = validate_model_slug(settings.texture_analysis_model)
+    image_model = validate_model_slug(settings.texture_image_model)
+    return analysis_model, image_model
 
 
 def _selected_meshes(context) -> tuple:
@@ -892,8 +880,8 @@ class UVMAPPING_OT_analyze_references(_AsyncTextureMixin, Operator):
                 raise ValueError(
                     "Blender 환경설정 > 시스템에서 'Allow Online Access'를 켜 주세요."
                 )
-            provider, model, _image_model = _provider_models(settings)
-            api_key = _provider_api_key(context, provider)
+            model, _image_model = _resolved_models(settings)
+            api_key = resolve_api_key(context)
             self._analysis_reference_digest = _reference_digest(paths)
         except ValueError as exc:
             self.report({"ERROR"}, str(exc))
@@ -901,7 +889,6 @@ class UVMAPPING_OT_analyze_references(_AsyncTextureMixin, Operator):
 
         job = {
             "action": "analyze",
-            "provider": provider,
             "model": model,
             "prompt": build_reference_analysis_prompt(len(paths)),
             "image_paths": [str(path) for path in paths],
@@ -952,8 +939,8 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
                 raise ValueError(
                     "참조 이미지가 없을 때는 추가 지시 프롬프트를 입력해 주세요."
                 )
-            provider, _analysis_model, model = _provider_models(settings)
-            api_key = _provider_api_key(context, provider)
+            _analysis_model, model = _resolved_models(settings)
+            api_key = resolve_api_key(context)
             projection = _projection_contract(context, objects)
             model_paths = _render_model_views(context, objects, projection)
             output_path = _output_path(context, objects)
@@ -1003,7 +990,6 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
             self._projection = projection
             self._user_prompt = user_prompt
             self._model = model
-            self._provider = provider
             self._analysis_payload = (
                 analysis.to_dict() if analysis is not None else None
             )
@@ -1013,7 +999,6 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
 
         job = {
             "action": "turnaround",
-            "provider": provider,
             "model": model,
             "prompt": compile_turnaround_prompt(analysis, user_prompt),
             "image_paths": [str(contact_sheet), *(str(path) for path in reference_paths)],
@@ -1031,9 +1016,7 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
             "schema_version": "1.1",
             "status": "TURNAROUND_READY",
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "provider": (
-                "openai" if self._provider == "OPENAI" else "google_gemini"
-            ),
+            "provider": "openrouter",
             "model": self._model,
             "target_objects": self._target_names,
             "source_jobs": self._source_jobs,

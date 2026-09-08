@@ -692,7 +692,7 @@ def test_settings_ui_exposes_only_ai_texturing_controls() -> None:
 
     # 자동 언랩 기능을 제거했으므로 관련 설정이 되살아나면 안 된다.
     for removed in (
-        "preset: EnumProperty",
+        "\n    preset: EnumProperty",
         "quality_level: EnumProperty",
         "seam_policy: EnumProperty",
         "island_margin: FloatProperty",

@@ -14,14 +14,8 @@ if __package__ in {None, ""}:
 from uvmapping.texture_pipeline import (
     InlineImage,
     TURNAROUND_VIEWS,
-    build_gemini_analysis_payload,
-    build_gemini_generate_content_payload,
-    build_gemini_turnaround_payload,
     build_reference_analysis_prompt,
     build_turnaround_request,
-    extract_gemini_generate_content_response,
-    extract_gemini_image,
-    extract_gemini_text,
     parse_reference_analysis,
     validate_reference_image_path,
 )
@@ -165,7 +159,7 @@ def test_turnaround_request_fixes_one_call_one_image_and_view_order() -> None:
     assert request.views == TURNAROUND_VIEWS == ("FRONT", "RIGHT", "BACK")
     assert request.provider_call_count == 1
     assert request.output_image_count == 1
-    assert request.model == "gemini-3-pro-image"
+    assert request.model == "google/gemini-3-pro-image"
     assert request.aspect_ratio == "21:9"
     assert request.image_size == "2K"
     assert "한 번" in request.prompt
@@ -225,97 +219,6 @@ def test_turnaround_request_rejects_cost_contract_changes() -> None:
             pass
         else:
             raise AssertionError("고정된 비용 또는 시점 계약의 변경이 거부되어야 합니다.")
-
-
-def test_gemini_payload_contains_all_inputs_and_single_image_config() -> None:
-    request = build_turnaround_request(
-        InlineImage("image/png", "geometry-data", "geometry_contact_sheet", "model"),
-        [
-            InlineImage("image/jpeg", "ref-a", "reference", "a"),
-            InlineImage("image/png", "ref-b", "reference", "b"),
-        ],
-        parse_reference_analysis('{"object_summary":"상자"}'),
-    )
-
-    payload = build_gemini_generate_content_payload(request)
-    parts = payload["contents"][0]["parts"]
-    inline_parts = [part["inlineData"] for part in parts if "inlineData" in part]
-
-    assert [part["data"] for part in inline_parts] == ["geometry-data", "ref-a", "ref-b"]
-    assert payload["generationConfig"]["responseModalities"] == ["TEXT", "IMAGE"]
-    assert payload["generationConfig"]["imageConfig"] == {
-        "aspectRatio": "21:9",
-        "imageSize": "2K",
-    }
-
-
-def test_public_gemini_payload_builders_use_tuple_images() -> None:
-    analysis_payload = build_gemini_analysis_payload(
-        "분석",
-        [("image/png", "first"), ("image/jpeg", "second")],
-    )
-    turnaround_payload = build_gemini_turnaround_payload(
-        "생성",
-        [("image/png", "geometry"), ("image/jpeg", "reference")],
-    )
-
-    assert analysis_payload["generationConfig"] == {
-        "responseModalities": ["TEXT"],
-        "responseMimeType": "application/json",
-    }
-    assert analysis_payload["contents"][0]["parts"][1]["inlineData"]["data"] == "first"
-    assert turnaround_payload["generationConfig"]["imageConfig"] == {
-        "aspectRatio": "21:9",
-        "imageSize": "2K",
-    }
-    parts = turnaround_payload["contents"][0]["parts"]
-    assert parts[1]["text"] == "다음 이미지 역할: geometry_contact_sheet"
-    assert parts[2]["inlineData"]["data"] == "geometry"
-    assert parts[3]["text"] == "다음 이미지 역할: reference"
-    assert parts[4]["inlineData"]["data"] == "reference"
-
-
-def test_gemini_response_extracts_text_and_image_key_variants() -> None:
-    response = {
-        "candidates": [
-            {
-                "content": {
-                    "parts": [
-                        {"text": "첫 번째"},
-                        {"inlineData": {"mimeType": "image/png", "data": "png-data"}},
-                    ]
-                }
-            },
-            {
-                "content": {
-                    "parts": [
-                        {"text": "두 번째"},
-                        {"inline_data": {"mime_type": "image/jpeg", "data": "jpg-data"}},
-                        {"inlineData": {"mimeType": "text/plain", "data": "ignored"}},
-                    ]
-                }
-            },
-        ]
-    }
-
-    result = extract_gemini_generate_content_response(response)
-
-    assert result.text == "첫 번째\n두 번째"
-    assert [(image.mime_type, image.data_base64) for image in result.images] == [
-        ("image/png", "png-data"),
-        ("image/jpeg", "jpg-data"),
-    ]
-    assert extract_gemini_text(response) == "첫 번째\n두 번째"
-    assert extract_gemini_image(response) == ("image/png", "png-data")
-
-
-def test_gemini_response_handles_missing_candidates() -> None:
-    result = extract_gemini_generate_content_response({"promptFeedback": {}})
-
-    assert result.text == ""
-    assert result.images == ()
-    assert extract_gemini_text({}) == ""
-    assert extract_gemini_image({}) is None
 
 
 def main() -> None:

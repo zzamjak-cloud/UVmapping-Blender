@@ -85,10 +85,26 @@ class UVMAPPING_PT_ai_texture(Panel):
             uv_box.label(text=", ".join(missing_uv))
             uv_box.label(text="UV Editing에서 UV를 펼친 뒤 0-1 안에 배치해 주세요")
 
+        key_box = layout.box()
+        key_box.label(text="OpenRouter", icon="KEYINGSET")
+        preferences = get_addon_preferences(context)
+        api_key = getattr(preferences, "openrouter_api_key", "") or os.environ.get(
+            "OPENROUTER_API_KEY", ""
+        )
+        if api_key.strip():
+            key_box.label(text="OpenRouter API 키 사용 가능", icon="CHECKMARK")
+        else:
+            key_box.label(text="OpenRouter API 키가 필요합니다", icon="ERROR")
+            key_box.label(text="환경설정 > 애드온에서 키 하나만 입력하면 됩니다")
+            key_box.operator(
+                "screen.userpref_show", text="환경설정 열기", icon="PREFERENCES"
+            )
+
         model_box = layout.box()
         model_box.label(text="이미지 생성 모델", icon="IMAGE_DATA")
         model_choices = model_box.column(align=True)
-        model_choices.prop(settings, "texture_image_provider", expand=True)
+        model_choices.prop(settings, "texture_model_preset", expand=True)
+        model_box.label(text=settings.texture_image_model, icon="DOT")
 
         reference_box = layout.box()
         reference_box.label(text="스타일 참조", icon="IMAGE_DATA")
@@ -107,24 +123,6 @@ class UVMAPPING_PT_ai_texture(Panel):
             "uvmapping.paste_reference_image", text="클립보드", icon="PASTEDOWN"
         )
         controls.operator("uvmapping.remove_reference_image", text="제거", icon="REMOVE")
-        preferences = get_addon_preferences(context)
-        if settings.texture_image_provider == "OPENAI":
-            provider_name = "OpenAI"
-            api_key = getattr(preferences, "openai_api_key", "") or os.environ.get(
-                "OPENAI_API_KEY", ""
-            )
-        else:
-            provider_name = "Gemini"
-            api_key = getattr(preferences, "gemini_api_key", "") or os.environ.get(
-                "GEMINI_API_KEY", ""
-            )
-        key_status = reference_box.box()
-        if api_key.strip():
-            key_status.label(text=f"{provider_name} API 키 사용 가능", icon="CHECKMARK")
-        else:
-            key_status.label(text=f"{provider_name} API 키가 필요합니다", icon="ERROR")
-            key_status.label(text="환경설정 > 애드온에서 API 키를 입력하세요")
-            key_status.operator("screen.userpref_show", text="환경설정 열기", icon="PREFERENCES")
         has_references = bool(settings.reference_images)
         analyze = reference_box.row()
         analyze.enabled = has_references
@@ -177,12 +175,9 @@ class UVMAPPING_PT_ai_texture(Panel):
         )
         if settings.show_texture_advanced:
             advanced = layout.box()
-            if settings.texture_image_provider == "OPENAI":
-                advanced.prop(settings, "texture_openai_analysis_model")
-                advanced.prop(settings, "texture_openai_image_model")
-            else:
-                advanced.prop(settings, "texture_analysis_model")
-                advanced.prop(settings, "texture_image_model")
+            advanced.prop(settings, "texture_analysis_model")
+            advanced.prop(settings, "texture_image_model")
+            advanced.label(text="openrouter.ai/models의 모델 식별자를 직접 넣을 수 있습니다", icon="INFO")
             advanced.label(text="API 키는 Blender 환경설정에서 관리합니다", icon="KEYINGSET")
 
 

@@ -1,4 +1,4 @@
-"""Blender 메인 프로세스 밖에서 이미지 AI HTTP 요청을 실행하는 작업자."""
+"""Blender 메인 프로세스 밖에서 OpenRouter HTTP 요청을 실행하는 작업자."""
 
 from __future__ import annotations
 
@@ -8,24 +8,24 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-from urllib import error, parse, request
+from urllib import error, request
 
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from uvmapping.texture_pipeline import (  # noqa: E402
-    build_gemini_analysis_payload,
-    build_gemini_turnaround_payload,
-    extract_gemini_generate_content_response,
-    extract_gemini_text,
     validate_reference_image_path,
 )
-from uvmapping.openai_provider import (  # noqa: E402
-    build_openai_analysis_payload,
-    build_openai_image_edit_multipart,
-    extract_openai_image_response,
-    extract_openai_response_text,
+from uvmapping.openrouter_provider import (  # noqa: E402
+    BASE_URL,
+    CHAT_COMPLETIONS_ENDPOINT,
+    IMAGES_ENDPOINT,
+    build_analysis_payload,
+    build_request_headers,
+    build_turnaround_payload,
+    extract_analysis_text,
+    extract_image_response,
 )
 
 
@@ -37,26 +37,14 @@ def _encode_images(paths: list[str]) -> tuple[tuple[str, str], ...]:
     return tuple(encoded)
 
 
-def _binary_images(paths: list[str]) -> tuple[tuple[str, str, bytes], ...]:
-    images = []
-    for index, raw_path in enumerate(paths):
-        path, mime_type = validate_reference_image_path(raw_path)
-        filename = f"{index:02d}_{path.name}"
-        images.append((filename, mime_type, path.read_bytes()))
-    return tuple(images)
+def _openrouter_request(endpoint: str, api_key: str, payload: dict) -> dict:
+    """OpenRouter JSON 엔드포인트 하나를 호출하고 응답을 해석한다."""
 
-
-def _gemini_request(model: str, api_key: str, payload: dict) -> dict:
-    safe_model = parse.quote(model.strip(), safe="-._")
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{safe_model}:generateContent"
-    )
     api_request = request.Request(
-        url,
+        f"{BASE_URL}/{endpoint}",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         method="POST",
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        headers=build_request_headers(api_key),
     )
     try:
         with request.urlopen(api_request, timeout=300) as response:
@@ -65,40 +53,13 @@ def _gemini_request(model: str, api_key: str, payload: dict) -> dict:
         detail = exc.read().decode("utf-8", errors="replace")
         try:
             message = json.loads(detail).get("error", {}).get("message", detail)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, AttributeError):
             message = detail
-        raise RuntimeError(f"Gemini API 오류({exc.code}): {message}") from exc
+        if exc.code in {401, 403}:
+            message = f"{message} (OpenRouter API 키를 확인해 주세요)"
+        raise RuntimeError(f"OpenRouter API 오류({exc.code}): {message}") from exc
     except error.URLError as exc:
-        raise RuntimeError(f"Gemini API 연결 실패: {exc.reason}") from exc
-
-
-def _openai_request(
-    endpoint: str,
-    api_key: str,
-    body: bytes,
-    content_type: str,
-) -> dict:
-    api_request = request.Request(
-        f"https://api.openai.com/v1/{endpoint}",
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": content_type,
-        },
-    )
-    try:
-        with request.urlopen(api_request, timeout=300) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        try:
-            message = json.loads(detail).get("error", {}).get("message", detail)
-        except json.JSONDecodeError:
-            message = detail
-        raise RuntimeError(f"OpenAI API 오류({exc.code}): {message}") from exc
-    except error.URLError as exc:
-        raise RuntimeError(f"OpenAI API 연결 실패: {exc.reason}") from exc
+        raise RuntimeError(f"OpenRouter API 연결 실패: {exc.reason}") from exc
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -123,57 +84,24 @@ def run_job(job: dict, api_key: str) -> dict:
     """직렬화된 작업 하나를 실행하고 작은 결과 계약만 반환한다."""
 
     action = job.get("action")
-    provider = str(job.get("provider", "GEMINI")).upper()
     image_paths = list(job.get("image_paths", ()))
     if action == "analyze":
-        images = _encode_images(image_paths)
-        if provider == "OPENAI":
-            payload = build_openai_analysis_payload(
-                str(job["prompt"]), images, model=str(job["model"])
-            )
-            response = _openai_request(
-                "responses",
-                api_key,
-                json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                "application/json",
-            )
-            text = extract_openai_response_text(response)
-        elif provider == "GEMINI":
-            payload = build_gemini_analysis_payload(str(job["prompt"]), images)
-            response = _gemini_request(str(job["model"]), api_key, payload)
-            text = extract_gemini_text(response)
-        else:
-            raise ValueError(f"지원하지 않는 AI Provider입니다: {provider!r}")
+        payload = build_analysis_payload(
+            str(job["prompt"]), _encode_images(image_paths), model=str(job["model"])
+        )
+        response = _openrouter_request(CHAT_COMPLETIONS_ENDPOINT, api_key, payload)
+        text = extract_analysis_text(response)
         if not text.strip():
-            raise RuntimeError(f"{provider} 응답에 참조 분석 텍스트가 없습니다.")
+            raise RuntimeError("OpenRouter 응답에 참조 분석 텍스트가 없습니다.")
         return {"ok": True, "text": text}
     if action == "turnaround":
-        if provider == "OPENAI":
-            content_type, body = build_openai_image_edit_multipart(
-                str(job["prompt"]),
-                _binary_images(image_paths),
-                model=str(job["model"]),
-            )
-            response = _openai_request("images/edits", api_key, body, content_type)
-            mime_type, image_data = extract_openai_image_response(response)
-        elif provider == "GEMINI":
-            images = _encode_images(image_paths)
-            payload = build_gemini_turnaround_payload(str(job["prompt"]), images)
-            response = _gemini_request(str(job["model"]), api_key, payload)
-            generated = extract_gemini_generate_content_response(response).images
-            if len(generated) != 1:
-                raise RuntimeError(
-                    f"Gemini 결과 이미지가 정확히 한 장이어야 합니다: {len(generated)}장"
-                )
-            mime_type = generated[0].mime_type
-            image_data_base64 = generated[0].data_base64
-            if mime_type not in {"image/png", "image/jpeg"}:
-                raise RuntimeError(f"지원하지 않는 Gemini 이미지 형식입니다: {mime_type}")
-            image_data = base64.b64decode(image_data_base64, validate=True)
-        else:
-            raise ValueError(f"지원하지 않는 AI Provider입니다: {provider!r}")
+        payload = build_turnaround_payload(
+            str(job["prompt"]), _encode_images(image_paths), model=str(job["model"])
+        )
+        response = _openrouter_request(IMAGES_ENDPOINT, api_key, payload)
+        mime_type, image_data = extract_image_response(response)
         requested_path = Path(str(job["output_path"]))
-        suffix = ".jpg" if mime_type == "image/jpeg" else ".png"
+        suffix = {"image/jpeg": ".jpg", "image/webp": ".webp"}.get(mime_type, ".png")
         output_path = requested_path.with_suffix(suffix)
         _atomic_write(output_path, image_data)
         return {"ok": True, "output_path": str(output_path)}
@@ -187,7 +115,7 @@ def main() -> None:
     try:
         api_key = sys.stdin.readline().strip()
         if not api_key:
-            raise ValueError("AI API 키가 작업자 프로세스에 전달되지 않았습니다.")
+            raise ValueError("OpenRouter API 키가 작업자 프로세스에 전달되지 않았습니다.")
         job = json.loads(request_path.read_text(encoding="utf-8"))
         result = run_job(job, api_key)
     except Exception as exc:

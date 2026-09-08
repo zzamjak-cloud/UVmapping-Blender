@@ -2,6 +2,23 @@
 
 이 프로젝트는 [Semantic Versioning](https://semver.org/)을 따릅니다.
 
+## 2.1.0 - 2026-09-08
+
+### 변경 (호환성 깨짐)
+
+- Gemini와 OpenAI 개인 키 두 개를 **OpenRouter API 키 하나**로 통합하고 환경설정 입력 필드를 단일화
+- 참조 분석은 OpenRouter `/chat/completions`, 3면도 생성은 `/images` 엔드포인트 하나로 통일
+- 환경 변수 대체 키를 `GEMINI_API_KEY`/`OPENAI_API_KEY`에서 `OPENROUTER_API_KEY`로 변경
+- 모델 식별자를 OpenRouter 슬러그로 교체하고 프리셋 전환 시 분석·이미지 모델을 함께 갱신
+  - Nano Banana Pro: `google/gemini-3.7-flash` + `google/gemini-3-pro-image`
+  - GPT Image: `openai/gpt-5.6-sol` + `openai/gpt-5.4-image-2`
+- 고급 설정에서 openrouter.ai/models의 임의 모델 식별자를 직접 입력 가능
+
+### 제거
+
+- `uvmapping/openai_provider.py`와 Gemini generateContent 전용 payload 빌더 삭제
+- 환경설정의 `gemini_api_key`, `openai_api_key` 및 Provider별 모델 속성 4종 삭제
+
 ## 2.0.0 - 2026-09-08
 
 ### 제거 (호환성 깨짐)

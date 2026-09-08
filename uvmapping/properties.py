@@ -34,27 +34,25 @@ def get_addon_preferences(context):
 
 
 class UVMAPPING_AP_preferences(AddonPreferences):
-    """Blender 사용자 환경설정에만 저장되는 AI Provider 자격 증명."""
+    """Blender 사용자 환경설정에만 저장되는 OpenRouter 자격 증명."""
 
     bl_idname = addon_module_id()
 
-    gemini_api_key: StringProperty(
-        name="Gemini API 키",
-        description="Gemini 참조 분석과 이미지 생성에 사용할 개인 API 키입니다",
-        default="",
-        subtype="PASSWORD",
-    )
-    openai_api_key: StringProperty(
-        name="OpenAI API 키",
-        description="OpenAI 참조 분석과 이미지 생성에 사용할 개인 API 키입니다",
+    openrouter_api_key: StringProperty(
+        name="OpenRouter API 키",
+        description="참조 분석과 3면도 생성을 모두 OpenRouter 한 곳으로 호출할 개인 API 키입니다",
         default="",
         subtype="PASSWORD",
     )
 
     def draw(self, _context):
         layout = self.layout
-        layout.prop(self, "gemini_api_key")
-        layout.prop(self, "openai_api_key")
+        layout.prop(self, "openrouter_api_key")
+        issue_box = layout.box()
+        issue_box.label(text="키는 openrouter.ai/keys에서 발급합니다.", icon="URL")
+        issue_box.operator(
+            "wm.url_open", text="OpenRouter 키 발급 페이지 열기", icon="URL"
+        ).url = "https://openrouter.ai/keys"
         save_box = layout.box()
         save_box.label(text="API 키를 입력한 뒤 반드시 아래 버튼으로 저장하세요.", icon="INFO")
         save_box.operator("wm.save_userpref", text="API 키 저장", icon="FILE_TICK")
@@ -62,6 +60,24 @@ class UVMAPPING_AP_preferences(AddonPreferences):
         warning = layout.box()
         warning.label(text="API 키는 이 컴퓨터의 Blender 사용자 환경설정에 저장됩니다.", icon="INFO")
         warning.label(text="공용 컴퓨터에서는 키를 입력하거나 저장하지 마세요.")
+
+
+# OpenRouter 모델 식별자는 "제공자/모델" 형식이며 (분석 모델, 이미지 모델) 순서다.
+NANO_BANANA_PRO_MODELS = ("google/gemini-3.7-flash", "google/gemini-3-pro-image")
+GPT_IMAGE_MODELS = ("openai/gpt-5.6-sol", "openai/gpt-5.4-image-2")
+MODEL_PRESETS = {
+    "NANO_BANANA_PRO": NANO_BANANA_PRO_MODELS,
+    "GPT_IMAGE": GPT_IMAGE_MODELS,
+}
+
+
+def _apply_model_preset(settings, _context) -> None:
+    """프리셋을 바꾸면 두 모델 식별자를 해당 조합으로 덮어쓴다."""
+
+    models = MODEL_PRESETS.get(str(settings.texture_model_preset))
+    if models is None:
+        return
+    settings.texture_analysis_model, settings.texture_image_model = models
 
 
 class UVMAPPING_PG_reference_image(PropertyGroup):
@@ -115,38 +131,33 @@ class UVMAPPING_PG_settings(PropertyGroup):
         description="참조 이미지에 없는 요구만 짧게 입력합니다",
         default="",
     )
-    texture_image_provider: EnumProperty(
+    texture_model_preset: EnumProperty(
         name="이미지 생성 모델",
-        description="참조 분석과 한 장짜리 3면도 생성에 사용할 AI 모델을 선택합니다",
+        description="OpenRouter에서 사용할 분석·이미지 모델 조합을 선택합니다",
         items=(
             (
-                "GEMINI",
+                "NANO_BANANA_PRO",
                 "Nano Banana Pro",
-                "Gemini 분석과 Nano Banana Pro로 3면도를 생성합니다",
+                "google/gemini-3.7-flash 분석과 google/gemini-3-pro-image 생성",
             ),
             (
-                "OPENAI",
-                "GPT-Image-2 (덕테이프)",
-                "GPT-5.6 분석과 GPT-Image-2로 3면도를 생성합니다",
+                "GPT_IMAGE",
+                "GPT Image (덕테이프)",
+                "openai/gpt-5.6-sol 분석과 openai/gpt-5.4-image-2 생성",
             ),
         ),
-        default="GEMINI",
+        default="NANO_BANANA_PRO",
+        update=_apply_model_preset,
     )
     texture_analysis_model: StringProperty(
         name="분석 모델",
-        default="gemini-3.7-flash",
+        description="OpenRouter 참조 분석 모델 식별자입니다",
+        default=NANO_BANANA_PRO_MODELS[0],
     )
     texture_image_model: StringProperty(
         name="이미지 모델",
-        default="gemini-3-pro-image",
-    )
-    texture_openai_analysis_model: StringProperty(
-        name="OpenAI 분석 모델",
-        default="gpt-5.6",
-    )
-    texture_openai_image_model: StringProperty(
-        name="OpenAI 이미지 모델",
-        default="gpt-image-2",
+        description="OpenRouter 3면도 생성 모델 식별자입니다",
+        default=NANO_BANANA_PRO_MODELS[1],
     )
     show_texture_advanced: BoolProperty(
         name="AI 고급 설정",
@@ -180,6 +191,9 @@ class UVMAPPING_PG_settings(PropertyGroup):
 
 
 __all__ = (
+    "GPT_IMAGE_MODELS",
+    "MODEL_PRESETS",
+    "NANO_BANANA_PRO_MODELS",
     "UVMAPPING_AP_preferences",
     "UVMAPPING_PG_reference_image",
     "UVMAPPING_PG_settings",

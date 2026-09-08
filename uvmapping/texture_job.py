@@ -17,7 +17,7 @@ from .quality import OVERLAP_EXACT, evaluate_atlas_quality, evaluate_uv_quality
 
 TEXTURE_JOB_PROPERTY = "uvmapping_texture_job"
 TEXTURE_TARGET_UDIMS = (1001,)
-ADDON_VERSION = "2.0.0"
+ADDON_VERSION = "2.1.0"
 
 # 사용자 UV를 그대로 쓰므로 member 간 겹침 판정은 예산을 넉넉히 잡아 정확히 센다.
 _ATLAS_PAIR_BUDGET = 1_000_000

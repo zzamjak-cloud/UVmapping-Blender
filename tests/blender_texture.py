@@ -55,9 +55,8 @@ addon = bpy.context.preferences.addons.get({MODULE_NAME!r})
 assert addon is not None, "개발 Extension이 활성화되지 않았습니다."
 preferences = getattr(addon, "preferences", None)
 assert preferences is not None, "애드온 환경설정을 찾지 못했습니다."
-gemini_configured = int(bool(getattr(preferences, "gemini_api_key", "").strip()))
-openai_configured = int(bool(getattr(preferences, "openai_api_key", "").strip()))
-print(f"UVMAPPING_API_KEY_STATE={{gemini_configured}},{{openai_configured}}")
+openrouter_configured = int(bool(getattr(preferences, "openrouter_api_key", "").strip()))
+print(f"UVMAPPING_API_KEY_STATE={{openrouter_configured}}")
 """
     result = subprocess.run(
         (
@@ -80,9 +79,9 @@ print(f"UVMAPPING_API_KEY_STATE={{gemini_configured}},{{openai_configured}}")
         None,
     )
     assert state_line is not None, "새 Blender 프로세스가 API 키 저장 상태를 반환하지 않았습니다."
-    values = state_line.removeprefix(marker).split(",")
-    assert values in (["0", "0"], ["0", "1"], ["1", "0"], ["1", "1"])
-    return values[0] == "1", values[1] == "1"
+    value = state_line.removeprefix(marker).strip()
+    assert value in ("0", "1"), f"예상치 못한 API 키 상태입니다: {value!r}"
+    return value == "1"
 
 
 def main() -> None:
@@ -102,65 +101,81 @@ def main() -> None:
     for name in (
         "reference_images",
         "texture_user_prompt",
-        "texture_image_provider",
+        "texture_model_preset",
         "texture_analysis_model",
         "texture_image_model",
-        "texture_openai_analysis_model",
-        "texture_openai_image_model",
         "texture_analysis_json",
         "texture_output_path",
         "texture_diffuse_path",
     ):
         assert properties.get(name) is not None, f"AI 텍스처 속성이 없습니다: {name}"
     assert properties.get("texture_api_key") is None, "API 키가 Scene 속성에 남아 있습니다."
-    assert settings.texture_image_provider == "GEMINI"
-    provider_items = properties["texture_image_provider"].enum_items
-    assert provider_items["GEMINI"].name == "Nano Banana Pro"
-    assert provider_items["OPENAI"].name == "GPT-Image-2 (덕테이프)"
-    settings.texture_image_provider = "OPENAI"
-    assert settings.texture_image_provider == "OPENAI"
-    settings.texture_image_provider = "GEMINI"
-    assert settings.texture_image_model == "gemini-3-pro-image"
-    assert settings.texture_openai_analysis_model == "gpt-5.6"
-    assert settings.texture_openai_image_model == "gpt-image-2"
+    # 구 Provider별 키·모델 속성은 완전히 사라져야 한다.
+    for gone in (
+        "texture_image_provider",
+        "texture_openai_analysis_model",
+        "texture_openai_image_model",
+    ):
+        assert properties.get(gone) is None, f"구 Provider 속성이 남아 있습니다: {gone}"
+
+    preset_items = properties["texture_model_preset"].enum_items
+    assert preset_items["NANO_BANANA_PRO"].name == "Nano Banana Pro"
+    assert preset_items["GPT_IMAGE"].name == "GPT Image (덕테이프)"
+    assert settings.texture_model_preset == "NANO_BANANA_PRO"
+    assert settings.texture_analysis_model == "google/gemini-3.7-flash"
+    assert settings.texture_image_model == "google/gemini-3-pro-image"
+    # 프리셋을 바꾸면 두 모델 식별자가 함께 갱신되어야 한다.
+    settings.texture_model_preset = "GPT_IMAGE"
+    assert settings.texture_analysis_model == "openai/gpt-5.6-sol"
+    assert settings.texture_image_model == "openai/gpt-5.4-image-2"
+    settings.texture_model_preset = "NANO_BANANA_PRO"
+    assert settings.texture_image_model == "google/gemini-3-pro-image"
 
     preferences_module = importlib.import_module(f"{MODULE_NAME}.uvmapping.properties")
     assert preferences_module.addon_module_id() == MODULE_NAME
     addon_preferences = preferences_module.get_addon_preferences(bpy.context)
     assert addon_preferences is not None, "등록된 애드온 환경설정을 찾지 못했습니다."
     assert type(addon_preferences).bl_idname == MODULE_NAME
-    for key_name in ("gemini_api_key", "openai_api_key"):
-        key_property = addon_preferences.bl_rna.properties.get(key_name)
-        assert key_property is not None, f"애드온 API 키 속성이 없습니다: {key_name}"
-        assert key_property.subtype == "PASSWORD"
+    key_property = addon_preferences.bl_rna.properties.get("openrouter_api_key")
+    assert key_property is not None, "OpenRouter API 키 속성이 없습니다."
+    assert key_property.subtype == "PASSWORD"
+    for gone in ("gemini_api_key", "openai_api_key"):
+        assert addon_preferences.bl_rna.properties.get(gone) is None, (
+            f"구 Provider 키 속성이 남아 있습니다: {gone}"
+        )
     draw_source = inspect.getsource(preferences_module.UVMAPPING_AP_preferences.draw)
     assert 'operator("wm.save_userpref"' in draw_source
     assert "API 키 저장" in draw_source
     assert "입력한 뒤 반드시" in draw_source
     bpy.ops.wm.save_userpref.get_rna_type()
 
-    configured_before_save = (
-        bool(addon_preferences.gemini_api_key.strip()),
-        bool(addon_preferences.openai_api_key.strip()),
-    )
+    configured_before_save = bool(addon_preferences.openrouter_api_key.strip())
     assert bpy.ops.wm.save_userpref() == {"FINISHED"}
     assert _key_configuration_from_new_process() == configured_before_save
 
     bpy.ops.mesh.primitive_cube_add(size=2.0)
     cube = bpy.context.object
     texture_module = importlib.import_module(f"{MODULE_NAME}.uvmapping.texture_operators")
-    assert texture_module._provider_models(settings) == (
-        "GEMINI",
-        "gemini-3.7-flash",
-        "gemini-3-pro-image",
+    assert texture_module._resolved_models(settings) == (
+        "google/gemini-3.7-flash",
+        "google/gemini-3-pro-image",
     )
-    settings.texture_image_provider = "OPENAI"
-    assert texture_module._provider_models(settings) == (
-        "OPENAI",
-        "gpt-5.6",
-        "gpt-image-2",
+    settings.texture_model_preset = "GPT_IMAGE"
+    assert texture_module._resolved_models(settings) == (
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.4-image-2",
     )
-    settings.texture_image_provider = "GEMINI"
+    settings.texture_model_preset = "NANO_BANANA_PRO"
+    # 키가 없으면 네트워크 호출 전에 안내와 함께 막혀야 한다.
+    if not addon_preferences.openrouter_api_key.strip() and not os.environ.get(
+        "OPENROUTER_API_KEY", ""
+    ):
+        try:
+            texture_module.resolve_api_key(bpy.context)
+        except ValueError as error:
+            assert "OpenRouter API 키" in str(error)
+        else:
+            raise AssertionError("키가 없을 때 안내 오류가 발생해야 합니다.")
     with tempfile.TemporaryDirectory(prefix="uvmapping-clipboard-operator-") as temp_dir:
         pasted_path = Path(temp_dir) / "clipboard.png"
         pasted_path.write_bytes(

@@ -11,7 +11,7 @@ from typing import Any, Mapping, Sequence
 
 ANALYSIS_SCHEMA_VERSION = "1.0"
 TURNAROUND_VIEWS = ("FRONT", "RIGHT", "BACK")
-DEFAULT_IMAGE_MODEL = "gemini-3-pro-image"
+DEFAULT_IMAGE_MODEL = "google/gemini-3-pro-image"
 DEFAULT_ASPECT_RATIO = "21:9"
 DEFAULT_IMAGE_SIZE = "2K"
 MAX_REFERENCE_IMAGE_BYTES = 32 * 1024 * 1024
@@ -166,22 +166,6 @@ class TurnaroundImageRequest:
         if self.contact_sheet.role != "geometry_contact_sheet":
             raise ValueError("실제 모델 contact sheet의 역할이 올바르지 않습니다.")
         # 참조 이미지는 선택 사항이다. 없으면 프롬프트만으로 스타일을 정한다.
-
-
-@dataclass(frozen=True, slots=True)
-class GeminiGeneratedImage:
-    """Gemini 응답에서 추출한 인라인 이미지."""
-
-    mime_type: str
-    data_base64: str
-
-
-@dataclass(frozen=True, slots=True)
-class GeminiGenerateContentResult:
-    """Gemini generateContent 후보에서 합친 텍스트와 이미지."""
-
-    text: str
-    images: tuple[GeminiGeneratedImage, ...]
 
 
 def build_reference_analysis_prompt(reference_count: int) -> str:
@@ -489,151 +473,3 @@ def build_turnaround_request(
         reference_images=tuple(reference_images),
         model=model,
     )
-
-
-def build_gemini_generate_content_payload(
-    request: TurnaroundImageRequest,
-) -> dict[str, Any]:
-    """Gemini generateContent REST API에 전달할 JSON 본문을 만든다."""
-
-    parts: list[dict[str, Any]] = [{"text": request.prompt}]
-    for image in (request.contact_sheet, *request.reference_images):
-        parts.append(
-            {
-                "text": f"다음 이미지 역할: {image.role}"
-                + (f", 이름: {image.name}" if image.name else "")
-            }
-        )
-        parts.append(
-            {
-                "inlineData": {
-                    "mimeType": image.mime_type,
-                    "data": image.data_base64,
-                }
-            }
-        )
-    return {
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {
-            "responseModalities": ["TEXT", "IMAGE"],
-            "imageConfig": {
-                "aspectRatio": request.aspect_ratio,
-                "imageSize": request.image_size,
-            },
-        },
-    }
-
-
-def _gemini_inline_parts(
-    images: Sequence[tuple[str, str]],
-) -> list[dict[str, Any]]:
-    """MIME 및 base64 쌍을 Gemini inlineData parts로 변환한다."""
-
-    parts: list[dict[str, Any]] = []
-    for mime_type, data_base64 in images:
-        if not mime_type.startswith("image/"):
-            raise ValueError("Gemini 입력 이미지는 image/* MIME 형식이어야 합니다.")
-        if not data_base64.strip():
-            raise ValueError("Gemini 입력 이미지 데이터가 비어 있습니다.")
-        parts.append({"inlineData": {"mimeType": mime_type, "data": data_base64}})
-    return parts
-
-
-def build_gemini_analysis_payload(
-    prompt: str,
-    images: Sequence[tuple[str, str]],
-) -> dict[str, Any]:
-    """참조 이미지 분석용 Gemini generateContent JSON 본문을 만든다."""
-
-    if not prompt.strip():
-        raise ValueError("분석 프롬프트가 비어 있습니다.")
-    if not images:
-        raise ValueError("분석할 참조 이미지가 최소 한 장 필요합니다.")
-    return {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}, *_gemini_inline_parts(images)],
-            }
-        ],
-        "generationConfig": {
-            "responseModalities": ["TEXT"],
-            "responseMimeType": "application/json",
-        },
-    }
-
-
-def build_gemini_turnaround_payload(
-    prompt: str,
-    images: Sequence[tuple[str, str]],
-    aspect_ratio: str = DEFAULT_ASPECT_RATIO,
-    image_size: str = DEFAULT_IMAGE_SIZE,
-) -> dict[str, Any]:
-    """한 장의 3면도 생성용 Gemini generateContent JSON 본문을 만든다."""
-
-    if not prompt.strip():
-        raise ValueError("3면도 프롬프트가 비어 있습니다.")
-    if not images:
-        raise ValueError("모델 contact sheet와 참조 이미지가 필요합니다.")
-    parts: list[dict[str, Any]] = [{"text": prompt}]
-    for index, image_part in enumerate(_gemini_inline_parts(images)):
-        role = "geometry_contact_sheet" if index == 0 else "reference"
-        parts.extend(({"text": f"다음 이미지 역할: {role}"}, image_part))
-    return {
-        "contents": [
-            {
-                "role": "user",
-                "parts": parts,
-            }
-        ],
-        "generationConfig": {
-            "responseModalities": ["TEXT", "IMAGE"],
-            "imageConfig": {
-                "aspectRatio": aspect_ratio,
-                "imageSize": image_size,
-            },
-        },
-    }
-
-
-def extract_gemini_generate_content_response(
-    payload: Mapping[str, Any],
-) -> GeminiGenerateContentResult:
-    """Gemini 후보의 text와 inlineData 이미지들을 안전하게 추출한다."""
-
-    texts: list[str] = []
-    images: list[GeminiGeneratedImage] = []
-    candidates = payload.get("candidates")
-    if not isinstance(candidates, list):
-        return GeminiGenerateContentResult(text="", images=())
-    for candidate in candidates:
-        content = _mapping(_mapping(candidate).get("content"))
-        parts = content.get("parts")
-        if not isinstance(parts, list):
-            continue
-        for raw_part in parts:
-            part = _mapping(raw_part)
-            text = _text(part.get("text"))
-            if text:
-                texts.append(text)
-            inline = _mapping(part.get("inlineData") or part.get("inline_data"))
-            mime_type = _text(inline.get("mimeType") or inline.get("mime_type"))
-            data = _text(inline.get("data"))
-            if mime_type.startswith("image/") and data:
-                images.append(GeminiGeneratedImage(mime_type=mime_type, data_base64=data))
-    return GeminiGenerateContentResult(text="\n".join(texts), images=tuple(images))
-
-
-def extract_gemini_text(payload: Mapping[str, Any]) -> str:
-    """Gemini 응답의 모든 텍스트 part를 하나의 문자열로 반환한다."""
-
-    return extract_gemini_generate_content_response(payload).text
-
-
-def extract_gemini_image(payload: Mapping[str, Any]) -> tuple[str, str] | None:
-    """Gemini 응답의 첫 이미지 MIME 형식과 base64 데이터를 반환한다."""
-
-    images = extract_gemini_generate_content_response(payload).images
-    if not images:
-        return None
-    return images[0].mime_type, images[0].data_base64

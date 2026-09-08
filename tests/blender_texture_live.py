@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -58,14 +59,12 @@ def main() -> None:
     addon.unregister()
     addon.register()
     preferences = properties.get_addon_preferences(bpy.context)
-    keys = {
-        "GEMINI": getattr(preferences, "gemini_api_key", "").strip(),
-        "OPENAI": getattr(preferences, "openai_api_key", "").strip(),
-    }
-    missing = [name for name, value in keys.items() if not value]
-    if missing:
+    api_key = getattr(preferences, "openrouter_api_key", "").strip() or os.environ.get(
+        "OPENROUTER_API_KEY", ""
+    ).strip()
+    if not api_key:
         raise RuntimeError(
-            "개발 프로필 애드온 환경설정에 API 키가 없습니다: " + ", ".join(missing)
+            "개발 프로필 애드온 환경설정 또는 OPENROUTER_API_KEY에 OpenRouter 키가 없습니다."
         )
 
     _clear_scene()
@@ -89,40 +88,39 @@ def main() -> None:
     for path in model_paths:
         path.unlink(missing_ok=True)
 
-    providers = (
-        ("GEMINI", "gemini-3.7-flash", "gemini-3-pro-image"),
-        ("OPENAI", "gpt-5.6", "gpt-image-2"),
+    # 키는 하나지만 OpenRouter가 두 모델 계열로 라우팅하는지 각각 확인한다.
+    presets = (
+        ("nano_banana_pro", "google/gemini-3.7-flash", "google/gemini-3-pro-image"),
+        ("gpt_image", "openai/gpt-5.6-sol", "openai/gpt-5.4-image-2"),
     )
     failures = []
-    for provider, analysis_model, image_model in providers:
+    for preset, analysis_model, image_model in presets:
         try:
             analysis_result = worker.run_job(
                 {
                     "action": "analyze",
-                    "provider": provider,
                     "model": analysis_model,
                     "prompt": pipeline.build_reference_analysis_prompt(1),
                     "image_paths": [str(reference_path)],
                 },
-                keys[provider],
+                api_key,
             )
             analysis = pipeline.parse_reference_analysis(analysis_result["text"])
             turnaround_result = worker.run_job(
                 {
                     "action": "turnaround",
-                    "provider": provider,
                     "model": image_model,
                     "prompt": pipeline.compile_turnaround_prompt(
                         analysis, "밝은 모서리와 과장된 금색 잠금장치"
                     ),
                     "image_paths": [str(geometry_path), str(reference_path)],
-                    "output_path": str(output_dir / f"{provider.lower()}_turnaround.png"),
+                    "output_path": str(output_dir / f"{preset}_turnaround.png"),
                 },
-                keys[provider],
+                api_key,
             )
             turnaround_path = Path(turnaround_result["output_path"])
             crops = operators._crop_turnaround(turnaround_path)
-            albedo_path = output_dir / f"{provider.lower()}_albedo.png"
+            albedo_path = output_dir / f"{preset}_albedo.png"
             result = bake.bake_diffuse(
                 bpy.context,
                 (cube,),
@@ -135,17 +133,17 @@ def main() -> None:
             assert turnaround_path.is_file() and albedo_path.is_file()
             assert result["status"] == "ALBEDO_APPLIED"
             print(
-                f"[live] {provider}: analysis=1, image=1, "
+                f"[live] {preset}: analysis=1, image=1, "
                 f"filled={result['filled_pixels']}, fallback={result['fallback_pixels']}"
             )
-        except Exception as exc:  # 공급자 하나가 실패해도 다른 공급자를 검증한다.
-            failures.append(f"{provider}: {type(exc).__name__}: {exc}")
-            print(f"[live] {provider}: 실패(재시도 없음) - {type(exc).__name__}: {exc}")
+        except Exception as exc:  # 프리셋 하나가 실패해도 다른 프리셋을 검증한다.
+            failures.append(f"{preset}: {type(exc).__name__}: {exc}")
+            print(f"[live] {preset}: 실패(재시도 없음) - {type(exc).__name__}: {exc}")
 
     print(f"[live] 결과 폴더: {output_dir}")
     if failures:
         raise AssertionError(" | ".join(failures))
-    print("[live] 공급자 2종 유료 호출과 최종 Albedo 적용 통과")
+    print("[live] OpenRouter 단일 키로 모델 2종 유료 호출과 최종 Albedo 적용 통과")
 
 
 if __name__ == "__main__":
