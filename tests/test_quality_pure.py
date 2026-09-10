@@ -687,7 +687,7 @@ def test_settings_ui_exposes_only_ai_texturing_controls() -> None:
     assert '("256", "256 px"' in properties_source
     assert '("512", "512 px"' in properties_source
     assert 'name="UV 패딩"' in properties_source
-    assert 'default="2048"' in properties_source
+    assert 'default="1024"' in properties_source
     assert "default=16" in properties_source
 
     # 자동 언랩 기능을 제거했으므로 관련 설정이 되살아나면 안 된다.

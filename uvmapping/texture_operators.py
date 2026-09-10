@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from array import array
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -30,13 +31,22 @@ from .texture_pipeline import (
     validate_reference_image_path,
 )
 
+# 3면도 생성 요청과 같은 21:9 캔버스로 contact sheet를 만들어 좌표계를 일치시킨다.
+CONTACT_SHEET_ASPECT = 21.0 / 9.0
+# 형상 가이드는 AI가 실루엣을 따라 그릴 수 있을 만큼 선명해야 한다.
+MODEL_CAPTURE_RESOLUTION = 1024
+# 투명 배경은 Provider마다 다르게 합성된다. 불투명 흰 배경 위의 회색 모델이
+# 실루엣 대비가 가장 분명하다. 외곽선까지 그리면 가이드가 "일러스트 대상"처럼
+# 보여 이미지 모델이 실루엣을 따라 그리는 대신 다시 그리기 시작한다.
+CAPTURE_BACKGROUND = (1.0, 1.0, 1.0)
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 MAX_REFERENCE_IMAGES = 5
 TEXTURE_DESIGN_STATE_PROPERTY = "uvmapping_texture_design_state"
 _ACTIVE_PROCESSES: set[subprocess.Popen] = set()
 _ACTIVE_JOB_DIRS: set[Path] = set()
-_ACTIVE_OPERATORS: list = []
-# 연산자 RNA가 해제된 뒤에도 타이머를 안전하게 해제하기 위한 모듈 레지스트리.
+# Blender는 execute()가 반환하는 즉시 Operator RNA를 해제하므로, 진행 중인
+# AI 작업 상태는 반드시 연산자 밖(모듈 레지스트리)에 보관해야 한다.
+_ACTIVE_RUNS: list = []
 _ACTIVE_TIMERS: set = set()
 
 
@@ -102,16 +112,78 @@ def _selected_meshes(context) -> tuple:
     )
 
 
-def _validated_texture_targets(context) -> tuple:
+def registered_targets(context) -> tuple:
+    """패널에 명시 등록한 대상 객체를 순서대로, 중복 없이 돌려준다."""
+
+    settings = getattr(context.scene, "uvmapping_settings", None)
+    if settings is None:
+        return ()
+    resolved = {}
+    for item in settings.target_objects:
+        obj = item.object
+        if obj is None or obj.type != "MESH" or obj.data is None:
+            continue
+        if not len(obj.data.polygons):
+            continue
+        resolved.setdefault(obj.name, obj)
+    return tuple(resolved.values())
+
+
+def texture_targets(context) -> tuple:
+    """등록 목록이 있으면 그것을, 없으면 현재 선택을 대상으로 삼는다."""
+
+    return registered_targets(context) or _selected_meshes(context)
+
+
+def non_object_mode_names(context) -> tuple[str, ...]:
+    """Edit·Paint 모드에서는 원본 Mesh가 최신이 아니므로 대상에서 막는다."""
+
+    return tuple(obj.name for obj in texture_targets(context) if obj.mode != "OBJECT")
+
+
+def ensure_object_mode(context, objects: tuple) -> None:
+    """대상이 Edit·Paint 모드면 Object Mode로 되돌린 뒤 진행한다."""
+
+    if all(obj.mode == "OBJECT" for obj in objects):
+        return
+    active = getattr(context, "object", None)
+    if active is not None and active.mode != "OBJECT":
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except RuntimeError:
+            pass
+    view_layer = getattr(context, "view_layer", None)
+    if view_layer is not None:
+        previous_active = view_layer.objects.active
+        for obj in objects:
+            if obj.mode == "OBJECT":
+                continue
+            try:
+                view_layer.objects.active = obj
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except (RuntimeError, ReferenceError):
+                pass
+        if previous_active is not None and previous_active.name in bpy.data.objects:
+            view_layer.objects.active = previous_active
+    remaining = tuple(obj.name for obj in objects if obj.mode != "OBJECT")
+    if remaining:
+        raise ValueError(
+            f"{', '.join(remaining[:3])}: Object Mode로 전환하지 못했습니다. "
+            "직접 Object Mode로 바꾼 뒤 다시 실행해 주세요."
+        )
+
+
+def _validated_texture_targets(context, objects=None) -> tuple:
     """선택 객체의 현재 UV에서 TextureJob 계약을 새로 계산해 기록한다.
 
     계약은 UV·메시 내용만으로 결정되므로, 3면도 생성 시점과 베이크 시점에 각각
     다시 계산해 비교하면 그 사이에 UV가 바뀌었는지 확인할 수 있다.
     """
 
-    objects = _selected_meshes(context)
+    objects = tuple(objects) if objects else texture_targets(context)
     if not objects:
-        raise ValueError("텍스처를 만들 Mesh 객체를 선택해 주세요.")
+        raise ValueError("대상 객체를 등록하거나 Mesh 객체를 선택해 주세요.")
+    ensure_object_mode(context, objects)
     ensure_texture_jobs(objects, context.scene.uvmapping_settings)
     return objects
 
@@ -129,10 +201,10 @@ def _nearly_equal_values(left, right, tolerance: float = 1.0e-6) -> bool:
         return left == right
 
 
-def _validated_bake_targets(context) -> tuple[tuple, dict, tuple[dict, ...]]:
-    """현재 선택·UV·Transform이 3면도 생성 시점과 같은지 검사한다."""
+def _validated_bake_targets(context, objects=None) -> tuple[tuple, dict, tuple[dict, ...]]:
+    """현재 대상·UV·Transform이 3면도 생성 시점과 같은지 검사한다."""
 
-    objects = _validated_texture_targets(context)
+    objects = _validated_texture_targets(context, objects)
     states = []
     jobs = []
     for obj in objects:
@@ -166,7 +238,7 @@ def _validated_bake_targets(context) -> tuple[tuple, dict, tuple[dict, ...]]:
 
     target_names = tuple(first.get("target_objects", ()))
     if set(target_names) != {obj.name for obj in objects}:
-        raise ValueError("3면도를 생성했던 Mesh 객체를 모두 다시 선택해 주세요.")
+        raise ValueError("3면도를 생성했던 Mesh 객체를 모두 다시 대상으로 지정해 주세요.")
     projection = first.get("projection")
     if not isinstance(projection, dict):
         raise ValueError("구버전 3면도입니다. 정확한 투영을 위해 다시 생성해 주세요.")
@@ -235,9 +307,11 @@ def _validated_bake_targets(context) -> tuple[tuple, dict, tuple[dict, ...]]:
 def can_bake_diffuse(context) -> bool:
     """패널 draw에서 파일 해시 계산 없이 베이크 가능성을 빠르게 표시한다."""
 
-    objects = _selected_meshes(context)
-    return bool(objects) and not _ACTIVE_OPERATORS and all(
-        obj.get(TEXTURE_DESIGN_STATE_PROPERTY) for obj in objects
+    objects = texture_targets(context)
+    return (
+        bool(objects)
+        and not _ACTIVE_RUNS
+        and all(obj.get(TEXTURE_DESIGN_STATE_PROPERTY) for obj in objects)
     )
 
 
@@ -328,7 +402,13 @@ def _render_model_views(
     camera_data.clip_end = max(1000.0, distance + extent.length * 3.0)
 
     render = scene.render
+    shading = scene.display.shading
+    view_settings = scene.view_settings
     saved = {
+        "view_transform": view_settings.view_transform,
+        "view_look": view_settings.look,
+        "view_exposure": view_settings.exposure,
+        "view_gamma": view_settings.gamma,
         "camera": scene.camera,
         "engine": render.engine,
         "filepath": render.filepath,
@@ -337,9 +417,11 @@ def _render_model_views(
         "resolution_percentage": render.resolution_percentage,
         "film_transparent": render.film_transparent,
         "file_format": render.image_settings.file_format,
-        "shading_light": scene.display.shading.light,
-        "shading_color_type": scene.display.shading.color_type,
-        "shading_single_color": tuple(scene.display.shading.single_color),
+        "shading_light": shading.light,
+        "shading_color_type": shading.color_type,
+        "shading_single_color": tuple(shading.single_color),
+        "shading_background_type": shading.background_type,
+        "shading_background_color": tuple(shading.background_color),
     }
     hidden = {obj: obj.hide_render for obj in scene.objects if obj != camera}
     selected = set(objects)
@@ -351,14 +433,22 @@ def _render_model_views(
             render.engine = "BLENDER_WORKBENCH_NEXT"
         except (TypeError, ValueError):
             render.engine = "BLENDER_WORKBENCH"
-        scene.display.shading.light = "STUDIO"
-        scene.display.shading.color_type = "SINGLE"
-        scene.display.shading.single_color = (0.55, 0.55, 0.55)
+        # AgX 같은 뷰 트랜스폼은 흰 배경을 0.77 회색으로 눌러 실루엣 대비와
+        # 외곽선을 흐린다. 형상 가이드는 색 변환 없이 그대로 저장한다.
+        view_settings.view_transform = "Standard"
+        view_settings.look = "None"
+        view_settings.exposure = 0.0
+        view_settings.gamma = 1.0
+        shading.light = "STUDIO"
+        shading.color_type = "SINGLE"
+        shading.single_color = (0.55, 0.55, 0.55)
+        shading.background_type = "VIEWPORT"
+        shading.background_color = CAPTURE_BACKGROUND
         scene.camera = camera
-        render.resolution_x = 512
-        render.resolution_y = 512
+        render.resolution_x = MODEL_CAPTURE_RESOLUTION
+        render.resolution_y = MODEL_CAPTURE_RESOLUTION
         render.resolution_percentage = 100
-        render.film_transparent = True
+        render.film_transparent = False
         render.image_settings.file_format = "PNG"
 
         views = (
@@ -384,16 +474,32 @@ def _render_model_views(
         render.resolution_percentage = saved["resolution_percentage"]
         render.film_transparent = saved["film_transparent"]
         render.image_settings.file_format = saved["file_format"]
-        scene.display.shading.light = saved["shading_light"]
-        scene.display.shading.color_type = saved["shading_color_type"]
-        scene.display.shading.single_color = saved["shading_single_color"]
+        view_settings.view_transform = saved["view_transform"]
+        view_settings.look = saved["view_look"]
+        view_settings.exposure = saved["view_exposure"]
+        view_settings.gamma = saved["view_gamma"]
+        shading.light = saved["shading_light"]
+        shading.color_type = saved["shading_color_type"]
+        shading.single_color = saved["shading_single_color"]
+        shading.background_type = saved["shading_background_type"]
+        shading.background_color = saved["shading_background_color"]
         bpy.data.objects.remove(camera, do_unlink=True)
         bpy.data.cameras.remove(camera_data)
     return tuple(paths)
 
 
-def _join_horizontal(paths: tuple[Path, ...], output_path: Path) -> Path:
-    """동일 크기 모델 뷰를 라벨 없이 한 장의 가로 contact sheet로 합친다."""
+def _join_horizontal(
+    paths: tuple[Path, ...],
+    output_path: Path,
+    aspect_ratio: float = CONTACT_SHEET_ASPECT,
+    background: tuple[float, float, float] = CAPTURE_BACKGROUND,
+) -> Path:
+    """모델 뷰를 가로로 잇고, AI 캔버스와 같은 종횡비가 되도록 위아래를 채운다.
+
+    생성 요청은 21:9 캔버스를 3열로 나누라고 지시하므로, 참조로 주는 contact
+    sheet도 같은 종횡비여야 AI가 각 열의 정사각형 viewport 위치를 그대로 따라
+    그린다. 그래야 베이크 때 모델 투영 좌표와 생성 이미지 좌표가 어긋나지 않는다.
+    """
 
     sources = [bpy.data.images.load(str(path), check_existing=False) for path in paths]
     target = None
@@ -403,20 +509,24 @@ def _join_horizontal(paths: tuple[Path, ...], output_path: Path) -> Path:
             raise RuntimeError("모델 뷰 렌더 크기가 서로 다릅니다.")
         channels = 4
         target_width = width * len(sources)
-        pixels = array("f", [0.0]) * (target_width * height * channels)
+        target_height = max(height, int(round(target_width / max(1.0e-6, aspect_ratio))))
+        row_offset = (target_height - height) // 2
+        pixels = array("f", [*background, 1.0][:channels]) * (target_width * target_height)
         for column, source in enumerate(sources):
             source_pixels = array("f", [0.0]) * (width * height * channels)
             source.pixels.foreach_get(source_pixels)
             for row in range(height):
                 source_start = row * width * channels
-                target_start = (row * target_width + column * width) * channels
+                target_start = (
+                    (row + row_offset) * target_width + column * width
+                ) * channels
                 pixels[target_start : target_start + width * channels] = source_pixels[
                     source_start : source_start + width * channels
                 ]
         target = bpy.data.images.new(
             "UVMapping Model Contact Sheet",
             width=target_width,
-            height=height,
+            height=target_height,
             alpha=True,
         )
         target.pixels.foreach_set(pixels)
@@ -504,26 +614,115 @@ def _reference_output_directory() -> Path:
     return output_dir
 
 
+def _tag_texture_panels_redraw() -> None:
+    """타이머에서 바꾼 상태 문자열이 즉시 패널에 보이도록 다시 그린다."""
+
+    window_manager = getattr(bpy.context, "window_manager", None)
+    for window in getattr(window_manager, "windows", ()):
+        for area in window.screen.areas:
+            area.tag_redraw()
+
+
+class _TextureRun:
+    """작업자 프로세스를 Operator RNA 수명과 무관하게 감시하는 실행 단위."""
+
+    def __init__(self, process, request_path, response_path, scene_pointer, payload, finish):
+        self.process = process
+        self.request_path = request_path
+        self.response_path = response_path
+        self.scene_pointer = scene_pointer
+        self.payload = payload
+        self.finish = finish
+        self.timer = None
+
+    def _scene(self):
+        return next(
+            (
+                candidate
+                for candidate in bpy.data.scenes
+                if candidate.as_pointer() == self.scene_pointer
+            ),
+            None,
+        )
+
+    def poll_process(self):
+        if self.process.poll() is None:
+            return 0.2
+        _ACTIVE_PROCESSES.discard(self.process)
+        if self in _ACTIVE_RUNS:
+            _ACTIVE_RUNS.remove(self)
+        scene = self._scene()
+        try:
+            result = json.loads(self.response_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            result = {"ok": False, "error": f"AI 작업 결과를 읽지 못했습니다: {exc}"}
+        self.cleanup_job_files()
+        if not result.get("ok"):
+            message = str(result.get("error", "알 수 없는 AI 작업 오류"))
+            if scene is not None:
+                scene.uvmapping_settings.texture_status = message
+            _tag_texture_panels_redraw()
+            return None
+        if scene is None:
+            _preserve_result_without_scene(result, self.payload)
+            return None
+        try:
+            self.finish(scene, result, self.payload)
+        except Exception as exc:  # noqa: BLE001 - 어떤 후처리 실패도 상태로 알린다.
+            if result.get("output_path"):
+                scene.uvmapping_settings.texture_output_path = str(result["output_path"])
+                message = f"원본 AI 결과는 저장됐지만 후처리에 실패했습니다: {exc}"
+            else:
+                message = f"AI 결과 적용 실패: {exc}"
+            scene.uvmapping_settings.texture_status = message
+        _tag_texture_panels_redraw()
+        return None
+
+    def cleanup_job_files(self):
+        for path in (self.request_path, self.response_path):
+            if path is not None:
+                path.unlink(missing_ok=True)
+        if self.request_path is not None:
+            _ACTIVE_JOB_DIRS.discard(self.request_path.parent)
+            try:
+                self.request_path.parent.rmdir()
+            except OSError:
+                pass
+
+
+def _preserve_result_without_scene(result: dict, payload: dict) -> None:
+    output_path = result.get("output_path")
+    if not output_path:
+        return
+    state = json.dumps(
+        {
+            "schema_version": "1.0",
+            "status": "RAW_RESULT_SCENE_REMOVED",
+            "turnaround_path": str(output_path),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    for name, session_uid in payload.get("target_keys", ()):
+        obj = bpy.data.objects.get(name)
+        if obj is not None and obj.session_uid == session_uid:
+            obj[TEXTURE_DESIGN_STATE_PROPERTY] = state
+
+
 class _AsyncTextureMixin:
     """별도 Blender 프로세스를 앱 타이머로 감시하는 연산자 공통부."""
 
-    _app_timer = None
-    _process = None
-    _request_path = None
-    _response_path = None
-    _cancel_notice_shown = False
-
-    def _start(self, context, job: dict, api_key: str, status: str):
-        if _ACTIVE_OPERATORS:
+    def _start(self, context, job: dict, api_key: str, status: str, payload: dict, finish):
+        if _ACTIVE_RUNS:
             self.report({"WARNING"}, "이미 AI 작업이 진행 중입니다.")
             return {"CANCELLED"}
         job_dir = Path(tempfile.gettempdir()) / "uvmapping_ai" / uuid.uuid4().hex
         job_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
         _ACTIVE_JOB_DIRS.add(job_dir)
-        self._request_path = job_dir / "request.json"
-        self._response_path = job_dir / "response.json"
+        request_path = job_dir / "request.json"
+        response_path = job_dir / "response.json"
         descriptor = os.open(
-            self._request_path,
+            request_path,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             0o600,
         )
@@ -550,8 +749,9 @@ class _AsyncTextureMixin:
         environment = {
             key: value for key, value in os.environ.items() if key in allowed_environment
         }
+        process = None
         try:
-            self._process = subprocess.Popen(
+            process = subprocess.Popen(
                 (
                     bpy.app.binary_path,
                     "--background",
@@ -559,43 +759,51 @@ class _AsyncTextureMixin:
                     "--python",
                     str(worker_path),
                     "--",
-                    str(self._request_path),
-                    str(self._response_path),
+                    str(request_path),
+                    str(response_path),
                 ),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 env=environment,
             )
-            if self._process.stdin is None:
+            if process.stdin is None:
                 raise OSError("AI 작업자 표준입력을 열지 못했습니다.")
-            self._process.stdin.write((api_key + "\n").encode("utf-8"))
-            self._process.stdin.close()
+            process.stdin.write((api_key + "\n").encode("utf-8"))
+            process.stdin.close()
         except OSError as exc:
-            if self._process is not None and self._process.poll() is None:
-                self._process.terminate()
-            self._cleanup_job_files()
+            if process is not None and process.poll() is None:
+                process.terminate()
+            for path in (request_path, response_path):
+                path.unlink(missing_ok=True)
+            _ACTIVE_JOB_DIRS.discard(job_dir)
+            try:
+                job_dir.rmdir()
+            except OSError:
+                pass
             message = f"AI 작업자 프로세스를 시작하지 못했습니다: {exc}"
             context.scene.uvmapping_settings.texture_status = message
             self.report({"ERROR"}, message)
             return {"CANCELLED"}
-        _ACTIVE_PROCESSES.add(self._process)
-        _ACTIVE_OPERATORS.append(self)
-        self._scene_pointer = context.scene.as_pointer()
+        _ACTIVE_PROCESSES.add(process)
+        run = _TextureRun(
+            process,
+            request_path,
+            response_path,
+            context.scene.as_pointer(),
+            payload,
+            finish,
+        )
+        _ACTIVE_RUNS.append(run)
         context.scene.uvmapping_settings.texture_status = status
 
-        # Blender가 연산자 RNA를 먼저 해제해도(종료·리로드) 타이머가
-        # ReferenceError 없이 스스로 정리되도록 closure로 감싼다.
         def timer_callback():
-            try:
-                result = self._poll_process()
-            except ReferenceError:
-                result = None
+            result = run.poll_process()
             if result is None:
                 _ACTIVE_TIMERS.discard(timer_callback)
             return result
 
-        self._app_timer = timer_callback
+        run.timer = timer_callback
         _ACTIVE_TIMERS.add(timer_callback)
         bpy.app.timers.register(
             timer_callback,
@@ -603,73 +811,6 @@ class _AsyncTextureMixin:
             persistent=True,
         )
         return {"FINISHED"}
-
-    def _poll_process(self):
-        if self._process.poll() is None:
-            return 0.2
-        _ACTIVE_PROCESSES.discard(self._process)
-        if self in _ACTIVE_OPERATORS:
-            _ACTIVE_OPERATORS.remove(self)
-        scene = next(
-            (
-                candidate
-                for candidate in bpy.data.scenes
-                if candidate.as_pointer() == self._scene_pointer
-            ),
-            None,
-        )
-        try:
-            result = json.loads(self._response_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            result = {"ok": False, "error": f"AI 작업 결과를 읽지 못했습니다: {exc}"}
-        self._cleanup_job_files()
-        if not result.get("ok"):
-            message = str(result.get("error", "알 수 없는 AI 작업 오류"))
-            if scene is not None:
-                scene.uvmapping_settings.texture_status = message
-            return None
-        if scene is None:
-            self._preserve_result_without_scene(result)
-            return None
-        try:
-            self._finish(scene, result)
-        except Exception as exc:
-            if result.get("output_path"):
-                scene.uvmapping_settings.texture_output_path = str(result["output_path"])
-                message = f"원본 AI 결과는 저장됐지만 후처리에 실패했습니다: {exc}"
-            else:
-                message = f"AI 결과 적용 실패: {exc}"
-            scene.uvmapping_settings.texture_status = message
-        return None
-
-    def _preserve_result_without_scene(self, result: dict) -> None:
-        output_path = result.get("output_path")
-        if not output_path:
-            return
-        state = json.dumps(
-            {
-                "schema_version": "1.0",
-                "status": "RAW_RESULT_SCENE_REMOVED",
-                "turnaround_path": str(output_path),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        for name, session_uid in getattr(self, "_target_keys", ()):
-            obj = bpy.data.objects.get(name)
-            if obj is not None and obj.session_uid == session_uid:
-                obj[TEXTURE_DESIGN_STATE_PROPERTY] = state
-
-    def _cleanup_job_files(self):
-        for path in (self._request_path, self._response_path):
-            if path is not None:
-                path.unlink(missing_ok=True)
-        if self._request_path is not None:
-            _ACTIVE_JOB_DIRS.discard(self._request_path.parent)
-            try:
-                self._request_path.parent.rmdir()
-            except OSError:
-                pass
 
 
 def shutdown() -> None:
@@ -681,18 +822,12 @@ def shutdown() -> None:
         if bpy.app.timers.is_registered(timer):
             bpy.app.timers.unregister(timer)
         _ACTIVE_TIMERS.discard(timer)
-    for operator in tuple(_ACTIVE_OPERATORS):
-        try:
-            timer = operator._app_timer
-            if timer is not None and bpy.app.timers.is_registered(timer):
-                bpy.app.timers.unregister(timer)
-            operator._app_timer = None
-            operator._cleanup_job_files()
-        except ReferenceError:
-            # 연산자 RNA가 이미 해제됨 — 타이머·프로세스·작업 파일은
-            # 모듈 레지스트리(_ACTIVE_TIMERS 등)가 정리한다.
-            pass
-        _ACTIVE_OPERATORS.remove(operator)
+    for run in tuple(_ACTIVE_RUNS):
+        if run.timer is not None and bpy.app.timers.is_registered(run.timer):
+            bpy.app.timers.unregister(run.timer)
+        run.timer = None
+        run.cleanup_job_files()
+        _ACTIVE_RUNS.remove(run)
     for process in tuple(_ACTIVE_PROCESSES):
         if process.poll() is None:
             process.terminate()
@@ -722,15 +857,18 @@ class UVMAPPING_OT_add_reference_images(Operator, ImportHelper):
     filename_ext = ".png"
     filter_glob: StringProperty(default="*.png;*.jpg;*.jpeg;*.webp", options={"HIDDEN"})
     files: CollectionProperty(type=OperatorFileListElement, options={"HIDDEN", "SKIP_SAVE"})
+    # ImportHelper는 filepath만 제공하므로, 다중 선택에 필요한 directory는 직접 선언한다.
+    directory: StringProperty(subtype="DIR_PATH", options={"HIDDEN", "SKIP_SAVE"})
 
     @classmethod
     def poll(cls, _context):
-        return not _ACTIVE_OPERATORS
+        return not _ACTIVE_RUNS
 
     def execute(self, context):
         settings = context.scene.uvmapping_settings
-        directory = Path(self.directory)
-        candidates = [directory / item.name for item in self.files] or [Path(self.filepath)]
+        directory = Path(self.directory) if self.directory else Path(self.filepath).parent
+        names = [item.name for item in self.files if item.name]
+        candidates = [directory / name for name in names] or [Path(self.filepath)]
         existing = {_absolute_path(item.path) for item in settings.reference_images}
         added = 0
         for path in candidates:
@@ -765,7 +903,7 @@ class UVMAPPING_OT_paste_reference_image(Operator):
         settings = getattr(getattr(context, "scene", None), "uvmapping_settings", None)
         return (
             clipboard_image.is_supported()
-            and not _ACTIVE_OPERATORS
+            and not _ACTIVE_RUNS
             and settings is not None
             and len(settings.reference_images) < MAX_REFERENCE_IMAGES
         )
@@ -848,7 +986,7 @@ class UVMAPPING_OT_remove_reference_image(Operator):
     @classmethod
     def poll(cls, context):
         settings = getattr(getattr(context, "scene", None), "uvmapping_settings", None)
-        return not _ACTIVE_OPERATORS and settings is not None and bool(settings.reference_images)
+        return not _ACTIVE_RUNS and settings is not None and bool(settings.reference_images)
 
     def execute(self, context):
         settings = context.scene.uvmapping_settings
@@ -870,7 +1008,7 @@ class UVMAPPING_OT_analyze_references(_AsyncTextureMixin, Operator):
 
     @classmethod
     def poll(cls, _context):
-        return not _ACTIVE_OPERATORS
+        return not _ACTIVE_RUNS
 
     def execute(self, context):
         settings = context.scene.uvmapping_settings
@@ -882,7 +1020,7 @@ class UVMAPPING_OT_analyze_references(_AsyncTextureMixin, Operator):
                 )
             model, _image_model = _resolved_models(settings)
             api_key = resolve_api_key(context)
-            self._analysis_reference_digest = _reference_digest(paths)
+            payload = {"reference_digest": _reference_digest(paths)}
         except ValueError as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -893,16 +1031,9 @@ class UVMAPPING_OT_analyze_references(_AsyncTextureMixin, Operator):
             "prompt": build_reference_analysis_prompt(len(paths)),
             "image_paths": [str(path) for path in paths],
         }
-        return self._start(context, job, api_key, "참조 이미지 분석 중…")
-
-    def _finish(self, scene, value):
-        settings = scene.uvmapping_settings
-        analysis = parse_reference_analysis(str(value["text"]))
-        settings.texture_analysis_json = json.dumps(
-            analysis.to_dict(), ensure_ascii=False, indent=2
+        return self._start(
+            context, job, api_key, "참조 이미지 분석 중…", payload, _finish_analysis
         )
-        settings.texture_analysis_reference_hash = self._analysis_reference_digest
-        settings.texture_status = "참조 분석 완료"
 
 
 class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
@@ -913,7 +1044,7 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
 
     @classmethod
     def poll(cls, context):
-        return not _ACTIVE_OPERATORS and bool(_selected_meshes(context))
+        return not _ACTIVE_RUNS and bool(texture_targets(context))
 
     def execute(self, context):
         settings = context.scene.uvmapping_settings
@@ -939,6 +1070,11 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
                 raise ValueError(
                     "참조 이미지가 없을 때는 추가 지시 프롬프트를 입력해 주세요."
                 )
+            # 이미지 모델은 참조 원본을 주면 그 캐릭터를 그대로 재생성해 모델
+            # 실루엣을 무시한다. 기본은 분석 결과(텍스트)만 스타일 근거로 보낸다.
+            generation_references = (
+                reference_paths if settings.send_reference_images else ()
+            )
             _analysis_model, model = _resolved_models(settings)
             api_key = resolve_api_key(context)
             projection = _projection_contract(context, objects)
@@ -955,17 +1091,16 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
             except OSError:
                 pass
             user_prompt = settings.texture_user_prompt
-            self._target_keys = tuple((obj.name, obj.session_uid) for obj in objects)
-            self._target_names = tuple(name for name, _session_uid in self._target_keys)
-            self._contact_sheet_path = str(contact_sheet)
-            self._reference_state = tuple(
+            target_keys = tuple((obj.name, obj.session_uid) for obj in objects)
+            reference_state = tuple(
                 {
                     "path": str(path),
                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                 }
                 for path in reference_paths
             )
-            self._source_jobs = tuple(
+            self_reference_count = len(generation_references)
+            source_jobs = tuple(
                 {
                     "object_name": obj.name,
                     **{
@@ -987,12 +1122,17 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
                     (obj, json.loads(obj[TEXTURE_JOB_PROPERTY])) for obj in objects
                 )
             )
-            self._projection = projection
-            self._user_prompt = user_prompt
-            self._model = model
-            self._analysis_payload = (
-                analysis.to_dict() if analysis is not None else None
-            )
+            payload = {
+                "target_keys": target_keys,
+                "target_names": tuple(name for name, _session_uid in target_keys),
+                "contact_sheet_path": str(contact_sheet),
+                "reference_state": reference_state,
+                "source_jobs": source_jobs,
+                "projection": projection,
+                "user_prompt": user_prompt,
+                "model": model,
+                "analysis_payload": analysis.to_dict() if analysis is not None else None,
+            }
         except (ValueError, RuntimeError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1000,55 +1140,116 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
         job = {
             "action": "turnaround",
             "model": model,
-            "prompt": compile_turnaround_prompt(analysis, user_prompt),
-            "image_paths": [str(contact_sheet), *(str(path) for path in reference_paths)],
+            "prompt": compile_turnaround_prompt(
+                analysis, user_prompt, reference_image_count=self_reference_count
+            ),
+            "image_paths": [
+                str(contact_sheet),
+                *(str(path) for path in generation_references),
+            ],
             "output_path": str(output_path),
         }
-        return self._start(context, job, api_key, "한 번의 요청으로 3면도 생성 중…")
+        return self._start(
+            context,
+            job,
+            api_key,
+            "한 번의 요청으로 3면도 생성 중…",
+            payload,
+            _finish_turnaround,
+        )
 
-    def _finish(self, scene, value):
-        value = Path(str(value["output_path"]))
-        settings = scene.uvmapping_settings
-        settings.texture_output_path = str(value)
-        settings.texture_status = "3면도 생성 완료 · Diffuse/Albedo를 적용해 주세요"
-        crop_paths = _crop_turnaround(value)
-        state = {
-            "schema_version": "1.1",
-            "status": "TURNAROUND_READY",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "provider": "openrouter",
-            "model": self._model,
-            "target_objects": self._target_names,
-            "source_jobs": self._source_jobs,
-            "projection": self._projection,
-            "references": self._reference_state,
-            "user_prompt": self._user_prompt,
-            "analysis": self._analysis_payload,
-            "geometry_contact_sheet": self._contact_sheet_path,
-            "geometry_sha256": hashlib.sha256(
-                Path(self._contact_sheet_path).read_bytes()
-            ).hexdigest(),
-            "turnaround_path": str(value),
-            "turnaround_sha256": hashlib.sha256(value.read_bytes()).hexdigest(),
-            "views": {
-                "front": str(crop_paths[0]),
-                "right": str(crop_paths[1]),
-                "back": str(crop_paths[2]),
-            },
-            "view_sha256": {
-                name: hashlib.sha256(path.read_bytes()).hexdigest()
-                for name, path in zip(("front", "right", "back"), crop_paths)
-            },
-        }
-        encoded_state = json.dumps(state, ensure_ascii=False, sort_keys=True)
-        for name, session_uid in self._target_keys:
-            obj = bpy.data.objects.get(name)
-            if obj is not None and obj.session_uid == session_uid:
-                obj[TEXTURE_DESIGN_STATE_PROPERTY] = encoded_state
-        try:
-            bpy.data.images.load(str(value), check_existing=False)
-        except RuntimeError:
-            pass
+
+def _finish_analysis(scene, value: dict, payload: dict) -> None:
+    settings = scene.uvmapping_settings
+    analysis = parse_reference_analysis(str(value["text"]))
+    settings.texture_analysis_json = json.dumps(
+        analysis.to_dict(), ensure_ascii=False, indent=2
+    )
+    settings.texture_analysis_reference_hash = payload["reference_digest"]
+    settings.texture_status = "참조 분석 완료"
+
+
+def _finish_turnaround(scene, value: dict, payload: dict) -> None:
+    value = Path(str(value["output_path"]))
+    settings = scene.uvmapping_settings
+    settings.texture_output_path = str(value)
+    settings.texture_status = "3면도 생성 완료 · Diffuse/Albedo를 적용해 주세요"
+    crop_paths = _crop_turnaround(value)
+    state = {
+        "schema_version": "1.1",
+        "status": "TURNAROUND_READY",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "provider": "openrouter",
+        "model": payload["model"],
+        "target_objects": payload["target_names"],
+        "source_jobs": payload["source_jobs"],
+        "projection": payload["projection"],
+        "references": payload["reference_state"],
+        "user_prompt": payload["user_prompt"],
+        "analysis": payload["analysis_payload"],
+        "geometry_contact_sheet": payload["contact_sheet_path"],
+        "geometry_sha256": hashlib.sha256(
+            Path(payload["contact_sheet_path"]).read_bytes()
+        ).hexdigest(),
+        "turnaround_path": str(value),
+        "turnaround_sha256": hashlib.sha256(value.read_bytes()).hexdigest(),
+        "views": {
+            "front": str(crop_paths[0]),
+            "right": str(crop_paths[1]),
+            "back": str(crop_paths[2]),
+        },
+        "view_sha256": {
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in zip(("front", "right", "back"), crop_paths)
+        },
+    }
+    encoded_state = json.dumps(state, ensure_ascii=False, sort_keys=True)
+    targets = []
+    for name, session_uid in payload["target_keys"]:
+        obj = bpy.data.objects.get(name)
+        if obj is not None and obj.session_uid == session_uid:
+            obj[TEXTURE_DESIGN_STATE_PROPERTY] = encoded_state
+            targets.append(obj)
+    try:
+        bpy.data.images.load(str(value), check_existing=False)
+    except RuntimeError:
+        pass
+    if not settings.auto_apply_diffuse:
+        return
+    if len(targets) != len(payload["target_keys"]):
+        settings.texture_status = (
+            "3면도는 생성됐지만 대상 객체가 바뀌어 자동 적용을 건너뜁니다. "
+            "대상을 다시 지정하고 Diffuse/Albedo를 적용해 주세요."
+        )
+        return
+    try:
+        # 생성 시점과 같은 객체에 바로 이어서 굽는다. 로컬 처리라 추가 비용이 없다.
+        with _bake_context(scene) as context:
+            apply_diffuse(context, tuple(targets))
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        settings.texture_status = f"3면도는 생성됐지만 자동 적용 실패: {exc}"
+
+
+@contextmanager
+def _bake_context(scene):
+    """타이머에서 베이크할 때 3면도를 만든 Scene을 가리키는 context를 만든다."""
+
+    context = bpy.context
+    if getattr(context, "scene", None) is scene:
+        yield context
+        return
+    window = next(
+        (
+            candidate
+            for candidate in getattr(context.window_manager, "windows", ())
+            if candidate.scene is scene
+        ),
+        None,
+    )
+    if window is None:
+        raise RuntimeError("3면도를 만든 Scene을 화면에서 찾지 못했습니다.")
+    with context.temp_override(window=window, scene=scene):
+        yield bpy.context
 
 
 def _diffuse_output_path(state: dict, objects: tuple) -> Path:
@@ -1067,6 +1268,101 @@ def _diffuse_output_path(state: dict, objects: tuple) -> Path:
     return candidate
 
 
+def apply_diffuse(context, objects=None) -> tuple[str, str]:
+    """검증부터 머티리얼 적용까지 수행하고 (상태 문자열, 경고) 쌍을 돌려준다.
+
+    실패는 예외로 올려 호출자가 연산자 보고나 상태 문자열로 처리하게 한다.
+    """
+
+    settings = context.scene.uvmapping_settings
+    objects, state, jobs = _validated_bake_targets(context, objects)
+    resolutions = {
+        tuple(int(value) for value in job.get("target_resolution", ()))
+        for job in jobs
+        if job.get("target_resolution")
+    }
+    if len(resolutions) > 1:
+        raise ValueError("대상 객체들의 TextureJob 해상도가 서로 다릅니다.")
+    target_resolution = next(iter(resolutions), ())
+    if target_resolution and (
+        len(target_resolution) != 2 or target_resolution[0] != target_resolution[1]
+    ):
+        raise ValueError("현재 버전은 정사각형 0-1 Atlas만 지원합니다.")
+    resolution = target_resolution[0] if target_resolution else int(
+        settings.texture_resolution
+    )
+    paddings = {
+        int(job["requested_padding"])
+        for job in jobs
+        if job.get("requested_padding") is not None
+    }
+    if len(paddings) > 1:
+        raise ValueError("대상 객체들의 TextureJob 패딩이 서로 다릅니다.")
+    padding = next(iter(paddings), int(settings.padding_pixels))
+    uv_layer_names = tuple(
+        str(job.get("uv_layer_name") or obj.data.uv_layers.active.name)
+        for obj, job in zip(objects, jobs)
+    )
+    output_path = _diffuse_output_path(state, objects)
+    view_paths = tuple(Path(state["views"][name]) for name in ("front", "right", "back"))
+    settings.texture_status = "3면도에서 Diffuse/Albedo 베이크 중…"
+    result = texture_bake.bake_diffuse(
+        context,
+        objects,
+        view_paths,
+        output_path,
+        resolution,
+        padding,
+        uv_layer_names=uv_layer_names,
+    )
+
+    output_path = Path(str(result.get("output_path", output_path)))
+    bake_stats = {
+        key: result[key]
+        for key in (
+            "filled_pixels",
+            "dilated_pixels",
+            "occluded_samples",
+            "occluded_fallback_pixels",
+            "fallback_pixels",
+            "depth_resolution",
+            "outside_atlas_triangles",
+            "triangle_count",
+        )
+        if key in result
+    }
+    updated = dict(state)
+    updated.update(
+        {
+            "status": "ALBEDO_APPLIED",
+            "albedo_applied_at": datetime.now(timezone.utc).isoformat(),
+            "albedo_path": str(output_path),
+            "albedo_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+            "albedo_resolution": [resolution, resolution],
+            "albedo_padding": padding,
+            "material_name": str(result.get("material_name", "")),
+            "bake_stats": bake_stats,
+        }
+    )
+    encoded_state = json.dumps(updated, ensure_ascii=False, sort_keys=True)
+    for obj in objects:
+        obj[TEXTURE_DESIGN_STATE_PROPERTY] = encoded_state
+    settings.texture_diffuse_path = str(output_path)
+
+    warning = ""
+    outside = int(bake_stats.get("outside_atlas_triangles", 0))
+    if outside:
+        # Mirror·Array의 UV Offset처럼 평가 UV를 0-1 밖으로 미는 설정은
+        # 해당 면을 비워 둔 채 베이크된다.
+        warning = (
+            f"{outside}개 삼각형의 UV가 0-1 밖이라 그 부분이 비었습니다. "
+            "Modifier의 UV Offset을 끄거나 UV를 0-1 안으로 옮긴 뒤 다시 실행해 주세요."
+        )
+    status = warning or "Diffuse/Albedo 베이크 및 머티리얼 적용 완료"
+    settings.texture_status = status
+    return status, warning
+
+
 class UVMAPPING_OT_bake_diffuse(Operator):
     """생성된 3면도를 현재 UV Atlas에 투영하고 머티리얼로 적용한다."""
 
@@ -1081,87 +1377,91 @@ class UVMAPPING_OT_bake_diffuse(Operator):
     def execute(self, context):
         settings = context.scene.uvmapping_settings
         try:
-            objects, state, jobs = _validated_bake_targets(context)
-            resolutions = {
-                tuple(int(value) for value in job.get("target_resolution", ()))
-                for job in jobs
-                if job.get("target_resolution")
-            }
-            if len(resolutions) > 1:
-                raise ValueError("선택 객체들의 TextureJob 해상도가 서로 다릅니다.")
-            target_resolution = next(iter(resolutions), ())
-            if target_resolution and (
-                len(target_resolution) != 2 or target_resolution[0] != target_resolution[1]
-            ):
-                raise ValueError("현재 버전은 정사각형 0-1 Atlas만 지원합니다.")
-            resolution = target_resolution[0] if target_resolution else int(
-                settings.texture_resolution
-            )
-            paddings = {
-                int(job["requested_padding"])
-                for job in jobs
-                if job.get("requested_padding") is not None
-            }
-            if len(paddings) > 1:
-                raise ValueError("선택 객체들의 TextureJob 패딩이 서로 다릅니다.")
-            padding = next(iter(paddings), int(settings.padding_pixels))
-            uv_layer_names = tuple(
-                str(job.get("uv_layer_name") or obj.data.uv_layers.active.name)
-                for obj, job in zip(objects, jobs)
-            )
-            output_path = _diffuse_output_path(state, objects)
-            view_paths = tuple(Path(state["views"][name]) for name in ("front", "right", "back"))
-            settings.texture_status = "3면도에서 Diffuse/Albedo 베이크 중…"
-            result = texture_bake.bake_diffuse(
-                context,
-                objects,
-                view_paths,
-                output_path,
-                resolution,
-                padding,
-                uv_layer_names=uv_layer_names,
-            )
+            status, warning = apply_diffuse(context)
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
             message = f"Diffuse/Albedo 적용 실패: {exc}"
             settings.texture_status = message
             self.report({"ERROR"}, message)
             return {"CANCELLED"}
+        self.report({"WARNING"} if warning else {"INFO"}, status)
+        return {"FINISHED"}
 
-        output_path = Path(str(result.get("output_path", output_path)))
-        updated = dict(state)
-        bake_stats = {
-            key: result[key]
-            for key in (
-                "filled_pixels",
-                "dilated_pixels",
-                "occluded_samples",
-                "fallback_pixels",
-                "depth_resolution",
+
+class UVMAPPING_OT_add_target_objects(Operator):
+    """현재 선택한 Mesh 객체를 텍스처 대상 목록에 등록한다."""
+
+    bl_idname = "uvmapping.add_target_objects"
+    bl_label = "선택 객체 등록"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_selected_meshes(context))
+
+    def execute(self, context):
+        settings = context.scene.uvmapping_settings
+        existing = {item.object.name for item in settings.target_objects if item.object}
+        added = 0
+        for obj in _selected_meshes(context):
+            if obj.name in existing:
+                continue
+            entry = settings.target_objects.add()
+            entry.object = obj
+            existing.add(obj.name)
+            added += 1
+        settings.target_object_index = max(0, len(settings.target_objects) - 1)
+        if not added:
+            self.report({"INFO"}, "이미 등록된 객체입니다.")
+        else:
+            self.report({"INFO"}, f"대상 객체 {added}개를 등록했습니다.")
+        return {"FINISHED"}
+
+
+class UVMAPPING_OT_remove_target_object(Operator):
+    """대상 목록에서 선택한 항목을 제거한다."""
+
+    bl_idname = "uvmapping.remove_target_object"
+    bl_label = "대상 제거"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene.uvmapping_settings.target_objects)
+
+    def execute(self, context):
+        settings = context.scene.uvmapping_settings
+        index = settings.target_object_index
+        if 0 <= index < len(settings.target_objects):
+            settings.target_objects.remove(index)
+            settings.target_object_index = min(
+                index, max(0, len(settings.target_objects) - 1)
             )
-            if key in result
-        }
-        updated.update(
-            {
-                "status": "ALBEDO_APPLIED",
-                "albedo_applied_at": datetime.now(timezone.utc).isoformat(),
-                "albedo_path": str(output_path),
-                "albedo_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
-                "albedo_resolution": [resolution, resolution],
-                "albedo_padding": padding,
-                "material_name": str(result.get("material_name", "")),
-                "bake_stats": bake_stats,
-            }
-        )
-        encoded_state = json.dumps(updated, ensure_ascii=False, sort_keys=True)
-        for obj in objects:
-            obj[TEXTURE_DESIGN_STATE_PROPERTY] = encoded_state
-        settings.texture_diffuse_path = str(output_path)
-        settings.texture_status = "Diffuse/Albedo 베이크 및 머티리얼 적용 완료"
-        self.report({"INFO"}, settings.texture_status)
+        return {"FINISHED"}
+
+
+class UVMAPPING_OT_clear_target_objects(Operator):
+    """대상 목록을 비워 다시 현재 선택을 따르게 한다."""
+
+    bl_idname = "uvmapping.clear_target_objects"
+    bl_label = "대상 비우기"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene.uvmapping_settings.target_objects)
+
+    def execute(self, context):
+        settings = context.scene.uvmapping_settings
+        settings.target_objects.clear()
+        settings.target_object_index = 0
+        self.report({"INFO"}, "대상 목록을 비웠습니다. 현재 선택을 사용합니다.")
         return {"FINISHED"}
 
 
 classes = (
+    UVMAPPING_OT_add_target_objects,
+    UVMAPPING_OT_remove_target_object,
+    UVMAPPING_OT_clear_target_objects,
     UVMAPPING_OT_add_reference_images,
     UVMAPPING_OT_paste_reference_image,
     UVMAPPING_OT_remove_reference_image,

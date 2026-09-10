@@ -11,6 +11,10 @@ if __package__ in {None, ""}:
 
 from uvmapping.texture_bake import (
     BakeTriangle,
+    build_raster_source,
+    extend_foreground,
+    _generated_topology,
+    _outside_atlas,
     RasterSource,
     _linear_to_srgb_byte,
     _srgb_to_linear,
@@ -26,11 +30,10 @@ from uvmapping.texture_bake import (
 
 
 def _solid_source(color: tuple[float, float, float, float]) -> RasterSource:
-    pixels = color * 16
-    return RasterSource(
+    return build_raster_source(
         width=4,
         height=4,
-        pixels=pixels,
+        pixels=list(color * 16),
         subject_bbox=(0, 0, 4, 4),
         background=(1.0, 1.0, 1.0, 1.0),
         background_threshold=0.05,
@@ -177,11 +180,17 @@ def test_rasterizer_blocks_rear_surface_with_screen_depth() -> None:
         "RIGHT": _solid_source((0.05, 0.8, 0.1, 1.0)),
         "BACK": _solid_source((0.05, 0.1, 0.8, 1.0)),
     }
-    _rgba, metrics = rasterize_atlas(
+    rgba, metrics = rasterize_atlas(
         (front, rear), sources, 32, 0, (0.0, 0.0, 0.0), 1.0
     )
     assert metrics["occluded_samples"] > 0
-    assert metrics["fallback_pixels"] > 0
+    # 가려진 뒷면은 전체 평균색이 아니라 같은 시점의 같은 좌표 색을 다시 쓴다.
+    assert metrics["occluded_fallback_pixels"] > 0
+    assert metrics["fallback_pixels"] == 0
+    rear_pixel = (8 * 32 + 24) * 4
+    assert rgba[rear_pixel] > rgba[rear_pixel + 1]
+    assert rgba[rear_pixel] > rgba[rear_pixel + 2]
+    assert rgba[rear_pixel + 3] == 255
 
 
 def test_png_encoder_writes_square_srgb_rgba_png() -> None:
@@ -211,6 +220,108 @@ def test_8192_resolution_is_rejected_with_4096_guidance() -> None:
         assert "4096" in str(error)
     else:
         raise AssertionError("8192px CPU Atlas 요청이 거부되어야 합니다.")
+
+
+class _Loop:
+    def __init__(self, vertex_index: int) -> None:
+        self.vertex_index = vertex_index
+
+
+class _Polygon:
+    def __init__(self, loop_start: int, loop_total: int) -> None:
+        self.loop_start = loop_start
+        self.loop_total = loop_total
+
+
+class _Mesh:
+    def __init__(self, vertices: int, loops: list[int], polygons: list[tuple[int, int]]) -> None:
+        self.vertices = [None] * vertices
+        self.loops = [_Loop(index) for index in loops]
+        self.polygons = [_Polygon(start, total) for start, total in polygons]
+
+
+def _quad_mesh() -> _Mesh:
+    return _Mesh(4, [0, 1, 2, 3], [(0, 4)])
+
+
+def test_generated_topology_detects_modifier_output() -> None:
+    original = _quad_mesh()
+    assert _generated_topology(original, _quad_mesh()) is False
+    subdivided = _Mesh(9, list(range(16)), [(0, 4), (4, 4), (8, 4), (12, 4)])
+    assert _generated_topology(original, subdivided) is True
+
+
+def _uv_triangle(uvs) -> BakeTriangle:
+    return BakeTriangle(
+        positions=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+        uvs=uvs,
+        normal=(0.0, -1.0, 0.0),
+    )
+
+
+def test_outside_atlas_flags_only_real_offsets() -> None:
+    inside = _uv_triangle(((0.1, 0.1), (0.9, 0.1), (0.1, 0.9)))
+    mirrored = _uv_triangle(((1.1, 0.1), (1.9, 0.1), (1.1, 0.9)))
+    degenerate = _uv_triangle(((1.0, 0.0), (1.0, 1.0), (1.0, 0.5)))
+    partial = _uv_triangle(((0.9, 0.1), (1.4, 0.1), (0.9, 0.9)))
+    assert _outside_atlas(inside) is False
+    assert _outside_atlas(mirrored) is True
+    assert _outside_atlas(degenerate) is False
+    assert _outside_atlas(partial) is False
+
+
+def test_extend_foreground_fills_background_with_nearest_subject_color() -> None:
+    width = height = 5
+    pixels = []
+    for y in range(height):
+        for x in range(width):
+            if x == 2 and y == 2:
+                pixels.extend((0.9, 0.2, 0.1, 1.0))
+            else:
+                pixels.extend((1.0, 1.0, 1.0, 1.0))
+
+    def is_foreground(color):
+        return color[0] < 0.95
+
+    filled, distance = extend_foreground(pixels, width, height, is_foreground)
+    center = (2 * width + 2) * 4
+    corner = (0 * width + 0) * 4
+    assert distance[2 * width + 2] == 0.0
+    assert abs(distance[0] - (8 ** 0.5)) < 1.0e-5
+    # 배경이던 모서리도 유일한 전경 색을 그대로 받는다.
+    assert filled[corner : corner + 4] == filled[center : center + 4]
+
+
+def test_aligned_sampler_extends_near_edges_and_gives_up_far_from_subject() -> None:
+    """생성 실루엣이 모델보다 좁을 때의 두 경우를 나눈다.
+
+    피사체 경계 상자 안이라도 실제로 그려진 형상 밖일 수 있다. 가까우면 최근접
+    전경 색으로 이어 붙이고, 멀면 다른 시점이 채우도록 표본을 포기해야 한다.
+    """
+
+    from uvmapping.texture_bake import _aligned_source_sample
+
+    width = height = 64
+    pixels = []
+    for y in range(height):
+        for x in range(width):
+            drawn = x < 6 or x >= width - 6
+            pixels.extend((0.8, 0.2, 0.1, 1.0) if drawn else (1.0, 1.0, 1.0, 1.0))
+    source = build_raster_source(
+        width=width,
+        height=height,
+        pixels=pixels,
+        subject_bbox=(0, 0, width, height),
+        background=(1.0, 1.0, 1.0, 1.0),
+        background_threshold=0.2,
+        fallback_color=(0.8, 0.2, 0.1, 1.0),
+    )
+    bbox = (0.0, 0.0, 1.0, 1.0)
+    # 그려진 형상 바로 바깥: 최근접 전경 색을 이어 붙인다.
+    near_edge = _aligned_source_sample(source, (6.5 / width, 0.5, 0.0), bbox)
+    assert near_edge is not None and near_edge[0] > near_edge[1]
+    # 형상에서 한참 떨어진 가운데: 다른 시점에 양보한다.
+    assert _aligned_source_sample(source, (0.5, 0.5, 0.0), bbox) is None
 
 
 if __name__ == "__main__":

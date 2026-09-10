@@ -8,3 +8,4 @@ build/
 .blender/
 .dev-profile/
 
+.omc/

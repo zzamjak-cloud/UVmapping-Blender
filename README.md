@@ -11,15 +11,15 @@
 ## 설치
 
 1. Blender에서 `Edit > Preferences > Get Extensions`를 엽니다.
-2. 오른쪽 위 메뉴에서 `Repositories > Add Remote Repository`를 선택합니다.
-3. 저장소 URL에 다음 주소를 입력합니다.
+3. 오른쪽 위 메뉴에서 `Repositories > Add Remote Repository`를 선택합니다.
+4. 저장소 URL에 다음 주소를 입력합니다.
 
    ```text
    https://zzamjak-cloud.github.io/UVmapping-Blender/index.json
    ```
 
-4. `Refresh Remote`를 실행한 뒤 `UV Mapping Blender`를 검색합니다.
-5. `Install`을 눌러 설치하고 Extension을 활성화합니다.
+5. `Refresh Remote`를 실행한 뒤 `UV Mapping Blender`를 검색합니다.
+6. `Install`을 눌러 설치하고 Extension을 활성화합니다.
 
 ### 업데이트 확인
 
@@ -38,18 +38,22 @@ Blender의 Extension 저장소를 새로 고치면 사용 가능한 업데이트
 
 ### AI 손맵 텍스처 디자인
 
-1. Object Mode에서 텍스처를 만들 Mesh 객체를 모두 선택하고 `3D Viewport > Sidebar(N) > UV Mapping`에서 `AI 손맵 텍스처` 패널을 엽니다.
-2. Pinterest 등에서 저장한 JPG, PNG 또는 WebP 참조 이미지를 최대 5장 추가합니다. macOS와 Windows에서는 브라우저의 `이미지 복사` 후 `클립보드` 버튼으로 바로 붙여넣을 수도 있습니다.
-3. `Edit > Preferences > Add-ons > UV Mapping Blender`에서 [openrouter.ai/keys](https://openrouter.ai/keys)에서 발급한 **OpenRouter API 키 하나**를 입력합니다. 분석과 이미지 생성 모두 이 키 하나로 처리되며 Provider별 키는 더 이상 필요 없습니다. 키는 프로젝트나 `.blend`가 아닌 Blender 개인 환경설정에 저장되고 입력창에서는 가려지지만, OS Keychain 암호화 저장소는 아닙니다. 공유 PC에서는 환경 변수 `OPENROUTER_API_KEY` 사용을 권장합니다.
-4. 패널의 `이미지 생성 모델`에서 `Nano Banana Pro`(`google/gemini-3-pro-image`) 또는 `GPT Image (덕테이프)`(`openai/gpt-5.4-image-2`) 버튼을 선택하고 `참조 이미지 분석`을 누릅니다. 프리셋을 바꾸면 분석 모델과 3면도 생성 모델이 함께 전환되며, `고급 설정`에서 [openrouter.ai/models](https://openrouter.ai/models)의 다른 모델 식별자를 직접 넣을 수도 있습니다.
-5. 참조 이미지에 없는 요구만 `추가 지시`에 한 문장으로 입력합니다. Blender의 한글 조합이 불안정하면 `한글 프롬프트 입력` 버튼을 눌러 OS 입력 창에서 작성합니다. 완료하면 한 줄로 정리되어 반영되고, 취소하면 기존 내용이 유지됩니다. 참조 이미지 없이 프롬프트만으로도 생성할 수 있습니다.
-6. `출력 텍스처`에서 베이크할 `텍스처 크기`와 `UV 패딩`을 정합니다.
-7. `단일 3면도 생성`을 누르면 선택 모델을 FRONT, RIGHT, BACK 방향으로 로컬 캡처한 뒤 OpenRouter를 한 번만 호출합니다. 어떤 모델을 골라도 21:9 종횡비, 2K 해상도, 결과 한 장으로 고정됩니다.
-8. 결과는 세 방향이 같은 폭으로 들어간 이미지 한 장과 로컬에서 분리한 세 이미지로 저장됩니다. 저장된 `.blend`는 옆의 `textures` 폴더, 저장하지 않은 파일은 임시 폴더를 사용합니다.
-9. `Diffuse/Albedo 적용`을 누르면 FRONT, RIGHT, BACK과 좌우 반전한 측면을 모델 표면에 깊이 인식 투영하고 현재 UV Atlas로 베이크합니다. 이 단계는 로컬 처리이므로 AI를 다시 호출하거나 추가 비용을 사용하지 않습니다.
-10. 완성된 PNG와 sRGB Image Texture가 연결된 Principled BSDF 머티리얼이 선택 Mesh에 적용됩니다. 원본 머티리얼 슬롯은 삭제하지 않습니다.
+1. 텍스처를 만들 Mesh 객체를 선택하고 `3D Viewport > Sidebar(N) > UV Mapping`에서 `AI 손맵 텍스처` 패널을 엽니다.
+2. `대상 객체`에서 `선택 객체 등록`을 누르면 그 객체들만 대상이 됩니다. 씬에 다른 객체가 많을 때 선택이 바뀌어도 대상이 흔들리지 않습니다. 목록이 비어 있으면 현재 선택을 그대로 사용합니다. Edit·Paint 모드에서 실행하면 Object Mode로 자동 전환합니다.
+3. Pinterest 등에서 저장한 JPG, PNG 또는 WebP 참조 이미지를 최대 5장 추가합니다. macOS와 Windows에서는 브라우저의 `이미지 복사` 후 `클립보드` 버튼으로 바로 붙여넣을 수도 있습니다.
+4. `Edit > Preferences > Add-ons > UV Mapping Blender`에서 [openrouter.ai/keys](https://openrouter.ai/keys)에서 발급한 **OpenRouter API 키 하나**를 입력합니다. 분석과 이미지 생성 모두 이 키 하나로 처리되며 Provider별 키는 더 이상 필요 없습니다. 키는 프로젝트나 `.blend`가 아닌 Blender 개인 환경설정에 저장되고 입력창에서는 가려지지만, OS Keychain 암호화 저장소는 아닙니다. 공유 PC에서는 환경 변수 `OPENROUTER_API_KEY` 사용을 권장합니다.
+5. 참조 이미지는 기본적으로 **분석 단계에서만** 사용합니다. 3면도 생성 호출에는 모델 형상 contact sheet 한 장만 보내고 스타일은 분석 결과로 전달하므로, 이미지 모델이 참조 캐릭터의 형상을 그대로 복제하는 일을 막습니다. 스타일 재현을 더 밀어붙이고 싶으면 `생성에도 참조 이미지 전달`을 켤 수 있지만, 결과가 모델 실루엣 대신 참조 형상을 따라갈 수 있습니다.
+6. 패널의 `이미지 생성 모델`에서 `Nano Banana Pro`(`google/gemini-3-pro-image`) 또는 `GPT Image (덕테이프)`(`openai/gpt-5.4-image-2`) 버튼을 선택하고 `참조 이미지 분석`을 누릅니다. 프리셋을 바꾸면 분석 모델과 3면도 생성 모델이 함께 전환되며, `고급 설정`에서 [openrouter.ai/models](https://openrouter.ai/models)의 다른 모델 식별자를 직접 넣을 수도 있습니다.
+7. 참조 이미지에 없는 요구만 `추가 지시`에 한 문장으로 입력합니다. Blender의 한글 조합이 불안정하면 `한글 프롬프트 입력` 버튼을 눌러 OS 입력 창에서 작성합니다. 완료하면 한 줄로 정리되어 반영되고, 취소하면 기존 내용이 유지됩니다. 참조 이미지 없이 프롬프트만으로도 생성할 수 있습니다.
+8. `출력 텍스처`에서 베이크할 `텍스처 크기`와 `UV 패딩`을 정합니다. `생성 후 자동 적용`을 켜 두면(기본값) 3면도 생성이 끝나는 즉시 아래 10~11단계가 자동으로 이어집니다.
+9. `단일 3면도 생성`을 누르면 대상 모델을 FRONT, RIGHT, BACK 방향으로 로컬 캡처해 흰 배경 위 회색 형상 가이드를 만든 뒤 OpenRouter를 한 번만 호출합니다. AI는 이 가이드의 실루엣, 비율, 자세를 그대로 두고 색만 입히도록 지시받습니다. 어떤 모델을 골라도 21:9 종횡비, 2K 해상도, 결과 한 장으로 고정됩니다.
+10. 결과는 세 방향이 같은 폭으로 들어간 이미지 한 장과 로컬에서 분리한 세 이미지로 저장됩니다. 저장된 `.blend`는 옆의 `textures` 폴더, 저장하지 않은 파일은 임시 폴더를 사용합니다.
+11. `Diffuse/Albedo 적용`을 누르면 FRONT, RIGHT, BACK과 좌우 반전한 측면을 모델 표면에 깊이 인식 투영하고 현재 UV Atlas로 베이크합니다. 이 단계는 로컬 처리이므로 AI를 다시 호출하거나 추가 비용을 사용하지 않습니다.
+12. 완성된 PNG와 sRGB Image Texture가 연결된 Principled BSDF 머티리얼이 선택 Mesh에 적용됩니다. 원본 머티리얼 슬롯은 삭제하지 않습니다.
 
-현재 CPU 베이크는 최대 4096×4096을 지원하며 기본 2048×2048을 권장합니다. 3면도에 직접 보이지 않는 상·하면은 인접 시점의 색을 확장해 채우므로, 의미 있는 상면 그림이 꼭 필요한 에셋은 추후 상면 참조 또는 별도 보정을 권장합니다. 3면도 생성 시점과 베이크 시점에 각각 현재 UV로 계약을 다시 계산해 비교하므로, 모델 Transform, 메시 또는 UV가 그 사이에 바뀌면 잘못 투영하지 않고 재생성을 안내합니다.
+Subdivision, Mirror, Bevel처럼 topology를 바꾸는 Modifier가 있어도 평가 결과를 그대로 투영합니다. 다만 Mirror나 Array의 UV Offset처럼 UV를 0-1 밖으로 보내는 설정은 해당 면이 비어 경고가 표시됩니다.
+
+현재 CPU 베이크는 최대 4096×4096을 지원하며 기본값은 1024×1024입니다. `텍스처 크기`와 `UV 패딩`은 `.blend`에 저장되므로, 이전에 저장한 파일은 그때 값이 그대로 유지됩니다. 3면도에 직접 보이지 않는 상·하면은 인접 시점의 색을 확장해 채우므로, 의미 있는 상면 그림이 꼭 필요한 에셋은 추후 상면 참조 또는 별도 보정을 권장합니다. 3면도 생성 시점과 베이크 시점에 각각 현재 UV로 계약을 다시 계산해 비교하므로, 모델 Transform, 메시 또는 UV가 그 사이에 바뀌면 잘못 투영하지 않고 재생성을 안내합니다.
 
 ## 릴리스 운영
 

@@ -1,10 +1,12 @@
 """AI 텍스처링 설정 속성."""
 
+import bpy
 from bpy.props import (
     BoolProperty,
     CollectionProperty,
     EnumProperty,
     IntProperty,
+    PointerProperty,
     StringProperty,
 )
 from bpy.types import AddonPreferences, PropertyGroup
@@ -93,6 +95,23 @@ class UVMAPPING_PG_reference_image(PropertyGroup):
     )
 
 
+def _is_texturable_mesh(_self, obj) -> bool:
+    """대상 목록에는 폴리곤이 있는 Mesh만 등록할 수 있다."""
+
+    return obj.type == "MESH" and obj.data is not None and len(obj.data.polygons) > 0
+
+
+class UVMAPPING_PG_target_object(PropertyGroup):
+    """텍스처를 구울 대상으로 명시 등록한 Mesh 객체."""
+
+    object: PointerProperty(
+        name="대상 객체",
+        description="이 3면도와 텍스처의 대상이 될 Mesh 객체입니다",
+        type=bpy.types.Object,
+        poll=_is_texturable_mesh,
+    )
+
+
 class UVMAPPING_PG_settings(PropertyGroup):
     """씬에 저장되는 AI 텍스처링 설정."""
 
@@ -107,7 +126,7 @@ class UVMAPPING_PG_settings(PropertyGroup):
             ("4096", "4096 px", "4K 텍스처를 대상으로 합니다"),
             ("8192", "8192 px", "8K 텍스처를 대상으로 합니다"),
         ),
-        default="2048",
+        default="1024",
     )
     padding_pixels: IntProperty(
         name="UV 패딩",
@@ -116,6 +135,29 @@ class UVMAPPING_PG_settings(PropertyGroup):
         min=0,
         max=256,
         subtype="PIXEL",
+    )
+    target_objects: CollectionProperty(
+        name="대상 객체",
+        type=UVMAPPING_PG_target_object,
+    )
+    target_object_index: IntProperty(
+        name="선택 대상 객체",
+        default=0,
+        min=0,
+    )
+    send_reference_images: BoolProperty(
+        name="생성에도 참조 이미지 전달",
+        description=(
+            "3면도 생성 호출에 참조 이미지 원본을 함께 보냅니다. "
+            "이미지 모델이 참조의 캐릭터 형상을 그대로 복제해 모델 실루엣을 "
+            "무시할 수 있으므로 기본값은 꺼짐이며, 스타일은 분석 결과로 전달됩니다"
+        ),
+        default=False,
+    )
+    auto_apply_diffuse: BoolProperty(
+        name="생성 후 자동 적용",
+        description="3면도 생성이 끝나면 Diffuse/Albedo 베이크와 머티리얼 적용까지 이어서 실행합니다",
+        default=True,
     )
     reference_images: CollectionProperty(
         name="참조 이미지",
@@ -197,6 +239,7 @@ __all__ = (
     "UVMAPPING_AP_preferences",
     "UVMAPPING_PG_reference_image",
     "UVMAPPING_PG_settings",
+    "UVMAPPING_PG_target_object",
     "addon_module_id",
     "get_addon_preferences",
 )

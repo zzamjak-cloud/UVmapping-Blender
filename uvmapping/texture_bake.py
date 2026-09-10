@@ -31,6 +31,8 @@ except ModuleNotFoundError:  # pragma: no cover - Blender 테스트에서 별도
 VIEW_NAMES = ("FRONT", "RIGHT", "BACK", "LEFT")
 SOURCE_VIEW_NAMES = ("FRONT", "RIGHT", "BACK")
 MAX_ATLAS_RESOLUTION = 4096
+# 생성 실루엣 밖 표본을 최근접 전경 색으로 이어 붙일 최대 거리(피사체 크기 대비).
+FOREGROUND_EXTEND_RATIO = 0.06
 _IMAGE_MARKER = "uvmapping_ai_albedo"
 _MATERIAL_MARKER = "uvmapping_ai_albedo"
 
@@ -50,7 +52,13 @@ class BakeTriangle:
 
 @dataclass(frozen=True)
 class RasterSource:
-    """Blender에서 선형 색 공간으로 읽은 생성 이미지."""
+    """Blender에서 선형 색 공간으로 읽은 생성 이미지.
+
+    ``filled``은 배경 픽셀을 가장 가까운 전경 색으로 채운 버퍼이고,
+    ``foreground_distance``는 각 픽셀에서 전경까지의 픽셀 거리다. 생성 그림의
+    실루엣이 모델보다 좁을 때 이 두 배열로 경계 밖 표본을 공간적으로 연속되게
+    복구한다.
+    """
 
     width: int
     height: int
@@ -59,6 +67,8 @@ class RasterSource:
     background: tuple[float, float, float, float]
     background_threshold: float
     fallback_color: tuple[float, float, float, float]
+    filled: Sequence[float]
+    foreground_distance: Sequence[float]
 
 
 @dataclass(frozen=True)
@@ -548,10 +558,148 @@ def _visible_in_depth(
 
 
 def _is_foreground(source: RasterSource, color: tuple[float, float, float, float]) -> bool:
-    if source.background[3] < 0.25:
-        return color[3] > 0.12
-    difference = max(abs(color[channel] - source.background[channel]) for channel in range(3))
-    return color[3] > 0.05 and difference > source.background_threshold * 0.55
+    return _foreground_test(source.background, source.background_threshold)(color)
+
+
+def _foreground_test(background, background_threshold: float):
+    """배경 색·투명도 기준으로 전경 여부를 판정하는 함수를 만든다."""
+
+    if background[3] < 0.25:
+        def transparent_test(color) -> bool:
+            return color[3] > 0.12
+
+        return transparent_test
+
+    limit = background_threshold * 0.55
+
+    def opaque_test(color) -> bool:
+        difference = max(abs(color[channel] - background[channel]) for channel in range(3))
+        return color[3] > 0.05 and difference > limit
+
+    return opaque_test
+
+
+def _nearest_foreground(
+    pixels: Sequence[float], width: int, height: int, is_foreground
+) -> tuple[array, array, float]:
+    """chamfer 스캔 두 번으로 픽셀마다 최근접 전경 인덱스와 제곱 거리를 구한다."""
+
+    size = width * height
+    nearest = array("i", [-1]) * size
+    foreground_found = False
+    for index in range(size):
+        offset = index * 4
+        color = (
+            pixels[offset],
+            pixels[offset + 1],
+            pixels[offset + 2],
+            pixels[offset + 3],
+        )
+        if is_foreground(color):
+            nearest[index] = index
+            foreground_found = True
+    infinity = float(width * width + height * height + 1)
+    if not foreground_found:
+        return nearest, array("f", [infinity]) * size, infinity
+
+    squared = array("f", [0.0 if nearest[index] >= 0 else infinity for index in range(size)])
+
+    def sweep(rows, columns, offsets) -> None:
+        for y in rows:
+            row = y * width
+            for x in columns:
+                index = row + x
+                best_squared = squared[index]
+                if best_squared == 0.0:
+                    continue
+                best_nearest = nearest[index]
+                for offset_x, offset_y in offsets:
+                    neighbor_x = x + offset_x
+                    neighbor_y = y + offset_y
+                    if not (0 <= neighbor_x < width and 0 <= neighbor_y < height):
+                        continue
+                    candidate = nearest[neighbor_y * width + neighbor_x]
+                    if candidate < 0:
+                        continue
+                    source_x = candidate % width
+                    source_y = candidate // width
+                    delta_x = source_x - x
+                    delta_y = source_y - y
+                    candidate_squared = float(delta_x * delta_x + delta_y * delta_y)
+                    if candidate_squared < best_squared:
+                        best_squared = candidate_squared
+                        best_nearest = candidate
+                squared[index] = best_squared
+                nearest[index] = best_nearest
+
+    sweep(range(height), range(width), ((-1, 0), (0, -1), (-1, -1), (1, -1)))
+    sweep(
+        range(height - 1, -1, -1),
+        range(width - 1, -1, -1),
+        ((1, 0), (0, 1), (1, 1), (-1, 1)),
+    )
+    return nearest, squared, infinity
+
+
+def extend_foreground(
+    pixels: Sequence[float], width: int, height: int, is_foreground
+) -> tuple[array, array]:
+    """배경을 가장 가까운 전경 색으로 채우고 전경까지의 거리를 함께 돌려준다.
+
+    표본이 실루엣 밖으로 나갔을 때 중심 쪽으로 몇 단계씩 끌어당기면 이웃 픽셀이
+    서로 다른 위치를 읽어 빗살 무늬가 생긴다. 그래서 미리 연속적인 확장 버퍼를
+    만들어 둔다.
+    """
+
+    size = width * height
+    nearest, squared, infinity = _nearest_foreground(pixels, width, height, is_foreground)
+    distance = array("f", [0.0]) * size
+    if all(index < 0 for index in nearest):
+        return array("f", pixels[: size * 4]), distance
+
+    filled = array("f", [0.0]) * (size * 4)
+    for index in range(size):
+        source_index = nearest[index]
+        if source_index < 0:
+            source_index = index
+        source_offset = source_index * 4
+        offset = index * 4
+        filled[offset] = pixels[source_offset]
+        filled[offset + 1] = pixels[source_offset + 1]
+        filled[offset + 2] = pixels[source_offset + 2]
+        filled[offset + 3] = pixels[source_offset + 3]
+        distance[index] = math.sqrt(squared[index]) if squared[index] < infinity else float(
+            max(width, height)
+        )
+    return filled, distance
+
+
+def build_raster_source(
+    *,
+    width: int,
+    height: int,
+    pixels: Sequence[float],
+    subject_bbox: BBox,
+    background: tuple[float, float, float, float],
+    background_threshold: float,
+    fallback_color: tuple[float, float, float, float],
+) -> RasterSource:
+    """생성 이미지 한 장에서 전경 확장 버퍼까지 갖춘 표본 원본을 만든다."""
+
+    filled, distance = extend_foreground(
+        pixels, width, height, _foreground_test(background, background_threshold)
+    )
+    return RasterSource(
+        width=width,
+        height=height,
+        pixels=pixels,
+        subject_bbox=subject_bbox,
+        background=background,
+        background_threshold=background_threshold,
+        fallback_color=fallback_color,
+        filled=filled,
+        foreground_distance=distance,
+    )
 
 
 def _aligned_source_sample(
@@ -575,15 +723,15 @@ def _aligned_source_sample(
     left, bottom, right, top = source.subject_bbox
     target_x = left + normalized_u * max(0, right - left - 1)
     target_y = bottom + normalized_v * max(0, top - bottom - 1)
-    center_x = (left + right - 1) * 0.5
-    center_y = (bottom + top - 1) * 0.5
-    for amount in (0.0, 0.035, 0.075, 0.13):
-        x = target_x * (1.0 - amount) + center_x * amount
-        y = target_y * (1.0 - amount) + center_y * amount
-        color = bilinear_sample(source.pixels, source.width, source.height, x, y)
-        if _is_foreground(source, color):
-            return color
-    return None
+    pixel_x = min(source.width - 1, max(0, int(round(target_x))))
+    pixel_y = min(source.height - 1, max(0, int(round(target_y))))
+    distance = source.foreground_distance[pixel_y * source.width + pixel_x]
+    # 생성 실루엣이 모델보다 좁으면 표본이 배경으로 나간다. 가까우면 최근접
+    # 전경 색으로 이어 붙이고, 멀면 다른 시점에 양보한다.
+    limit = max(4.0, FOREGROUND_EXTEND_RATIO * max(right - left, top - bottom))
+    if distance > limit:
+        return None
+    return bilinear_sample(source.filled, source.width, source.height, target_x, target_y)
 
 
 def _normal_view_weights(normal: Vec3) -> dict[str, float]:
@@ -629,6 +777,7 @@ def rasterize_atlas(
     occupied = bytearray(resolution * resolution)
     filled_pixels = 0
     occluded_samples = 0
+    occluded_fallback_pixels = 0
     fallback_pixels = 0
 
     for triangle in triangles:
@@ -655,6 +804,7 @@ def rasterize_atlas(
                     for axis in range(3)
                 )
                 colors: list[tuple[tuple[float, float, float, float], float]] = []
+                occluded_views: list[tuple] = []
                 for view, view_weight in view_weights.items():
                     if view_weight <= 1.0e-8:
                         continue
@@ -662,14 +812,17 @@ def rasterize_atlas(
                     visible = _visible_in_depth(
                         projected, depth_buffers[view], depth_resolution, depth_tolerance
                     )
-                    if not visible and not vertical:
-                        occluded_samples += 1
-                        continue
                     source_name = "RIGHT" if view == "LEFT" else view
                     source = sources[source_name]
                     vertical_fallback = 0
                     if vertical:
                         vertical_fallback = 1 if triangle.normal[2] > 0.0 else -1
+                    if not visible and not vertical:
+                        occluded_samples += 1
+                        occluded_views.append(
+                            (source, projected, view, view_weight, vertical_fallback)
+                        )
+                        continue
                     color = _aligned_source_sample(
                         source,
                         projected,
@@ -679,6 +832,22 @@ def rasterize_atlas(
                     )
                     if color is not None:
                         colors.append((color, view_weight))
+                if not colors and occluded_views:
+                    # 다리 안쪽처럼 모든 시점에서 가려진 면은 전체 평균색을 칠하면
+                    # 텍스처가 빠진 것처럼 보인다. 가림을 무시하고 같은 시점의 같은
+                    # 좌표를 다시 읽어 주변과 이어지는 색을 쓴다.
+                    for source, projected, view, view_weight, vertical_fallback in occluded_views:
+                        color = _aligned_source_sample(
+                            source,
+                            projected,
+                            projected_bboxes[view],
+                            mirror_x=view == "LEFT",
+                            vertical_fallback=vertical_fallback,
+                        )
+                        if color is not None:
+                            colors.append((color, view_weight))
+                    if colors:
+                        occluded_fallback_pixels += 1
                 if not colors:
                     fallback_pixels += 1
                     available = [
@@ -707,6 +876,7 @@ def rasterize_atlas(
         "filled_pixels": filled_pixels,
         "dilated_pixels": dilated_pixels,
         "occluded_samples": occluded_samples,
+        "occluded_fallback_pixels": occluded_fallback_pixels,
         "fallback_pixels": fallback_pixels,
         "depth_resolution": depth_resolution,
     }
@@ -789,17 +959,19 @@ def _resolve_uv_name(obj, uv_layer_names, object_index: int) -> str:
     return str(name)
 
 
-def _topology_matches(original, evaluated) -> bool:
+def _generated_topology(original, evaluated) -> bool:
+    """Modifier가 polygon/loop 구성을 바꿨는지 판단한다."""
+
     if (
         len(original.vertices) != len(evaluated.vertices)
         or len(original.loops) != len(evaluated.loops)
         or len(original.polygons) != len(evaluated.polygons)
     ):
-        return False
+        return True
     if any(left.vertex_index != right.vertex_index for left, right in zip(original.loops, evaluated.loops)):
-        return False
-    return all(
-        left.loop_start == right.loop_start and left.loop_total == right.loop_total
+        return True
+    return any(
+        left.loop_start != right.loop_start or left.loop_total != right.loop_total
         for left, right in zip(original.polygons, evaluated.polygons)
     )
 
@@ -840,15 +1012,20 @@ def _collect_blender_triangles(context, objects: Sequence, uv_layer_names) -> tu
         )
         evaluated_mesh = evaluated_object.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
         try:
-            if not _topology_matches(obj.data, evaluated_mesh):
-                raise ValueError(
-                    f"{obj.name}: Modifier 평가 결과가 원본 polygon/loop topology와 다릅니다. "
-                    "Modifier를 적용하거나 비활성화한 뒤 다시 실행해 주세요."
-                )
+            # Subsurf, Mirror, Bevel처럼 topology를 바꾸는 Modifier도 평가 Mesh의
+            # UV를 그대로 투영하면 되므로 원본과의 topology 일치를 요구하지 않는다.
+            # 생성과 베이크 사이의 Modifier 변경은 projection 계약의
+            # evaluated_geometry_sha256이 잡아낸다.
+            generated = _generated_topology(obj.data, evaluated_mesh)
             uv_name = _resolve_uv_name(obj, uv_layer_names, object_index)
             uv_layer = evaluated_mesh.uv_layers.get(uv_name)
             if uv_layer is None:
-                raise ValueError(f"{obj.name}: 평가 Mesh에 '{uv_name}' UV 레이어가 없습니다.")
+                raise ValueError(
+                    f"{obj.name}: 평가 Mesh에 '{uv_name}' UV 레이어가 없습니다. "
+                    "UV를 지우는 Modifier를 비활성화하거나 적용한 뒤 다시 실행해 주세요."
+                    if generated
+                    else f"{obj.name}: 평가 Mesh에 '{uv_name}' UV 레이어가 없습니다."
+                )
             evaluated_mesh.calc_loop_triangles()
             matrix = evaluated_object.matrix_world
             normal_matrix = matrix.to_3x3().inverted_safe().transposed()
@@ -905,7 +1082,7 @@ def _load_raster_sources(paths: Mapping[str, Path]) -> tuple[dict[str, RasterSou
             if bbox == (0, 0, width, height):
                 # 피사체가 프레임을 가득 채우면 border와의 차이를 요구하지 않는다.
                 threshold = -1.0
-            sources[name] = RasterSource(
+            sources[name] = build_raster_source(
                 width=width,
                 height=height,
                 pixels=pixels,
@@ -1011,6 +1188,21 @@ def _rollback_material_application(
             obj.active_material_index = min(active_index, max(0, len(obj.material_slots) - 1))
 
 
+def _outside_atlas(triangle: BakeTriangle) -> bool:
+    """면적이 있는 삼각형이 0-1 Atlas 바깥에 통째로 놓였는지 확인한다."""
+
+    (u0, v0), (u1, v1), (u2, v2) = triangle.uvs
+    if abs((u1 - u0) * (v2 - v0) - (u2 - u0) * (v1 - v0)) <= 1.0e-12:
+        # 퇴화 삼각형은 어차피 래스터화되지 않으므로 경고 대상이 아니다.
+        return False
+    return (
+        max(u0, u1, u2) <= 0.0
+        or min(u0, u1, u2) >= 1.0
+        or max(v0, v1, v2) <= 0.0
+        or min(v0, v1, v2) >= 1.0
+    )
+
+
 def bake_diffuse(
     context,
     objects: Sequence,
@@ -1046,6 +1238,7 @@ def bake_diffuse(
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     triangles, center, scale = _collect_blender_triangles(context, targets, uv_layer_names)
+    outside_atlas = sum(1 for triangle in triangles if _outside_atlas(triangle))
     sources, loaded_images = _load_raster_sources(paths)
     stage_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp.png")
     backup_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.bak")
@@ -1106,6 +1299,8 @@ def bake_diffuse(
             "resolution": resolution,
             "padding": padding,
             "view_names": SOURCE_VIEW_NAMES,
+            "outside_atlas_triangles": outside_atlas,
+            "triangle_count": len(triangles),
             **metrics,
         }
     except Exception:
@@ -1135,6 +1330,7 @@ def bake_diffuse(
 
 __all__ = (
     "BakeTriangle",
+    "FOREGROUND_EXTEND_RATIO",
     "MAX_ATLAS_RESOLUTION",
     "RasterSource",
     "SOURCE_VIEW_NAMES",
@@ -1145,7 +1341,9 @@ __all__ = (
     "build_depth_buffer",
     "detect_foreground_bbox",
     "dilate_rgba",
+    "build_raster_source",
     "encode_srgb_png",
+    "extend_foreground",
     "project_point",
     "rasterize_atlas",
 )

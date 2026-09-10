@@ -181,13 +181,14 @@ def build_reference_analysis_prompt(reference_count: int) -> str:
 - 이미지에 직접 보이는 사실은 uncertainty.observed에, 보이지 않아 추론한 내용은 uncertainty.inferred에 기록합니다.
 - 참조끼리 모순되는 내용은 임의로 합치지 말고 uncertainty.conflicts에 기록합니다.
 - 로고, 워터마크, 사진 배경, UI, 텍스트는 디자인 특징으로 복제하지 않습니다.
+- 자세, 포즈, 손동작, 시선, 카메라 각도, 구도, 실루엣, 비율, 체형은 기록하지 않습니다. 이 값들은 텍스처를 입힐 3D 모델에서 이미 정해져 있으며, 참조에서 가져오면 결과가 어긋납니다.
 - 재질의 물리적 PBR 값이 아니라 diffuse/albedo에 그릴 색, 붓질, 명암, 가장자리 강조를 설명합니다.
 - Markdown, 코드펜스, 설명문 없이 아래 스키마와 정확히 같은 JSON 객체 하나만 반환합니다.
 - 모든 배열은 정보가 없어도 빈 배열로 포함하고, confidence는 0.0~1.0 숫자로 반환합니다.
 
 {{
   "schema_version": "{ANALYSIS_SCHEMA_VERSION}",
-  "object_summary": "짧은 물체 및 디자인 요약",
+  "object_summary": "짧은 물체 및 디자인 요약(자세와 구도는 빼고 색·재질 중심으로)",
   "reference_roles": [
     {{"reference_index": 0, "role": "역할", "use_for": ["색상", "붓질"], "confidence": 0.0}}
   ],
@@ -398,6 +399,8 @@ def parse_reference_analysis(raw_text: str) -> ReferenceAnalysis:
 def compile_turnaround_prompt(
     analysis: ReferenceAnalysis | Mapping[str, Any] | None,
     user_prompt: str = "",
+    *,
+    reference_image_count: int = 0,
 ) -> str:
     """모델 형상과 참조 스타일(또는 프롬프트만)을 한 장의 3면도에 결합하도록 지시한다.
 
@@ -406,6 +409,8 @@ def compile_turnaround_prompt(
     """
 
     instruction = user_prompt.strip() or "추가 지시 없음"
+    if reference_image_count and analysis is None:
+        raise ValueError("참조 이미지를 함께 보낼 때는 참조 분석이 필요합니다.")
     if analysis is None:
         if not user_prompt.strip():
             raise ValueError("참조 분석이 없으면 사용자 지시가 필요합니다.")
@@ -424,20 +429,40 @@ def compile_turnaround_prompt(
             if isinstance(analysis, ReferenceAnalysis)
             else normalize_reference_analysis(analysis)
         )
+        # reference_roles와 uncertainty는 분석 단계의 기록일 뿐이고, 참조의
+        # 서술이 생성 형상으로 새는 통로가 된다. 스타일 근거만 싣는다.
+        analysis_payload = {
+            key: value
+            for key, value in normalized.to_dict().items()
+            if key in ("object_summary", "style", "surface_regions", "design_rules")
+        }
         analysis_json = json.dumps(
-            normalized.to_dict(), ensure_ascii=False, separators=(",", ":")
+            analysis_payload, ensure_ascii=False, separators=(",", ":")
         )
-        role_section = (
-            "- 첫 번째 이미지(role=geometry_contact_sheet): Blender의 실제 모델 형상입니다. "
-            "실루엣, 비율, 부품 배치를 반드시 이 이미지에 맞춥니다.\n"
-            "- 두 번째 이후 이미지(role=reference): 외형, 색상, 붓질, 장식 스타일의 근거입니다. "
-            "참조의 다른 물체 형상은 복제하지 않습니다."
-        )
+        if reference_image_count:
+            role_section = (
+                "- 첫 번째 이미지(role=geometry_contact_sheet): Blender의 실제 모델 형상입니다. "
+                "실루엣, 비율, 자세, 부품 배치를 반드시 이 이미지에 맞춥니다.\n"
+                f"- 두 번째 이후 이미지 {reference_image_count}장(role=palette_only): 색과 재질 표현만 참고합니다. "
+                "이 이미지의 캐릭터, 비율, 자세, 실루엣, 부품 구성은 절대 가져오지 않습니다."
+            )
+        else:
+            role_section = (
+                "- 입력 이미지는 첫 번째 한 장뿐입니다(role=geometry_contact_sheet). "
+                "Blender의 실제 모델 형상이며, 실루엣, 비율, 자세, 부품 배치를 반드시 이 이미지에 맞춥니다.\n"
+                "- 스타일은 아래 분석 JSON 텍스트만 근거로 합니다."
+            )
         style_section = f"분석 JSON:\n{analysis_json}"
     return f"""캐주얼 게임용 스타일리시 손맵 diffuse/albedo 제작을 위한 3면도 한 장을 생성하세요.
 
 입력 이미지 역할:
 {role_section}
+
+형상 계약(다른 모든 지시보다 우선):
+- 첫 번째 이미지는 흰 배경 위의 회색 3D 모델입니다. 그 실루엣 안쪽을 색으로 채우는 작업이며, 실루엣 밖에는 아무것도 그리지 않습니다.
+- 첫 번째 이미지의 실루엣, 비율, 크기, 화면 안 위치를 그대로 유지합니다. 이 형상은 텍스처를 입힐 실제 3D 모델이므로 한 픽셀도 재해석하지 않습니다.
+- 첫 번째 이미지에 없는 부품(가방, 소품, 장비, 장식)은 추가하지 않고, 있는 부품을 빼지도 않습니다.
+- 다른 참조나 분석 결과가 이 계약과 충돌하면 언제나 첫 번째 이미지를 따릅니다.
 
 {style_section}
 
@@ -446,9 +471,10 @@ def compile_turnaround_prompt(
 
 출력 계약:
 - Provider 호출 한 번에서 최종 이미지 정확히 한 장만 생성합니다. 시점별로 세 번 생성하지 마세요.
-- 하나의 21:9 캔버스를 같은 너비의 3열로 나눕니다.
+- 하나의 21:9 캔버스를 같은 너비의 3열로 나눕니다. 첫 번째 입력 이미지가 정확히 같은 21:9 3열 배치이므로 그 레이아웃을 그대로 따릅니다.
 - 왼쪽부터 FRONT | RIGHT SIDE | BACK 순서이며, 세 칸에 동일한 물체, 동일한 축척, 동일한 세로 중심을 배치합니다.
 - 각 열의 중앙 정사각형 viewport 안에 물체를 배치하고, 세 viewport의 상하좌우 여백을 동일하게 유지합니다.
+- 첫 번째 입력 이미지의 실루엣 위에 색만 덧입히듯, 각 열에서 물체의 외곽선 위치, 크기, 세로 중심을 입력과 최대한 일치시킵니다. 부위 경계(예: 장갑과 소매, 신발과 바지)도 입력 실루엣의 같은 높이에 맞춥니다.
 - 세 시점의 색, 무늬, 마모, 부품 연결은 서로 연속되고 일관되어야 합니다.
 - 원근을 제거한 orthographic view처럼 표현하고 물체가 잘리지 않게 충분한 여백을 둡니다.
 - 조명 사진이나 렌더가 아니라 diffuse/albedo에 옮길 수 있는 손으로 그린 색과 명암을 표현합니다.
@@ -468,7 +494,9 @@ def build_turnaround_request(
     """비용 계약이 고정된 단일 3면도 이미지 요청을 만든다."""
 
     return TurnaroundImageRequest(
-        prompt=compile_turnaround_prompt(analysis, user_instruction),
+        prompt=compile_turnaround_prompt(
+            analysis, user_instruction, reference_image_count=len(reference_images)
+        ),
         contact_sheet=contact_sheet,
         reference_images=tuple(reference_images),
         model=model,

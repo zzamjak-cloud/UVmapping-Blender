@@ -16,6 +16,8 @@ from uvmapping.texture_pipeline import (
     TURNAROUND_VIEWS,
     build_reference_analysis_prompt,
     build_turnaround_request,
+    compile_turnaround_prompt,
+    normalize_reference_analysis,
     parse_reference_analysis,
     validate_reference_image_path,
 )
@@ -167,6 +169,9 @@ def test_turnaround_request_fixes_one_call_one_image_and_view_order() -> None:
     assert "FRONT | RIGHT SIDE | BACK" in request.prompt
     assert "같은 너비의 3열" in request.prompt
     assert "중앙 정사각형 viewport" in request.prompt
+    # contact sheet와 같은 레이아웃을 강제해야 베이크 투영 좌표가 어긋나지 않는다.
+    assert "그 레이아웃을 그대로 따릅니다" in request.prompt
+    assert "부위 경계" in request.prompt
     assert "텍스트, 라벨, 구분선" in request.prompt
     assert "푸른색 천 장식을 추가" in request.prompt
     assert "낡은 나무 상자" in request.prompt
@@ -232,6 +237,46 @@ def main() -> None:
         test()
         print(f"PASS {test.__name__}")
     print(f"순수 AI 텍스처 파이프라인 테스트 {len(tests)}/{len(tests)} 통과")
+
+
+def test_turnaround_prompt_keeps_geometry_authoritative_without_reference_images() -> None:
+    analysis = normalize_reference_analysis(
+        {"object_summary": "낡은 나무 상자", "style": {"palette": ["#8B5A2B"]}}
+    )
+    prompt = compile_turnaround_prompt(analysis, "", reference_image_count=0)
+    assert "입력 이미지는 첫 번째 한 장뿐입니다" in prompt
+    assert "분석 JSON 텍스트만 근거로" in prompt
+    assert "형상 계약(다른 모든 지시보다 우선)" in prompt
+    assert "한 픽셀도 재해석하지 않습니다" in prompt
+    # 자세 부위를 열거하면 오히려 이미지 모델이 손동작을 만들어 낸다.
+    assert "팔" not in prompt.split("형상 계약")[1].split("분석 JSON")[0]
+    assert "흰 배경 위의 회색 3D 모델" in prompt
+    # 분석 기록용 필드는 생성 프롬프트로 새지 않는다.
+    assert "uncertainty" not in prompt
+    assert "reference_roles" not in prompt
+
+
+def test_turnaround_prompt_limits_reference_images_to_palette() -> None:
+    analysis = normalize_reference_analysis({"object_summary": "소방관 캐릭터"})
+    prompt = compile_turnaround_prompt(analysis, "", reference_image_count=2)
+    assert "두 번째 이후 이미지 2장(role=palette_only)" in prompt
+    assert "실루엣, 부품 구성은 절대 가져오지 않습니다" in prompt
+
+
+def test_turnaround_prompt_rejects_reference_images_without_analysis() -> None:
+    try:
+        compile_turnaround_prompt(None, "지시", reference_image_count=1)
+    except ValueError as error:
+        assert "참조 분석" in str(error)
+    else:
+        raise AssertionError("분석 없이 참조 이미지를 보내면 거부해야 합니다.")
+
+
+def test_analysis_prompt_excludes_pose_and_composition() -> None:
+    prompt = build_reference_analysis_prompt(1)
+    # 참조의 자세가 분석 텍스트를 타고 생성 형상으로 새면 안 된다.
+    assert "자세, 포즈, 손동작" in prompt
+    assert "기록하지 않습니다" in prompt
 
 
 if __name__ == "__main__":

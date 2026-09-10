@@ -21,6 +21,7 @@ def register():
         UVMAPPING_AP_preferences,
         UVMAPPING_PG_reference_image,
         UVMAPPING_PG_settings,
+        UVMAPPING_PG_target_object,
     )
 
     if _registered_classes:
@@ -29,6 +30,7 @@ def register():
     classes = (
         UVMAPPING_AP_preferences,
         UVMAPPING_PG_reference_image,
+        UVMAPPING_PG_target_object,
         UVMAPPING_PG_settings,
         *texture_operators.classes,
         *ui.classes,

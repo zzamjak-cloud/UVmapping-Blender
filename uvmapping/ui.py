@@ -7,29 +7,45 @@ import bpy
 from bpy.types import Panel, UIList
 
 from .properties import get_addon_preferences
-from .texture_operators import can_bake_diffuse
+from .texture_operators import can_bake_diffuse, registered_targets, texture_targets
 
 
 def _has_texture_target(context) -> bool:
-    """폴리곤이 있는 Mesh가 선택되어 있어야 텍스처 단계를 노출한다."""
+    """등록 대상이나 선택 Mesh가 있어야 텍스처 단계를 노출한다."""
 
-    candidates = getattr(context, "selected_editable_objects", ())
-    return any(
-        obj.type == "MESH" and obj.data is not None and len(obj.data.polygons) > 0
-        for obj in candidates
-    )
+    return bool(texture_targets(context))
 
 
 def _missing_uv_names(context) -> tuple[str, ...]:
-    """활성 UV 맵이 없는 선택 객체 이름을 모은다."""
+    """활성 UV 맵이 없는 대상 객체 이름을 모은다."""
 
-    names = []
-    for obj in getattr(context, "selected_editable_objects", ()):
-        if obj.type != "MESH" or obj.data is None or not len(obj.data.polygons):
-            continue
+    return tuple(
+        obj.name for obj in texture_targets(context) if obj.data.uv_layers.active is None
+    )
+
+
+class UVMAPPING_UL_target_objects(UIList):
+    """3면도와 텍스처의 대상으로 등록한 Mesh 객체 목록."""
+
+    def draw_item(
+        self,
+        _context,
+        layout,
+        _data,
+        item,
+        _icon,
+        _active_data,
+        _active_property,
+        _index,
+    ):
+        obj = item.object
+        if obj is None:
+            layout.label(text="(삭제된 객체)", icon="ERROR")
+            return
+        row = layout.row(align=True)
+        row.label(text=obj.name, icon="OUTLINER_OB_MESH")
         if obj.data.uv_layers.active is None:
-            names.append(obj.name)
-    return tuple(names)
+            row.label(text="", icon="ERROR")
 
 
 class UVMAPPING_UL_reference_images(UIList):
@@ -77,6 +93,36 @@ class UVMAPPING_PT_ai_texture(Panel):
                     "use_online_access",
                     text="Allow Online Access 켜기",
                 )
+
+        target_box = layout.box()
+        target_box.label(text="대상 객체", icon="OUTLINER_OB_MESH")
+        registered = registered_targets(context)
+        if settings.target_objects:
+            target_box.template_list(
+                "UVMAPPING_UL_target_objects",
+                "",
+                settings,
+                "target_objects",
+                settings,
+                "target_object_index",
+                rows=3,
+            )
+        else:
+            target_box.label(
+                text="등록이 없으면 현재 선택한 Mesh를 대상으로 합니다", icon="INFO"
+            )
+        target_controls = target_box.row(align=True)
+        target_controls.operator(
+            "uvmapping.add_target_objects", text="선택 객체 등록", icon="ADD"
+        )
+        target_controls.operator(
+            "uvmapping.remove_target_object", text="", icon="REMOVE"
+        )
+        target_controls.operator("uvmapping.clear_target_objects", text="", icon="X")
+        if registered:
+            target_box.label(
+                text=f"등록 {len(registered)}개를 대상으로 진행합니다", icon="CHECKMARK"
+            )
 
         missing_uv = _missing_uv_names(context)
         if missing_uv:
@@ -131,6 +177,16 @@ class UVMAPPING_PT_ai_texture(Panel):
             reference_box.label(
                 text="참조 없이도 아래 프롬프트만으로 생성할 수 있습니다", icon="INFO"
             )
+        else:
+            reference_box.prop(settings, "send_reference_images")
+            if settings.send_reference_images:
+                reference_box.label(
+                    text="참조 형상이 복제되어 모델 실루엣을 무시할 수 있습니다", icon="ERROR"
+                )
+            else:
+                reference_box.label(
+                    text="스타일은 분석 결과로만 전달해 모델 형상을 지킵니다", icon="CHECKMARK"
+                )
 
         prompt_box = layout.box()
         prompt_box.label(text="추가 지시", icon="TEXT")
@@ -143,6 +199,7 @@ class UVMAPPING_PT_ai_texture(Panel):
         output_box.label(text="출력 텍스처", icon="TEXTURE")
         output_box.prop(settings, "texture_resolution")
         output_box.prop(settings, "padding_pixels")
+        output_box.prop(settings, "auto_apply_diffuse")
 
         generate = layout.column()
         generate.scale_y = 1.5
@@ -157,6 +214,8 @@ class UVMAPPING_PT_ai_texture(Panel):
         apply_texture.scale_y = 1.5
         apply_texture.enabled = can_bake_diffuse(context)
         apply_texture.operator("uvmapping.bake_diffuse", icon="MATERIAL_DATA")
+        if settings.auto_apply_diffuse:
+            layout.label(text="생성이 끝나면 자동으로 적용합니다", icon="CHECKMARK")
 
         status = layout.box()
         status.label(text=settings.texture_status, icon="INFO")
@@ -183,6 +242,7 @@ class UVMAPPING_PT_ai_texture(Panel):
 
 classes = (
     UVMAPPING_UL_reference_images,
+    UVMAPPING_UL_target_objects,
     UVMAPPING_PT_ai_texture,
 )
 
@@ -191,4 +251,5 @@ __all__ = (
     "classes",
     "UVMAPPING_PT_ai_texture",
     "UVMAPPING_UL_reference_images",
+    "UVMAPPING_UL_target_objects",
 )
