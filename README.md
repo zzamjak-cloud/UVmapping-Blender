@@ -11,15 +11,18 @@
 ## 설치
 
 1. Blender에서 `Edit > Preferences > Get Extensions`를 엽니다.
-3. 오른쪽 위 메뉴에서 `Repositories > Add Remote Repository`를 선택합니다.
-4. 저장소 URL에 다음 주소를 입력합니다.
+2. 오른쪽 위 메뉴에서 `Repositories > Add Remote Repository`를 선택합니다.
+3. 저장소 URL에 다음 주소를 입력합니다.
 
    ```text
    https://zzamjak-cloud.github.io/UVmapping-Blender/index.json
    ```
 
+4. 저장소 목록에서 이름을 `UVmapping-Blender`로 바꿉니다. Blender는 원격 저장소 이름을 URL의 **호스트**에서 자동으로 정하므로, 같은 호스트에 있는 다른 저장소를 함께 쓰면 `zzamjak-cloud.github.io.001`처럼 구분이 안 되는 이름이 붙습니다. 목록의 이름을 더블클릭해 바꾸면 환경설정에 그대로 저장됩니다.
 5. `Refresh Remote`를 실행한 뒤 `UV Mapping Blender`를 검색합니다.
 6. `Install`을 눌러 설치하고 Extension을 활성화합니다.
+
+같은 URL을 두 번 등록하면 저장소가 두 개 만들어져 `Get Extensions`에 같은 애드온이 두 번 보입니다. 이때는 `Repositories`에서 중복된 항목 하나를 `−`로 지우면 됩니다.
 
 ### 업데이트 확인
 
