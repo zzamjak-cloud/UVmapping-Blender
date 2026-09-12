@@ -95,8 +95,14 @@ def run_job(job: dict, api_key: str) -> dict:
             raise RuntimeError("OpenRouter 응답에 참조 분석 텍스트가 없습니다.")
         return {"ok": True, "text": text}
     if action == "turnaround":
+        # 종횡비와 해상도는 레이아웃 계약에서 오므로 작업 JSON 값을 그대로 전달한다.
+        options = {
+            key: str(job[key])
+            for key in ("aspect_ratio", "resolution")
+            if job.get(key) is not None
+        }
         payload = build_turnaround_payload(
-            str(job["prompt"]), _encode_images(image_paths), model=str(job["model"])
+            str(job["prompt"]), _encode_images(image_paths), model=str(job["model"]), **options
         )
         response = _openrouter_request(IMAGES_ENDPOINT, api_key, payload)
         mime_type, image_data = extract_image_response(response)

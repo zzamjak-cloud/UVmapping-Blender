@@ -7,7 +7,14 @@ import bpy
 from bpy.types import Panel, UIList
 
 from .properties import get_addon_preferences
-from .texture_operators import can_bake_diffuse, registered_targets, texture_targets
+from .texture_operators import (
+    can_bake_diffuse,
+    has_stalled_sequential_state,
+    registered_targets,
+    texture_targets,
+    texture_verification_summary,
+)
+from .texture_pipeline import resolve_layout
 
 
 def _has_texture_target(context) -> bool:
@@ -66,7 +73,7 @@ class UVMAPPING_UL_reference_images(UIList):
 
 
 class UVMAPPING_PT_ai_texture(Panel):
-    """스타일 참조 분석과 한 장짜리 모델 3면도 생성 패널."""
+    """스타일 참조 분석과 한 장짜리 모델 다면도 생성 패널."""
 
     bl_label = "AI 손맵 텍스처"
     bl_idname = "UVMAPPING_PT_ai_texture"
@@ -195,11 +202,42 @@ class UVMAPPING_PT_ai_texture(Panel):
             "uvmapping.edit_texture_prompt", text="한글 프롬프트 입력", icon="TEXT"
         )
 
+        composition_box = layout.box()
+        composition_box.label(text="다면도 구성", icon="MESH_GRID")
+        composition_box.prop(settings, "turnaround_layout", text="")
+        composition_box.prop(settings, "turnaround_image_size")
+        composition_box.prop(settings, "generation_mode", text="")
+        if settings.generation_mode == "SEQUENTIAL":
+            call_count = len(resolve_layout(settings.turnaround_layout).views)
+            composition_box.label(
+                text=f"OpenRouter 호출 {call_count}회 · 비용 {call_count}배", icon="ERROR"
+            )
+        else:
+            composition_box.prop(settings, "auto_regenerate_attempts")
+            if settings.auto_regenerate_attempts:
+                composition_box.label(
+                    text=f"불일치 시 최대 {settings.auto_regenerate_attempts}회 추가 호출", icon="INFO"
+                )
+        if settings.turnaround_layout == "SIX":
+            composition_box.label(
+                text="상·하·좌 시점을 실제 그림으로 받아 투영합니다", icon="CHECKMARK"
+            )
+        else:
+            composition_box.label(
+                text="상·하면은 측면 색을 늘려 채웁니다", icon="INFO"
+            )
+
         output_box = layout.box()
         output_box.label(text="출력 텍스처", icon="TEXTURE")
         output_box.prop(settings, "texture_resolution")
         output_box.prop(settings, "padding_pixels")
         output_box.prop(settings, "auto_apply_diffuse")
+        blend_column = output_box.column(align=True)
+        blend_column.label(text="투영 블렌딩", icon="NODE_MATERIAL")
+        blend_column.prop(settings, "blend_exponent")
+        blend_column.prop(settings, "harmonize_view_colors")
+        blend_column.prop(settings, "silhouette_warp")
+        output_box.prop(settings, "verify_after_bake")
 
         generate = layout.column()
         generate.scale_y = 1.5
@@ -214,13 +252,22 @@ class UVMAPPING_PT_ai_texture(Panel):
         apply_texture.scale_y = 1.5
         apply_texture.enabled = can_bake_diffuse(context)
         apply_texture.operator("uvmapping.bake_diffuse", icon="MATERIAL_DATA")
+        if has_stalled_sequential_state(context):
+            # 중단된 순차 생성은 베이크할 수 없으므로 상태를 지우는 길을 바로 보여 준다.
+            stalled = layout.row()
+            stalled.alert = True
+            stalled.operator("uvmapping.reset_texture_state", icon="TRASH")
         if settings.auto_apply_diffuse:
             layout.label(text="생성이 끝나면 자동으로 적용합니다", icon="CHECKMARK")
+
+        summary = texture_verification_summary(context)
+        if summary is not None:
+            self._draw_verification(layout, summary)
 
         status = layout.box()
         status.label(text=settings.texture_status, icon="INFO")
         if settings.texture_output_path:
-            status.prop(settings, "texture_output_path", text="3면도")
+            status.prop(settings, "texture_output_path", text="다면도")
         if settings.texture_diffuse_path:
             status.prop(settings, "texture_diffuse_path", text="Diffuse")
 
@@ -238,6 +285,40 @@ class UVMAPPING_PT_ai_texture(Panel):
             advanced.prop(settings, "texture_image_model")
             advanced.label(text="openrouter.ai/models의 모델 식별자를 직접 넣을 수 있습니다", icon="INFO")
             advanced.label(text="API 키는 Blender 환경설정에서 관리합니다", icon="KEYINGSET")
+
+    @staticmethod
+    def _draw_verification(layout, summary: dict) -> None:
+        """사전 실루엣 검증과 적용 후 검증 결과. 재생성이 필요한지 한눈에 보이게 한다."""
+
+        verification = summary.get("verification") or {}
+        silhouette_failed = list(summary.get("silhouette_failed") or [])
+        views = verification.get("views") or {}
+        recommend = bool(silhouette_failed) or any(
+            not item.get("passed", True) for item in views.values()
+        ) or bool(verification.get("error"))
+        box = layout.box()
+        header = box.row()
+        header.label(text="검증", icon="ERROR" if recommend else "CHECKMARK")
+        if summary.get("attempt"):
+            header.label(text=f"재생성 {summary['attempt']}회")
+        if silhouette_failed:
+            box.label(text=f"실루엣 불일치: {', '.join(silhouette_failed)}", icon="ERROR")
+        elif summary.get("silhouette_error"):
+            box.label(text="실루엣 검증 실패", icon="INFO")
+        if views:
+            grid = box.grid_flow(columns=3, align=True)
+            for view, item in views.items():
+                score = float(item.get("score", 0.0))
+                cell = grid.row()
+                cell.alert = not item.get("passed", True)
+                cell.label(text=f"{view} {score:.2f}")
+        if verification.get("error"):
+            box.label(text=f"적용 후 검증 실패: {verification['error']}", icon="INFO")
+        sheet = verification.get("sheet")
+        if sheet:
+            box.operator("wm.path_open", text="검증 시트 열기", icon="IMAGE_DATA").filepath = str(sheet)
+        if recommend:
+            box.label(text="재생성 권장", icon="ERROR")
 
 
 classes = (

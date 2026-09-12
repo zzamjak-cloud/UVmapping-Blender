@@ -179,7 +179,7 @@ def _check_bootstrap_and_user_docs() -> None:
         "0-1 안에 배치",
         "서로 겹치지 않아야",
         "AI 손맵 텍스처",
-        "단일 3면도 생성",
+        "단일 다면도 생성",
         "OpenRouter API 키 하나",
         "OPENROUTER_API_KEY",
         "openrouter.ai/keys",

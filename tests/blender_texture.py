@@ -92,15 +92,61 @@ def _check_full_pipeline(texture_module, bake_module) -> None:
     original_key = os.environ.get("OPENROUTER_API_KEY")
     online = bpy.context.preferences.system.use_online_access
 
-    def fake_turnaround(path: Path) -> None:
-        width, height = 336, 144  # 21:9 결과의 축소판
+    cell_colors = (
+        (200, 60, 60),
+        (60, 200, 60),
+        (60, 60, 200),
+        (200, 200, 60),
+        (60, 200, 200),
+        (200, 60, 200),
+    )
+
+    sequential_calls: list[dict] = []
+    grid_calls: list[dict] = []
+    # True면 다음 격자 결과의 모든 셀 한가운데에 순백 세로 틈을 그려 가이드(틈 없는
+    # 둥근 큐브)와 실루엣 내부 구조가 다른 "팔을 붙여 그린" 상황을 흉내 낸다.
+    mismatch_next = [False]
+
+    def fake_turnaround(path: Path, aspect_ratio: str) -> None:
+        # 요청 종횡비에 맞는 축소판 결과. 셀마다 다른 단색으로 채운다.
+        if aspect_ratio == "1:1":
+            # 순차 생성 모드의 단일 시점 결과. 흰 배경 위 중앙 실루엣을 호출 순서마다
+            # 다른 단색으로 칠한다. 배경이 있어야 부분 베이크의 미채색 영역이 검증된다.
+            color = cell_colors[len(sequential_calls) % len(cell_colors)]
+            width = height = 128
+            margin = 16
+            pixels = bytearray()
+            for row in range(height):
+                for column in range(width):
+                    inside = margin <= row < height - margin and margin <= column < width - margin
+                    pixels += bytes((color if inside else (255, 255, 255)) + (255,))
+            path.write_bytes(bake_module.encode_srgb_png(bytes(pixels), width, height))
+            return
+        if aspect_ratio == "3:2":
+            width, height, columns, rows = 336, 224, 3, 2
+        else:
+            width, height, columns, rows = 336, 144, 3, 1
+        cell_width, cell_height = width // columns, height // rows
+        gap = mismatch_next[0]
+        mismatch_next[0] = False
+        margin = max(4, cell_width // 14)
         pixels = bytearray()
-        for _row in range(height):
+        for row in range(height):
+            row_from_top = min(rows - 1, (height - 1 - row) // cell_height)
+            local_row = row % cell_height
             for column in range(width):
-                band = min(2, column * 3 // width)
-                pixels += bytes(
-                    ((200, 60, 60), (60, 200, 60), (60, 60, 200))[band] + (255,)
+                cell_index = min(columns - 1, column // cell_width)
+                local_column = column % cell_width
+                cell = row_from_top * columns + cell_index
+                # 실제 생성물처럼 흰 여백 위에 피사체를 그린다. 배경 추정이 테두리 중앙값을 쓰므로
+                # 여백이 없으면 셀 색이 배경으로 오인된다.
+                inside = (
+                    margin <= local_row < cell_height - margin
+                    and margin <= local_column < cell_width - margin
                 )
+                if gap and inside and abs(local_column - cell_width // 2) < max(2, cell_width // 12):
+                    inside = False
+                pixels += bytes((cell_colors[cell] if inside else (255, 255, 255)) + (255,))
         path.write_bytes(bake_module.encode_srgb_png(bytes(pixels), width, height))
 
     class _StubWorker:
@@ -108,7 +154,12 @@ def _check_full_pipeline(texture_module, bake_module) -> None:
             self.stdin = io.BytesIO()
             request = json.loads(Path(arguments[-2]).read_text(encoding="utf-8"))
             output_path = Path(request["output_path"])
-            fake_turnaround(output_path)
+            assert request["resolution"] in ("1K", "2K", "4K"), request.get("resolution")
+            fake_turnaround(output_path, str(request.get("aspect_ratio", "21:9")))
+            if request.get("aspect_ratio") == "1:1":
+                sequential_calls.append(request)
+            else:
+                grid_calls.append(request)
             Path(arguments[-1]).write_text(
                 json.dumps({"ok": True, "output_path": str(output_path)}),
                 encoding="utf-8",
@@ -142,23 +193,69 @@ def _check_full_pipeline(texture_module, bake_module) -> None:
         bpy.ops.object.select_all(action="DESELECT")
         bpy.ops.object.mode_set(mode="OBJECT")
 
+        # 첫 결과는 실루엣 내부 구조가 가이드와 다르게(세로 틈) 나와 자동 재생성이 1회 일어나야 한다.
+        assert settings.auto_regenerate_attempts == 1, settings.auto_regenerate_attempts
+        mismatch_next[0] = True
         assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
         # Operator RNA는 execute() 반환과 함께 해제되므로, 결과 회수는
         # 연산자 밖의 실행 레지스트리가 담당해야 한다.
         assert len(texture_module._ACTIVE_RUNS) == 1
         assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        # 사전 검증이 불일치를 잡아 재생성 작업자를 바로 이어 띄운다.
+        first_state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert first_state["attempt"] == 0, first_state.get("attempt")
+        first_report = first_state["silhouette_report"]
+        assert all(not first_report[view]["passed"] for view in first_report), first_report
+        assert all(
+            first_report[view]["segment_mismatch_ratio"] > bake_module.SILHOUETTE_SEGMENT_MISMATCH_LIMIT
+            for view in first_report
+        ), first_report
+        assert len(texture_module._ACTIVE_RUNS) == 1, "불일치 시 재생성이 시작되어야 합니다."
+        assert "재생성 1/1" in settings.texture_status, settings.texture_status
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
         assert not texture_module._ACTIVE_RUNS
+        assert len(grid_calls) == 2, len(grid_calls)
+        assert "이전 시도 교정" not in grid_calls[0]["prompt"]
+        assert "이전 시도 교정" in grid_calls[1]["prompt"]
+        assert "배경이 보이는 모든 틈" in grid_calls[1]["prompt"]
+        first_paths = [Path(path) for path in first_state["views"].values()] + [Path(first_state["turnaround_path"])]
 
         state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
         assert state["status"] == "TURNAROUND_READY", state["status"]
+        assert state["attempt"] == 1, state.get("attempt")
+        assert state["regeneration_feedback"], state.get("regeneration_feedback")
+        assert all(report["passed"] for report in state["silhouette_report"].values()), state["silhouette_report"]
+        assert "_retry01" in state["turnaround_path"], state["turnaround_path"]
+        # 기본 구성은 6면도이며 상·하·좌 시점이 실제 파일로 분리되어야 한다.
+        assert state["layout"] == "SIX", state.get("layout")
+        assert set(state["views"]) == {"front", "right", "back", "left", "top", "bottom"}
         assert all(Path(path).is_file() for path in state["views"].values())
 
         assert texture_module.can_bake_diffuse(bpy.context)
+        assert settings.verify_after_bake
         assert bpy.ops.uvmapping.bake_diffuse() == {"FINISHED"}, settings.texture_status
         diffuse_path = Path(settings.texture_diffuse_path)
         assert diffuse_path.is_file()
         applied = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
         assert applied["status"] == "ALBEDO_APPLIED"
+        # 적용 후 검증: 시점별 렌더 비교 점수와 검증 시트가 남아야 한다.
+        verification = applied["verification"]
+        assert not verification.get("error"), verification
+        assert set(verification["views"]) == {"FRONT", "RIGHT", "BACK", "LEFT", "TOP", "BOTTOM"}, verification
+        assert all(0.0 <= item["score"] <= 1.0 for item in verification["views"].values())
+        assert all(item["sample_count"] > 0 for item in verification["views"].values()), verification
+        sheet_path = Path(verification["sheet"])
+        assert sheet_path.is_file() and sheet_path.name.endswith("_verify.png"), verification["sheet"]
+        assert verification["silhouette_failed"] == [], verification["silhouette_failed"]
+        sheet_image = bpy.data.images.load(str(sheet_path), check_existing=False)
+        try:
+            # 행 3(가이드/생성/렌더) × 열 6.
+            assert tuple(sheet_image.size) == (6 * texture_module.VERIFY_SHEET_CELL, 3 * texture_module.VERIFY_SHEET_CELL)
+        finally:
+            bpy.data.images.remove(sheet_image)
+        sheet_path.unlink(missing_ok=True)
+        for path in first_paths:
+            path.unlink(missing_ok=True)
         material = cube.data.materials[cube.data.polygons[0].material_index]
         texture_node = next(
             node
@@ -172,25 +269,148 @@ def _check_full_pipeline(texture_module, bake_module) -> None:
             Path(path).unlink(missing_ok=True)
         Path(state["geometry_contact_sheet"]).unlink(missing_ok=True)
 
+        applied_state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert applied_state["bake_settings"]["layout"] == "SIX"
+        assert set(applied_state["bake_stats"]["view_names"]) == {
+            "FRONT", "RIGHT", "BACK", "LEFT", "TOP", "BOTTOM"
+        }, applied_state["bake_stats"].get("view_names")
+
         # 자동 적용을 켜면 Edit Mode에서 시작해도 모드 전환과 베이크까지 이어진다.
+        # 이번에는 3열 3면도 구성으로 같은 구간을 다시 검사하되, 재생성 횟수 0에서
+        # 불일치가 나면 경고만 남기고 자동 적용은 막지 않아야 한다.
         settings.auto_apply_diffuse = True
+        settings.turnaround_layout = "THREE"
+        settings.auto_regenerate_attempts = 0
         settings.texture_diffuse_path = ""
+        mismatch_next[0] = True
+        grid_calls.clear()
         bpy.context.view_layer.objects.active = cube
         cube.select_set(True)
         bpy.ops.object.mode_set(mode="EDIT")
         assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
         assert cube.mode == "OBJECT", "생성 단계에서 Object Mode로 전환하지 못했습니다."
         assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert not texture_module._ACTIVE_RUNS, "재생성 횟수 0에서는 재생성하지 않아야 합니다."
+        assert len(grid_calls) == 1, len(grid_calls)
         auto_state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
         assert auto_state["status"] == "ALBEDO_APPLIED", settings.texture_status
+        assert auto_state["attempt"] == 0
+        assert any(not report["passed"] for report in auto_state["silhouette_report"].values())
+        assert "실루엣 불일치" in settings.texture_status, settings.texture_status
+        assert auto_state["verification"]["silhouette_failed"], auto_state["verification"]
+        assert auto_state["verification"]["passed"] is False
+        assert auto_state["layout"] == "THREE"
+        assert set(auto_state["views"]) == {"front", "right", "back"}
         auto_diffuse = Path(settings.texture_diffuse_path)
         assert auto_diffuse.is_file()
+        Path(auto_state["verification"]["sheet"]).unlink(missing_ok=True)
         auto_diffuse.unlink(missing_ok=True)
+        settings.auto_regenerate_attempts = 1
         Path(auto_state["turnaround_path"]).unlink(missing_ok=True)
         for path in auto_state["views"].values():
             Path(path).unlink(missing_ok=True)
         Path(auto_state["geometry_contact_sheet"]).unlink(missing_ok=True)
         settings.target_objects.clear()
+
+        # 순차 인페인팅 모드: 시점마다 1회씩 호출하고, 앞 시점의 부분 베이크를
+        # 텍스처 가이드로 넘기며, 마지막 시점 뒤 자동 적용까지 이어져야 한다.
+        # 6면도로 돌려야 LEFT 미러·상하 늘리기 대체가 가이드의 미채색 영역을
+        # 지워 버리지 않는지 확인할 수 있다.
+        settings.generation_mode = "SEQUENTIAL"
+        settings.turnaround_layout = "SIX"
+        settings.auto_apply_diffuse = True
+        settings.texture_diffuse_path = ""
+        entry = settings.target_objects.add()
+        entry.object = cube
+        # 순차 진행 중에는 사용자 머티리얼 슬롯과 면 할당이 바뀌면 안 된다.
+        slot_snapshot = tuple(slot.material.name if slot.material else "" for slot in cube.material_slots)
+        index_snapshot = tuple(polygon.material_index for polygon in cube.data.polygons)
+        material_count_before = len(bpy.data.materials)
+        assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+        seen_steps = []
+        gray_guides = 0
+        while texture_module._ACTIVE_RUNS:
+            run = texture_module._ACTIVE_RUNS[0]
+            progress = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+            step = int(progress.get("sequential_step", -1))
+            seen_steps.append((progress["status"], step))
+            assert progress["status"] == "SEQUENTIAL_IN_PROGRESS", progress["status"]
+            assert tuple(
+                slot.material.name if slot.material else "" for slot in cube.material_slots
+            ) == slot_snapshot, "순차 진행 중 머티리얼 슬롯이 바뀌었습니다."
+            assert tuple(polygon.material_index for polygon in cube.data.polygons) == index_snapshot
+            assert len(bpy.data.materials) == material_count_before, "임시 머티리얼이 남았습니다."
+            if step >= 1:
+                # 앞 시점만 칠한 부분 베이크는 미채색 픽셀을 남겨야 하고, 그 회색이
+                # 다음 시점 가이드 렌더에 실제로 보여야 한다.
+                stats = progress["partial_bake_stats"]
+                assert stats["unpainted_pixels"] > 0, stats
+                assert stats["resolution"] <= 1024, stats
+                view = progress["sequence_views"][step].lower()
+                guide = bpy.data.images.load(progress["guides"][view], check_existing=False)
+                try:
+                    guide_pixels = guide.pixels[:]
+                    gray = 0
+                    painted = 0
+                    for offset in range(0, len(guide_pixels), 4 * 13):
+                        r, g, b = guide_pixels[offset : offset + 3]
+                        if min(r, g, b) > 0.93:
+                            continue  # 흰 배경
+                        # 미채색 회색은 무채색, 앞 시점 색은 채도가 있다. 경계의 혼합은 둘 다 아니다.
+                        if max(r, g, b) - min(r, g, b) < 0.08:
+                            gray += 1
+                        elif max(r, g, b) - min(r, g, b) > 0.25:
+                            painted += 1
+                finally:
+                    bpy.data.images.remove(guide)
+                assert gray > 0, f"{view} 가이드에 미채색 회색 영역이 없습니다."
+                gray_guides += 1
+                if step == 1:
+                    # RIGHT 가이드에서 FRONT가 비스듬히 칠한 색은 회색 마커에 밀려야 하므로
+                    # 오른쪽 면 대부분이 회색이어야 한다.
+                    assert gray > painted, (gray, painted)
+            assert run.poll_process() is None
+        assert len(sequential_calls) == 6, len(sequential_calls)
+        assert gray_guides == 5, gray_guides
+        # 첫 요청은 회색 실루엣 채색, 이후 요청은 채색된 부분 유지 지시여야 한다.
+        assert "회색" in sequential_calls[0]["prompt"]
+        assert all("한 픽셀도 바꾸지 않고" in call["prompt"] for call in sequential_calls[1:])
+        assert all(len(call["image_paths"]) == 1 for call in sequential_calls)
+        assert all(call["aspect_ratio"] == "1:1" for call in sequential_calls)
+        assert [step for _status, step in seen_steps] == [0, 1, 2, 3, 4, 5], seen_steps
+        sequential_state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert sequential_state["status"] == "ALBEDO_APPLIED", settings.texture_status
+        assert sequential_state["generation_mode"] == "SEQUENTIAL"
+        assert set(sequential_state["views"]) == {"front", "right", "back", "left", "top", "bottom"}
+        # 순차 모드도 완료 후 같은 실루엣 리포트와 적용 후 검증을 남긴다.
+        assert set(sequential_state["silhouette_report"]) >= {"FRONT", "RIGHT", "BACK"}, sequential_state["silhouette_report"]
+        assert set(sequential_state["verification"]["views"]) == {"FRONT", "RIGHT", "BACK", "LEFT", "TOP", "BOTTOM"}
+        Path(sequential_state["verification"]["sheet"]).unlink(missing_ok=True)
+        # 가이드와 부분 베이크는 완료 후 남기지 않는다.
+        assert sequential_state["guides"] == {}, sequential_state["guides"]
+        stem = Path(sequential_calls[0]["output_path"]).name.split("_seq_")[0]
+        leftovers = sorted(
+            path.name
+            for path in Path(sequential_calls[0]["output_path"]).parent.glob(f"{stem}_seq_*")
+            if path.name.endswith("_guide.png") or path.name.endswith("_seq_partial.png")
+        )
+        assert not leftovers, leftovers
+        assert all(Path(path).is_file() for path in sequential_state["views"].values())
+        sequential_diffuse = Path(settings.texture_diffuse_path)
+        assert sequential_diffuse.is_file()
+        assert sequential_state["albedo_path"] == str(sequential_diffuse)
+        # 최종 베이크는 부분 베이크와 같은 블렌딩 설정을 써야 한다.
+        assert sequential_state["bake_settings"]["layout"] == "SIX"
+        # 완료된 상태는 초기화 연산자로 지울 수 있고, 지우면 베이크 버튼이 꺼진다.
+        assert bpy.ops.uvmapping.reset_texture_state() == {"FINISHED"}
+        assert cube.get(texture_module.TEXTURE_DESIGN_STATE_PROPERTY) is None
+        assert not texture_module.can_bake_diffuse(bpy.context)
+        sequential_diffuse.unlink(missing_ok=True)
+        for path in sequential_state["views"].values():
+            Path(path).unlink(missing_ok=True)
+        settings.target_objects.clear()
+        settings.generation_mode = "SINGLE"
+        settings.turnaround_layout = "SIX"
     finally:
         texture_module.subprocess.Popen = original_popen
         bpy.context.preferences.system.use_online_access = online
@@ -224,8 +444,24 @@ def main() -> None:
         "texture_analysis_json",
         "texture_output_path",
         "texture_diffuse_path",
+        "turnaround_layout",
+        "turnaround_image_size",
+        "blend_exponent",
+        "harmonize_view_colors",
+        "silhouette_warp",
+        "generation_mode",
+        "auto_regenerate_attempts",
+        "verify_after_bake",
     ):
         assert properties.get(name) is not None, f"AI 텍스처 속성이 없습니다: {name}"
+    assert settings.turnaround_layout == "SIX"
+    assert settings.generation_mode == "SINGLE"
+    # 비용 절충: 기본은 자동(6면도 2K, 3면도 1K)이고 4K는 사용자가 직접 고른다.
+    assert settings.turnaround_image_size == "AUTO"
+    assert settings.auto_regenerate_attempts == 1
+    assert settings.verify_after_bake is True
+    # 행 워프는 캐릭터에서 몸통 중앙을 흔들므로 실험 옵션(기본 꺼짐)이다.
+    assert settings.silhouette_warp is False
     assert properties.get("texture_api_key") is None, "API 키가 Scene 속성에 남아 있습니다."
     # 구 Provider별 키·모델 속성은 완전히 사라져야 한다.
     for gone in (
@@ -483,8 +719,12 @@ def main() -> None:
         scene.view_settings.view_transform,
         scene.view_settings.look,
     )
-    view_paths = texture_module._render_model_views(bpy.context, (cube,))
-    assert len(view_paths) == 3 and all(path.is_file() for path in view_paths)
+    pipeline_module = importlib.import_module(f"{MODULE_NAME}.uvmapping.texture_pipeline")
+    six_layout = pipeline_module.TURNAROUND_LAYOUTS["SIX"]
+    three_layout = pipeline_module.TURNAROUND_LAYOUTS["THREE"]
+    view_paths = texture_module._render_model_views(bpy.context, (cube,), None, six_layout.views)
+    assert tuple(view_paths) == six_layout.views, tuple(view_paths)
+    assert all(path.is_file() for path in view_paths.values())
     assert saved_render == (
         scene.camera,
         scene.render.engine,
@@ -504,25 +744,52 @@ def main() -> None:
     ), "모델 캡처가 Scene 렌더 설정을 복구하지 못했습니다."
     assert bpy.data.objects.get("UVMapping AI 임시 카메라") is None
 
-    sheet_path = view_paths[0].parent / "test_contact_sheet.png"
-    texture_module._join_horizontal(view_paths, sheet_path)
-    assert sheet_path.is_file()
-    assert texture_module.validate_reference_image_path(sheet_path)[1] == "image/png"
-    # contact sheet는 생성 요청과 같은 21:9여야 AI가 열 배치를 그대로 따라 그린다.
-    sheet_width = texture_module.MODEL_CAPTURE_RESOLUTION * 3
-    sheet_height = round(sheet_width / texture_module.CONTACT_SHEET_ASPECT)
+    capture = texture_module.MODEL_CAPTURE_RESOLUTION
+    first_dir = next(iter(view_paths.values())).parent
+
+    # 6면도 contact sheet: 정사각 셀 3×2는 그대로 3:2라 여백 없이 이어진다.
+    six_sheet_path = first_dir / "test_contact_sheet_six.png"
+    texture_module._join_grid(tuple(view_paths.values()), six_layout, six_sheet_path)
+    assert six_sheet_path.is_file()
+    assert texture_module.validate_reference_image_path(six_sheet_path)[1] == "image/png"
+    sheet = bpy.data.images.load(str(six_sheet_path), check_existing=False)
+    sheet_width = capture * 3
+    try:
+        assert tuple(sheet.size) == (capture * 3, capture * 2), tuple(sheet.size)
+        # 둘째 행(LEFT/TOP/BOTTOM)이 캔버스 아래쪽에 놓여야 하므로 아래쪽 셀 중앙에
+        # 회색 모델이 있어야 한다(흰 배경이 아님).
+        center_bottom = ((capture // 2) * sheet_width + capture // 2) * 4
+        assert sheet.pixels[center_bottom] < 0.9, "둘째 행 셀 중앙에 모델이 캡처되지 않았습니다."
+    finally:
+        bpy.data.images.remove(sheet)
+
+    crops = texture_module._crop_turnaround(six_sheet_path, six_layout)
+    assert tuple(crops) == tuple(view.lower() for view in six_layout.views), tuple(crops)
+    for crop_path in crops.values():
+        assert crop_path.is_file()
+        crop = bpy.data.images.load(str(crop_path), check_existing=False)
+        try:
+            assert tuple(crop.size) == (capture, capture)
+        finally:
+            bpy.data.images.remove(crop)
+
+    # 3면도 contact sheet는 생성 요청과 같은 21:9여야 AI가 열 배치를 그대로 따라 그린다.
+    three_paths = tuple(view_paths[view] for view in three_layout.views)
+    sheet_path = first_dir / "test_contact_sheet.png"
+    texture_module._join_grid(three_paths, three_layout, sheet_path)
+    sheet_height = round(sheet_width / (21.0 / 9.0))
     sheet = bpy.data.images.load(str(sheet_path), check_existing=False)
     try:
         assert tuple(sheet.size) == (sheet_width, sheet_height), tuple(sheet.size)
     finally:
         bpy.data.images.remove(sheet)
 
-    crop_paths = texture_module._crop_turnaround(sheet_path)
+    crop_paths = tuple(texture_module._crop_turnaround(sheet_path, three_layout).values())
     assert len(crop_paths) == 3 and all(path.is_file() for path in crop_paths)
     for crop_path in crop_paths:
         crop = bpy.data.images.load(str(crop_path), check_existing=False)
         try:
-            assert tuple(crop.size) == (texture_module.MODEL_CAPTURE_RESOLUTION, sheet_height)
+            assert tuple(crop.size) == (capture, sheet_height)
         finally:
             bpy.data.images.remove(crop)
 

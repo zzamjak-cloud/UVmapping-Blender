@@ -12,6 +12,8 @@ import binascii
 import re
 from typing import Any, Mapping, Sequence
 
+from .texture_pipeline import ASPECT_RATIO_OPTIONS, IMAGE_SIZE_OPTIONS
+
 
 BASE_URL = "https://openrouter.ai/api/v1"
 CHAT_COMPLETIONS_ENDPOINT = "chat/completions"
@@ -21,6 +23,9 @@ DEFAULT_ANALYSIS_MODEL = "google/gemini-3.7-flash"
 DEFAULT_IMAGE_MODEL = "google/gemini-3-pro-image"
 DEFAULT_ASPECT_RATIO = "21:9"
 DEFAULT_RESOLUTION = "2K"
+# OpenRouter /images가 받는 해상도 등급. 레이아웃 종횡비는 호출자가 명시한다.
+# 해상도·종횡비 화이트리스트는 파이프라인 레이아웃 계약 한 곳에서만 정의한다.
+RESOLUTION_OPTIONS = IMAGE_SIZE_OPTIONS
 
 # 애드온 사용량을 OpenRouter 대시보드에서 구분하기 위한 선택적 출처 헤더.
 APP_TITLE = "UV Mapping Blender"
@@ -174,8 +179,12 @@ def build_turnaround_payload(
 
     prompt_value = _require_non_empty_text(prompt, "3면도 프롬프트")
     model_value = validate_model_slug(model)
-    aspect_value = _require_non_empty_text(aspect_ratio, "이미지 종횡비")
-    resolution_value = _require_non_empty_text(resolution, "이미지 해상도")
+    aspect_value = _require_non_empty_text(aspect_ratio, "이미지 종횡비").strip()
+    if aspect_value not in ASPECT_RATIO_OPTIONS:
+        raise ValueError(f"이미지 종횡비는 {', '.join(ASPECT_RATIO_OPTIONS)} 중 하나여야 합니다.")
+    resolution_value = _require_non_empty_text(resolution, "이미지 해상도").strip()
+    if resolution_value not in RESOLUTION_OPTIONS:
+        raise ValueError(f"이미지 해상도는 {', '.join(RESOLUTION_OPTIONS)} 중 하나여야 합니다.")
     if not images:
         raise ValueError("모델 contact sheet가 최소 한 장 필요합니다.")
     if len(images) > MAX_INPUT_REFERENCES:

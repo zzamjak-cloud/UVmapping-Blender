@@ -5,6 +5,7 @@ from bpy.props import (
     BoolProperty,
     CollectionProperty,
     EnumProperty,
+    FloatProperty,
     IntProperty,
     PointerProperty,
     StringProperty,
@@ -135,6 +136,91 @@ class UVMAPPING_PG_settings(PropertyGroup):
         min=0,
         max=256,
         subtype="PIXEL",
+    )
+    turnaround_layout: EnumProperty(
+        name="다면도 구성",
+        description="한 번의 호출로 생성할 시점 구성입니다. 6면도는 상·하·좌 시점까지 실제 그림으로 받아 투영합니다",
+        items=(
+            ("THREE", "3면도 · 21:9", "FRONT, RIGHT, BACK 3열 · 21:9 · 1회 호출"),
+            (
+                "SIX",
+                "6면도 · 3:2",
+                "FRONT, RIGHT, BACK / LEFT, TOP, BOTTOM 3×2 · 3:2 · 1회 호출, 상·하·좌 포함",
+            ),
+        ),
+        default="SIX",
+    )
+    generation_mode: EnumProperty(
+        name="생성 방식",
+        description=(
+            "SINGLE은 모든 시점을 한 장에 담아 한 번만 호출합니다. "
+            "SEQUENTIAL은 시점을 하나씩 생성하며 앞 시점의 투영 결과를 다음 가이드로 넘겨 "
+            "시점 간 색·무늬 일관성을 높이지만, 시점 수만큼 호출하므로 비용이 N배입니다"
+        ),
+        items=(
+            ("SINGLE", "한 번 호출 · 다면도 한 장", "모든 시점을 한 캔버스에 담아 1회 호출"),
+            (
+                "SEQUENTIAL",
+                "순차 인페인팅 · 시점 수만큼 호출",
+                "시점마다 1회씩 호출해 앞 시점의 채색을 유지한 채 빈 곳만 채움 · 비용 N배",
+            ),
+        ),
+        default="SINGLE",
+    )
+    turnaround_image_size: EnumProperty(
+        name="생성 이미지 크기",
+        description=(
+            "Provider에 요청할 다면도 캔버스 해상도입니다. 자동은 6면도 2K(시점당 512px), "
+            "3면도 1K를 씁니다. 4K는 시점당 해상도가 두 배지만 호출 비용이 커지므로 직접 선택할 때만 씁니다"
+        ),
+        items=(
+            ("AUTO", "자동", "6면도 2K · 3면도 1K · 순차 모드 시점당 1K"),
+            ("1K", "1K", "1K 캔버스 · 6면도 시점당 약 256px"),
+            ("2K", "2K", "2K 캔버스 · 6면도 시점당 512px"),
+            ("4K", "4K", "4K 캔버스 · 6면도 시점당 1024px · 비용 주의"),
+        ),
+        default="AUTO",
+    )
+    auto_regenerate_attempts: IntProperty(
+        name="실루엣 불일치 시 자동 재생성",
+        description=(
+            "생성 직후 시점별 실루엣을 모델과 비교해 내부 구조가 어긋난 시점이 있으면 교정 지시를 붙여 "
+            "다시 생성하는 최대 횟수입니다. 재생성마다 OpenRouter 호출과 비용이 추가됩니다. 0이면 경고만 남깁니다"
+        ),
+        default=1,
+        min=0,
+        max=2,
+    )
+    verify_after_bake: BoolProperty(
+        name="적용 후 검증",
+        description=(
+            "Diffuse/Albedo 적용 뒤 모델을 각 시점에서 다시 렌더해 생성 그림과 비교한 점수와 "
+            "검증 시트(가이드/생성/베이크 렌더)를 남깁니다. 로컬 처리라 추가 비용은 없습니다"
+        ),
+        default=True,
+    )
+    blend_exponent: FloatProperty(
+        name="시점 전이 폭",
+        description="시점 경계에서 색을 섞는 폭을 정합니다. 값이 클수록 전이가 좁아져 측면 색이 정면으로 덜 번집니다",
+        default=4.0,
+        min=2.0,
+        max=8.0,
+        step=50,
+        precision=1,
+    )
+    harmonize_view_colors: BoolProperty(
+        name="시점 간 색조 보정",
+        description="두 시점이 함께 보는 면의 평균색을 비교해 측면·뒷면의 밝기와 색조를 정면 기준으로 맞춥니다",
+        default=True,
+    )
+    silhouette_warp: BoolProperty(
+        name="실루엣 행 워프 (실험적)",
+        description=(
+            "생성된 그림의 실루엣 폭을 모델 투영 실루엣에 행 단위로 맞춥니다. "
+            "팔다리가 없는 소품처럼 줄마다 부위가 하나인 형상에서만 켜세요. "
+            "캐릭터에서는 몸통 중앙이 흔들릴 수 있습니다"
+        ),
+        default=False,
     )
     target_objects: CollectionProperty(
         name="대상 객체",

@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "uvmapping_blender"
-version = "2.2.0"
+version = "2.3.0"
 name = "UV Mapping Blender"
 tagline = "AI 3면도로 기존 UV에 손맵 텍스처를 만들어 베이크합니다"
 maintainer = "zzamjak-cloud"

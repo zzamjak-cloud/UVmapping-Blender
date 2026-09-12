@@ -157,6 +157,18 @@ def test_turnaround_payload_fixes_one_image_and_passes_references() -> None:
     json.dumps(payload, ensure_ascii=False)
 
 
+def test_turnaround_payload_rejects_aspect_ratio_outside_layout_contract() -> None:
+    for aspect_ratio in ("4:3", "", "21/9"):
+        try:
+            build_turnaround_payload("3면도", (("image/png", _PNG),), aspect_ratio=aspect_ratio)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"레이아웃 계약 밖 종횡비를 거부해야 합니다: {aspect_ratio!r}")
+    for aspect_ratio in ("1:1", "3:2", "21:9"):
+        assert build_turnaround_payload("3면도", (("image/png", _PNG),), aspect_ratio=aspect_ratio)["aspect_ratio"] == aspect_ratio
+
+
 def test_turnaround_payload_enforces_openrouter_reference_limit() -> None:
     too_many = tuple(("image/png", _PNG) for _ in range(MAX_INPUT_REFERENCES + 1))
     _expect_error(
@@ -166,6 +178,56 @@ def test_turnaround_payload_enforces_openrouter_reference_limit() -> None:
     _expect_error(lambda: build_turnaround_payload("p", ()), "contact sheet가 최소 한 장")
     _expect_error(lambda: build_turnaround_payload("", (("image/png", _PNG),)),
                   "3면도 프롬프트이(가) 비어 있습니다")
+    _expect_error(
+        lambda: build_turnaround_payload("p", (("image/png", _PNG),), resolution="8K"),
+        "1K, 2K, 4K",
+    )
+    grid = build_turnaround_payload("p", (("image/png", _PNG),), aspect_ratio="3:2", resolution="4K")
+    assert (grid["aspect_ratio"], grid["resolution"], grid["n"]) == ("3:2", "4K", 1)
+
+
+def test_worker_forwards_layout_aspect_ratio_and_resolution() -> None:
+    """작업 JSON의 종횡비·해상도가 네트워크 호출 본문까지 그대로 전달되는지 본다."""
+
+    from uvmapping import texture_worker
+
+    captured: list[tuple[str, dict]] = []
+    png_bytes = base64.b64decode(_PNG) + b"\x00\x00\x00\x00IEND\xaeB`\x82"
+
+    def fake_request(endpoint, api_key, payload):
+        captured.append((endpoint, payload))
+        return {"data": [{"b64_json": base64.b64encode(png_bytes).decode("ascii")}]}
+
+    original = texture_worker._openrouter_request
+    texture_worker._openrouter_request = fake_request
+    try:
+        with tempfile.TemporaryDirectory(prefix="uvmapping-worker-layout-") as temp_dir:
+            sheet = Path(temp_dir) / "sheet.png"
+            sheet.write_bytes(png_bytes)
+            output = Path(temp_dir) / "result.png"
+            base_job = {
+                "action": "turnaround",
+                "model": DEFAULT_IMAGE_MODEL,
+                "prompt": "p",
+                "image_paths": [str(sheet)],
+                "output_path": str(output),
+            }
+            result = texture_worker.run_job(
+                {**base_job, "aspect_ratio": "3:2", "resolution": "4K"}, "sk-or-v1-test"
+            )
+            assert result["ok"] is True and Path(result["output_path"]).is_file()
+            endpoint, payload = captured[-1]
+            assert endpoint == IMAGES_ENDPOINT
+            assert (payload["aspect_ratio"], payload["resolution"]) == ("3:2", "4K")
+            # 값이 없으면 기존 기본값을 유지한다.
+            texture_worker.run_job(base_job, "sk-or-v1-test")
+            payload = captured[-1][1]
+            assert (payload["aspect_ratio"], payload["resolution"]) == (
+                DEFAULT_ASPECT_RATIO,
+                DEFAULT_RESOLUTION,
+            )
+    finally:
+        texture_worker._openrouter_request = original
 
 
 def test_image_response_requires_exactly_one_decodable_image() -> None:
