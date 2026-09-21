@@ -681,11 +681,16 @@ def test_settings_ui_exposes_only_ai_texturing_controls() -> None:
         encoding="utf-8"
     )
     ui_source = (root / "uvmapping" / "ui.py").read_text(encoding="utf-8")
+    presets_source = (root / "uvmapping" / "texture_presets.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "texture_resolution: EnumProperty" in properties_source
     assert "padding_pixels: IntProperty" in properties_source
-    assert '("256", "256 px"' in properties_source
-    assert '("512", "512 px"' in properties_source
+    # 텍스처 크기 선택지는 순수 모듈에서 정의하고 프로퍼티가 그대로 쓴다.
+    assert "items=TEXTURE_RESOLUTION_OPTIONS" in properties_source
+    assert '("256", "256 px"' in presets_source
+    assert '("512", "512 px"' in presets_source
     assert 'name="UV 패딩"' in properties_source
     assert 'default="1024"' in properties_source
     assert "default=16" in properties_source
@@ -704,8 +709,8 @@ def test_settings_ui_exposes_only_ai_texturing_controls() -> None:
     ):
         assert removed not in properties_source
 
-    assert 'output_box.prop(settings, "texture_resolution")' in ui_source
-    assert 'output_box.prop(settings, "padding_pixels")' in ui_source
+    assert 'advanced.prop(settings, "texture_resolution")' in ui_source
+    assert 'advanced.prop(settings, "padding_pixels")' in ui_source
     assert 'bl_label = "AI 손맵 텍스처"' in ui_source
     for removed in (
         "uvmapping.auto_unwrap",

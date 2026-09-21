@@ -155,10 +155,11 @@ def _run_turnaround_group(group: dict, api_key: str) -> dict:
     작업 JSON에 실려 온 값만 사용하므로 호출 사이에 공유하는 상태가 없다.
     """
 
-    # 종횡비와 해상도는 레이아웃 계약에서 오므로 작업 JSON 값을 그대로 전달한다.
+    # 종횡비·해상도·품질 등급은 레이아웃 계약과 모델 능력치에서 오므로
+    # 작업 JSON에 실린 값만 그대로 전달한다. quality는 선택 필드다.
     options = {
         key: str(group[key])
-        for key in ("aspect_ratio", "resolution")
+        for key in ("aspect_ratio", "resolution", "quality")
         if group.get(key) is not None
     }
     payload = build_turnaround_payload(

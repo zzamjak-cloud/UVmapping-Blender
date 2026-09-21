@@ -9,8 +9,10 @@ import inspect
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
+import types
 
 import bpy
 
@@ -88,7 +90,363 @@ print(f"UVMAPPING_API_KEY_STATE={{openrouter_configured}}")
     return value == "1"
 
 
-def _check_full_pipeline(texture_module, bake_module) -> None:
+class _FakeOperatorProperties(types.SimpleNamespace):
+    """레이아웃 스텁이 돌려주는 연산자 프로퍼티. filepath·url 대입만 받으면 된다."""
+
+
+class _FakeLayout:
+    """패널 draw가 부르는 레이아웃을 흉내 내 프로퍼티·연산자 이름을 실제로 검사한다."""
+
+    def __init__(self, record):
+        self.record = record
+        self.enabled = True
+        self.alert = False
+        self.scale_y = 1.0
+
+    def box(self, *_arguments, **_keywords):
+        return _FakeLayout(self.record)
+
+    row = box
+    column = box
+    grid_flow = box
+
+    def label(self, text="", icon="NONE"):
+        self.record["labels"].append(str(text))
+
+    def prop(self, data, property, **_keywords):
+        assert data.bl_rna.properties.get(property) is not None, (
+            f"패널이 없는 프로퍼티를 그립니다: {property}"
+        )
+        self.record["props"].append(property)
+
+    def operator(self, idname, **_keywords):
+        module, _separator, name = idname.partition(".")
+        assert hasattr(getattr(bpy.ops, module), name), f"등록되지 않은 연산자입니다: {idname}"
+        self.record["operators"].append(idname)
+        return _FakeOperatorProperties()
+
+    def template_list(
+        self,
+        _listtype_name,
+        _list_id,
+        dataptr,
+        propname,
+        active_dataptr,
+        active_propname,
+        **_keywords,
+    ):
+        assert dataptr.bl_rna.properties.get(propname) is not None, propname
+        assert active_dataptr.bl_rna.properties.get(active_propname) is not None, active_propname
+        self.record["lists"].append(propname)
+
+
+def _draw_panel(ui_module) -> dict:
+    """등록된 Panel 클래스의 draw를 순수 파이썬 숙주에 붙여 예외 없이 실행한다."""
+
+    panel = ui_module.UVMAPPING_PT_ai_texture
+    members = {
+        name: value
+        for name, value in vars(panel).items()
+        if name not in ("__dict__", "__weakref__")
+    }
+    probe_type = type("UVMappingPanelProbe", (object,), members)
+    probe = probe_type()
+    record = {"labels": [], "props": [], "operators": [], "lists": []}
+    probe.layout = _FakeLayout(record)
+    probe.draw(bpy.context)
+    return record
+
+
+def _check_panel_draw(ui_module, settings) -> None:
+    """기본·고급·전문가 상태에서 패널이 그려지고, 기본 화면 노출 항목이 최소로 유지되는지."""
+
+    original_key = os.environ.get("OPENROUTER_API_KEY")
+    online = bpy.context.preferences.system.use_online_access
+    os.environ["OPENROUTER_API_KEY"] = "stub-key"
+    bpy.context.preferences.system.use_online_access = True
+    try:
+        settings.reference_images.clear()
+        settings.target_objects.clear()
+        settings.texture_output_path = ""
+        settings.texture_diffuse_path = ""
+        settings.show_texture_advanced = False
+        settings.show_texture_expert = False
+
+        basic = _draw_panel(ui_module)
+        assert tuple(basic["props"]) == (
+            "texture_user_prompt",
+            "texture_quality_preset",
+            "texture_model_preset",
+            "show_texture_advanced",
+        ), basic["props"]
+        assert basic["lists"] == ["reference_images"], basic["lists"]
+        assert "uvmapping.generate_turnaround" in basic["operators"], basic["operators"]
+        # 정상 상태에서는 키·온라인 경고를 띄우지 않는다.
+        assert not any("사용 가능" in label for label in basic["labels"]), basic["labels"]
+        assert not any("API 키가 필요" in label for label in basic["labels"]), basic["labels"]
+
+        settings.show_texture_advanced = True
+        advanced = _draw_panel(ui_module)
+        for name in (
+            "turnaround_layout",
+            "turnaround_image_size",
+            "generation_mode",
+            "auto_regenerate_attempts",
+            "texture_resolution",
+            "padding_pixels",
+            "auto_apply_diffuse",
+            "verify_after_bake",
+            "show_texture_expert",
+        ):
+            assert name in advanced["props"], name
+        for hidden in ("blend_exponent", "texture_image_model"):
+            assert hidden not in advanced["props"], hidden
+
+        settings.show_texture_expert = True
+        expert = _draw_panel(ui_module)
+        for name in (
+            "blend_exponent",
+            "harmonize_view_colors",
+            "silhouette_warp",
+            "texture_analysis_model",
+            "texture_image_model",
+        ):
+            assert name in expert["props"], name
+
+        # 해상도 대신 품질 단계를 받는 모델은 그 사실을 기본 화면에 알린다.
+        # Provider 능력치 헬퍼가 없는 빌드에서도 패널은 그려져야 하므로 있을 때만 검사한다.
+        settings.texture_quality_preset = "HIGH"
+        settings.texture_model_preset = "GPT_IMAGE_25_SUNBURST"
+        gpt_panel = _draw_panel(ui_module)
+        assert any("1K 고정 · 품질 단계 xhigh" in label for label in gpt_panel["labels"]), (
+            gpt_panel["labels"]
+        )
+        # 고급 설정에서도 효과 없는 "생성 이미지 크기" 대신 품질 단계를 보여 준다.
+        assert "texture_image_quality" in gpt_panel["props"], gpt_panel["props"]
+        assert "turnaround_image_size" not in gpt_panel["props"], gpt_panel["props"]
+        assert any("시점당 픽셀이 낮고" in label for label in gpt_panel["labels"]), (
+            gpt_panel["labels"]
+        )
+        # 모델 상한을 넘는 등급은 낮춰 보내며, 패널도 낮아진 값을 보여야 한다.
+        settings.texture_model_preset = "GPT_IMAGE"
+        clamped_panel = _draw_panel(ui_module)
+        assert any("품질 단계 high" in label for label in clamped_panel["labels"]), (
+            clamped_panel["labels"]
+        )
+        assert any(
+            "xhigh는 이 모델의 상한을 넘어 high로" in label for label in clamped_panel["labels"]
+        ), clamped_panel["labels"]
+        settings.texture_model_preset = "NANO_BANANA_PRO"
+        gemini_panel = _draw_panel(ui_module)
+        assert not any("1K 고정" in label for label in gemini_panel["labels"])
+        assert "turnaround_image_size" in gemini_panel["props"], gemini_panel["props"]
+        assert "texture_image_quality" not in gemini_panel["props"], gemini_panel["props"]
+
+        # 저장된 세부 값이 프리셋 표와 어긋나면 값을 덮어쓰지 않고 표시로만 알린다.
+        settings.texture_quality_preset = "STANDARD"
+        assert not any(
+            "사용자 지정 상태" in label for label in _draw_panel(ui_module)["labels"]
+        )
+        properties_module = importlib.import_module(f"{MODULE_NAME}.uvmapping.properties")
+        stored = settings.texture_resolution
+        properties_module._APPLYING_QUALITY_PRESET = True
+        try:
+            # 구버전 씬을 흉내 낸다: 프리셋 표시는 STANDARD인데 세부 값만 다르다.
+            settings.texture_resolution = "512"
+        finally:
+            properties_module._APPLYING_QUALITY_PRESET = False
+        assert settings.texture_quality_preset == "STANDARD"
+        mismatched = _draw_panel(ui_module)
+        assert any("사용자 지정 상태" in label for label in mismatched["labels"]), (
+            mismatched["labels"]
+        )
+        settings.texture_quality_preset = "STANDARD"
+        settings.texture_resolution = stored
+
+        # 참조가 있으면 고급 설정에 분석 버튼과 참조 전달 옵션이 나타난다.
+        reference = settings.reference_images.add()
+        reference.path = str(Path(__file__))
+        with_references = _draw_panel(ui_module)
+        assert "send_reference_images" in with_references["props"]
+        assert "uvmapping.analyze_references" in with_references["operators"]
+        settings.reference_images.clear()
+    finally:
+        settings.show_texture_advanced = False
+        settings.show_texture_expert = False
+        bpy.context.preferences.system.use_online_access = online
+        if original_key is None:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        else:
+            os.environ["OPENROUTER_API_KEY"] = original_key
+    print("[texture] 패널 draw(기본·고급·전문가) 통과")
+
+
+def _check_generation_chain(
+    texture_module,
+    bake_module,
+    ui_module,
+    settings,
+    cube,
+    grid_calls,
+    analysis_calls,
+    analysis_fails,
+) -> None:
+    """생성 버튼 하나가 참조 분석부터 이어서 실행하는지(스텁 작업자)."""
+
+    chain_dir = Path(tempfile.mkdtemp(prefix="uvmapping-chain-"))
+    leftovers: list[Path] = []
+    try:
+        reference_path = chain_dir / "chain_reference.png"
+        reference_path.write_bytes(
+            bake_module.encode_srgb_png(bytes((180, 140, 90, 255)) * (4 * 4), 4, 4)
+        )
+        settings.reference_images.clear()
+        reference = settings.reference_images.add()
+        reference.path = str(reference_path)
+        settings.texture_analysis_json = ""
+        settings.texture_analysis_reference_hash = ""
+        settings.auto_apply_diffuse = False
+        settings.auto_regenerate_attempts = 0
+        settings.send_reference_images = False
+        settings.target_objects.clear()
+        entry = settings.target_objects.add()
+        entry.object = cube
+        grid_calls.clear()
+        analysis_calls.clear()
+
+        # UV가 없는 대상이면 분석 호출조차 띄우지 않고 즉시 막혀야 한다.
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(6.0, 0.0, 0.0))
+        uvless = bpy.context.object
+        uvless.name = "UV 없는 대상"
+        while uvless.data.uv_layers:
+            uvless.data.uv_layers.remove(uvless.data.uv_layers[0])
+        settings.target_objects.clear()
+        entry = settings.target_objects.add()
+        entry.object = uvless
+        try:
+            # 연산자가 ERROR를 보고하면 bpy.ops는 RuntimeError로 올린다.
+            bpy.ops.uvmapping.generate_turnaround()
+        except RuntimeError as error:
+            assert "UV 맵이 없습니다" in str(error), str(error)
+        else:
+            raise AssertionError("UV가 없는 대상은 즉시 막혀야 합니다.")
+        assert not analysis_calls, "대상 검증 전에 분석을 띄우면 안 됩니다."
+        assert not texture_module._ACTIVE_RUNS
+        bpy.data.objects.remove(uvless, do_unlink=True)
+        settings.target_objects.clear()
+        entry = settings.target_objects.add()
+        entry.object = cube
+
+        # 분석 실패는 생성 실패와 구분되는 상태 메시지를 남기고 생성으로 넘어가지 않는다.
+        analysis_fails[0] = True
+        assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+        assert len(analysis_calls) == 1, analysis_calls
+        assert len(texture_module._ACTIVE_RUNS) == 1
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert not texture_module._ACTIVE_RUNS
+        assert settings.texture_status.startswith("참조 분석 실패: "), settings.texture_status
+        assert not grid_calls, grid_calls
+
+        # 분석이 성공하면 같은 버튼 한 번으로 생성까지 이어진다.
+        analysis_fails[0] = False
+        assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+        assert len(analysis_calls) == 2, analysis_calls
+        assert not grid_calls, "분석이 끝나기 전에 생성이 시작되면 안 됩니다."
+        assert len(texture_module._ACTIVE_RUNS) == 1
+        chain_payload = texture_module._ACTIVE_RUNS[0].payload
+        assert [name for name, _uid in chain_payload["target_keys"]] == [cube.name], chain_payload
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert settings.texture_analysis_json, settings.texture_status
+        assert settings.texture_analysis_reference_hash
+        assert len(texture_module._ACTIVE_RUNS) == 1, f"생성이 이어지지 않았습니다: {settings.texture_status}"
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert not texture_module._ACTIVE_RUNS
+        assert len(grid_calls) == 1, grid_calls
+        chain_state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert chain_state["status"] == "TURNAROUND_READY", settings.texture_status
+        assert texture_module.can_bake_diffuse(bpy.context)
+        assert not texture_module.has_applied_diffuse(bpy.context)
+        assert texture_module.can_generate_turnaround(bpy.context)
+        leftovers.append(Path(chain_state["turnaround_path"]))
+        leftovers.append(Path(chain_state["geometry_contact_sheet"]))
+        leftovers.extend(Path(path) for path in chain_state["views"].values())
+
+        # 분석 결과가 최신이면 분석을 건너뛰고 생성만 다시 실행한다.
+        grid_calls.clear()
+        assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+        assert len(analysis_calls) == 2, "최신 분석이 있으면 다시 분석하면 안 됩니다."
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert not texture_module._ACTIVE_RUNS
+        assert len(grid_calls) == 1, grid_calls
+        repeated_state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        leftovers.append(Path(repeated_state["turnaround_path"]))
+        leftovers.append(Path(repeated_state["geometry_contact_sheet"]))
+        leftovers.extend(Path(path) for path in repeated_state["views"].values())
+
+        # GPT 계열은 4K를 골라도 1K로 고정되고 품질 등급이 요청에 실린다.
+        # AUTO는 현재 프리셋(여기서는 CUSTOM)의 기본 등급인 high로 풀려야 한다.
+        settings.turnaround_image_size = "4K"
+        settings.texture_image_quality = "AUTO"
+        settings.texture_model_preset = "GPT_IMAGE_25_SUNBURST"
+        assert settings.texture_quality_preset == "CUSTOM", settings.texture_quality_preset
+        grid_calls.clear()
+        assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert not texture_module._ACTIVE_RUNS
+        assert len(grid_calls) == 1, grid_calls
+        assert grid_calls[0]["resolution"] == "1K", grid_calls[0]["resolution"]
+        assert grid_calls[0]["quality"] == "high", grid_calls[0]
+        auto_quality_state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert auto_quality_state["image_size"] == "1K", auto_quality_state["image_size"]
+        leftovers.append(Path(auto_quality_state["turnaround_path"]))
+        leftovers.append(Path(auto_quality_state["geometry_contact_sheet"]))
+        leftovers.extend(Path(path) for path in auto_quality_state["views"].values())
+
+        # 직접 고른 등급은 그대로 실린다.
+        settings.texture_image_quality = "XHIGH"
+        grid_calls.clear()
+        assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert not texture_module._ACTIVE_RUNS
+        assert grid_calls[0]["resolution"] == "1K", grid_calls[0]["resolution"]
+        assert grid_calls[0]["quality"] == "xhigh", grid_calls[0]
+        gpt_state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert gpt_state["image_size"] == "1K", gpt_state["image_size"]
+        assert gpt_state["quality"] == "xhigh", gpt_state.get("quality")
+        leftovers.append(Path(gpt_state["turnaround_path"]))
+        leftovers.append(Path(gpt_state["geometry_contact_sheet"]))
+        leftovers.extend(Path(path) for path in gpt_state["views"].values())
+
+        # Gemini 계열은 고른 크기를 그대로 쓰고 품질 등급을 보내지 않는다.
+        settings.texture_model_preset = "NANO_BANANA_PRO"
+        grid_calls.clear()
+        assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert not texture_module._ACTIVE_RUNS
+        assert grid_calls[0]["resolution"] == "4K", grid_calls[0]["resolution"]
+        assert "quality" not in grid_calls[0], grid_calls[0]
+        gemini_state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert gemini_state["quality"] == "", gemini_state.get("quality")
+        leftovers.append(Path(gemini_state["turnaround_path"]))
+        leftovers.append(Path(gemini_state["geometry_contact_sheet"]))
+        leftovers.extend(Path(path) for path in gemini_state["views"].values())
+    finally:
+        for path in leftovers:
+            path.unlink(missing_ok=True)
+        settings.reference_images.clear()
+        settings.target_objects.clear()
+        settings.texture_analysis_json = ""
+        settings.texture_analysis_reference_hash = ""
+        settings.auto_regenerate_attempts = 1
+        settings.turnaround_image_size = "AUTO"
+        settings.texture_image_quality = "AUTO"
+        settings.texture_model_preset = "NANO_BANANA_PRO"
+        cube.pop(texture_module.TEXTURE_DESIGN_STATE_PROPERTY, None)
+        shutil.rmtree(chain_dir, ignore_errors=True)
+    print("[texture] 분석→생성 체인 통과")
+
+
+def _check_full_pipeline(texture_module, bake_module, ui_module) -> None:
     """작업자를 스텁으로 바꿔 생성 -> 결과 회수 -> 베이크 -> 저장 전 구간을 검증한다."""
 
     original_popen = texture_module.subprocess.Popen
@@ -107,6 +465,9 @@ def _check_full_pipeline(texture_module, bake_module) -> None:
     sequential_calls: list[dict] = []
     grid_calls: list[dict] = []
     batch_calls: list[list] = []
+    analysis_calls: list[dict] = []
+    # True면 다음 분석 요청이 실패로 돌아온다(분석 실패와 생성 실패 구분 검사용).
+    analysis_fails = [False]
     # 이름이 여기 들어간 그룹은 작업자가 실패로 보고한다(부분 실패 경로 검사용).
     fail_groups: set = set()
     # True면 다음 격자 결과의 모든 셀 한가운데에 순백 세로 틈을 그려 가이드(틈 없는
@@ -184,6 +545,17 @@ def _check_full_pipeline(texture_module, bake_module) -> None:
         def __init__(self, arguments, **_kwargs):
             self.stdin = io.BytesIO()
             request = json.loads(Path(arguments[-2]).read_text(encoding="utf-8"))
+            if request.get("action") == "analyze":
+                analysis_calls.append(request)
+                response = (
+                    {"ok": False, "error": "스텁 분석 강제 실패"}
+                    if analysis_fails[0]
+                    else {"ok": True, "text": '{"object_summary": "스텁 참조 분석"}'}
+                )
+                Path(arguments[-1]).write_text(
+                    json.dumps(response, ensure_ascii=False), encoding="utf-8"
+                )
+                return
             if request.get("action") == "turnaround_batch":
                 groups = list(request["groups"])
                 batch_calls.append(groups)
@@ -366,6 +738,15 @@ def _check_full_pipeline(texture_module, bake_module) -> None:
         assert set(auto_state["views"]) == {"front", "right", "back"}
         auto_diffuse = Path(settings.texture_diffuse_path)
         assert auto_diffuse.is_file()
+        # 베이크는 무과금이므로 적용을 끝낸 뒤에도 다시 적용할 길이 남아야 한다.
+        assert settings.auto_apply_diffuse
+        assert texture_module.has_applied_diffuse(bpy.context)
+        assert texture_module.can_bake_diffuse(bpy.context)
+        applied_panel = _draw_panel(ui_module)
+        assert "uvmapping.bake_diffuse" in applied_panel["operators"], applied_panel["operators"]
+        assert not any(
+            "생성이 끝나면 자동으로 적용합니다" in label for label in applied_panel["labels"]
+        ), applied_panel["labels"]
         Path(auto_state["verification"]["sheet"]).unlink(missing_ok=True)
         auto_diffuse.unlink(missing_ok=True)
         settings.auto_regenerate_attempts = 1
@@ -637,6 +1018,17 @@ def _check_full_pipeline(texture_module, bake_module) -> None:
         settings.target_objects.clear()
         settings.generation_mode = "SINGLE"
         settings.turnaround_layout = "SIX"
+
+        _check_generation_chain(
+            texture_module,
+            bake_module,
+            ui_module,
+            settings,
+            cube,
+            grid_calls,
+            analysis_calls,
+            analysis_fails,
+        )
     finally:
         texture_module.subprocess.Popen = original_popen
         bpy.context.preferences.system.use_online_access = online
@@ -678,6 +1070,10 @@ def main() -> None:
         "generation_mode",
         "auto_regenerate_attempts",
         "verify_after_bake",
+        "texture_quality_preset",
+        "texture_image_quality",
+        "show_texture_advanced",
+        "show_texture_expert",
     ):
         assert properties.get(name) is not None, f"AI 텍스처 속성이 없습니다: {name}"
     assert settings.turnaround_layout == "SIX"
@@ -709,6 +1105,72 @@ def main() -> None:
     assert settings.texture_image_model == "openai/gpt-5.4-image-2"
     settings.texture_model_preset = "NANO_BANANA_PRO"
     assert settings.texture_image_model == "google/gemini-3-pro-image"
+    # GPT Image 2.5 계열 두 프리셋 추가. 기존 항목과 기본값은 그대로다.
+    assert preset_items["GPT_IMAGE_25_SUNBURST"].name == "GPT Image 2.5 Sunburst (정밀, 느리고 비쌈)"
+    assert preset_items["GPT_IMAGE_25_FLARE"].name == "GPT Image 2.5 Flare (속도 우선)"
+    for identifier in ("GPT_IMAGE_25_SUNBURST", "GPT_IMAGE_25_FLARE"):
+        assert "덕테이프" in preset_items[identifier].description, identifier
+        assert "품질 단계" in preset_items[identifier].description, identifier
+    settings.texture_model_preset = "GPT_IMAGE_25_SUNBURST"
+    assert settings.texture_analysis_model == "openai/gpt-5.6-sol"
+    assert settings.texture_image_model == "openai/gpt-image-2.5-sunburst"
+    settings.texture_model_preset = "GPT_IMAGE_25_FLARE"
+    assert settings.texture_image_model == "openai/gpt-image-2.5-flare"
+    settings.texture_model_preset = "NANO_BANANA_PRO"
+    assert settings.texture_image_model == "google/gemini-3-pro-image"
+
+    # 베이크 상한이 4096이므로 8192는 고를 수 없어야 한다.
+    resolution_items = tuple(properties["texture_resolution"].enum_items.keys())
+    assert "8192" not in resolution_items, resolution_items
+    assert max(int(value) for value in resolution_items) == 4096, resolution_items
+
+    # 품질 프리셋: 표대로 개별 값을 덮어쓰고, 개별 값을 직접 바꾸면 CUSTOM으로 내려간다.
+    presets_module = importlib.import_module(f"{MODULE_NAME}.uvmapping.texture_presets")
+    assert tuple(properties["texture_quality_preset"].enum_items.keys()) == (
+        "FAST",
+        "STANDARD",
+        "HIGH",
+        "CUSTOM",
+    )
+    assert settings.texture_quality_preset == "STANDARD"
+    for preset_name in ("FAST", "HIGH", "STANDARD"):
+        settings.texture_quality_preset = preset_name
+        expected = presets_module.QUALITY_PRESETS[preset_name]
+        assert settings.texture_quality_preset == preset_name, "프리셋 적용이 자신을 되돌렸습니다."
+        assert settings.turnaround_layout == expected["turnaround_layout"], preset_name
+        assert settings.turnaround_image_size == expected["turnaround_image_size"], preset_name
+        assert settings.texture_resolution == expected["texture_resolution"], preset_name
+        assert settings.auto_regenerate_attempts == expected["auto_regenerate_attempts"], preset_name
+        assert settings.verify_after_bake == expected["verify_after_bake"], preset_name
+        assert settings.texture_image_quality == expected["texture_image_quality"], preset_name
+    settings.texture_resolution = "4096"
+    assert settings.texture_quality_preset == "CUSTOM", "개별 값 변경이 CUSTOM으로 이어지지 않았습니다."
+    assert settings.texture_resolution == "4096", "CUSTOM 전환이 방금 고른 값을 되돌렸습니다."
+    settings.verify_after_bake = False
+    assert settings.texture_quality_preset == "CUSTOM"
+    settings.texture_quality_preset = "STANDARD"
+    assert settings.texture_resolution == "1024"
+    assert settings.verify_after_bake is True
+    # 같은 값을 다시 써도 프리셋 표시는 흔들리지 않아야 한다.
+    settings.turnaround_layout = "SIX"
+    assert settings.texture_quality_preset == "STANDARD"
+
+    # 품질 단계: AUTO는 프리셋 표의 등급을 따르므로 CUSTOM으로 내리지 않는다.
+    assert tuple(properties["texture_image_quality"].enum_items.keys()) == (
+        "AUTO",
+        "MEDIUM",
+        "HIGH",
+        "XHIGH",
+    )
+    settings.texture_image_quality = "AUTO"
+    assert settings.texture_quality_preset == "STANDARD"
+    assert presets_module.resolved_image_quality("STANDARD", "AUTO") == "high"
+    settings.texture_image_quality = "MEDIUM"
+    assert settings.texture_quality_preset == "CUSTOM"
+    # CUSTOM에서 AUTO를 고르면 정해진 기본 등급(high)을 쓴다.
+    assert presets_module.resolved_image_quality("CUSTOM", "AUTO") == "high"
+    settings.texture_quality_preset = "STANDARD"
+    assert settings.texture_image_quality == "HIGH"
 
     preferences_module = importlib.import_module(f"{MODULE_NAME}.uvmapping.properties")
     assert preferences_module.addon_module_id() == MODULE_NAME
@@ -743,6 +1205,18 @@ def main() -> None:
     assert texture_module._resolved_models(settings) == (
         "openai/gpt-5.6-sol",
         "openai/gpt-5.4-image-2",
+    )
+    # GPT 계열은 크기를 받지 않아 1K로 고정하고 품질 등급을 실어 보낸다.
+    assert texture_module.effective_image_size("google/gemini-3-pro-image", "4K") == "4K"
+    assert texture_module.effective_image_size("openai/gpt-image-2.5-sunburst", "4K") == "1K"
+    assert texture_module.provider_quality("google/gemini-3-pro-image", "XHIGH", "HIGH") is None
+    assert (
+        texture_module.provider_quality("openai/gpt-image-2.5-sunburst", "AUTO", "STANDARD")
+        == "high"
+    )
+    assert (
+        texture_module.provider_quality("openai/gpt-image-2.5-sunburst", "MEDIUM", "HIGH")
+        == "medium"
     )
     settings.texture_model_preset = "NANO_BANANA_PRO"
     # 키가 없으면 네트워크 호출 전에 안내와 함께 막혀야 한다.
@@ -1225,7 +1699,10 @@ def main() -> None:
         assert len(settings.reference_images) == 1
         settings.reference_images.clear()
 
-    _check_full_pipeline(texture_module, bake_module)
+    ui_module = importlib.import_module(f"{MODULE_NAME}.uvmapping.ui")
+    _check_panel_draw(ui_module, settings)
+
+    _check_full_pipeline(texture_module, bake_module, ui_module)
 
     _clear_scene()
     addon.unregister()

@@ -389,6 +389,57 @@ def test_retry_status_classification_covers_429_and_5xx_only() -> None:
 # --- 기존 단일 액션 회귀 ------------------------------------------------------
 
 
+def test_optional_quality_field_reaches_the_request_body() -> None:
+    """작업 JSON의 선택 필드 quality가 단일·배치 모두에서 본문까지 전달된다."""
+
+    captured: list = []
+
+    def fake_request(endpoint, api_key, payload):
+        captured.append(payload)
+        return _image_response()
+
+    gpt_model = "openai/gpt-image-2.5-sunburst"
+    with tempfile.TemporaryDirectory(prefix="uvmapping-worker-quality-") as temp_dir:
+        root = Path(temp_dir)
+        sheet = _write_sheet(root)
+        job = {
+            "action": "turnaround",
+            "model": gpt_model,
+            "prompt": "품질 지정",
+            "image_paths": [str(sheet)],
+            "output_path": str(root / "single.png"),
+            "aspect_ratio": "16:9",
+            "resolution": "1K",
+            "quality": "max",
+        }
+        with _PatchedWorker(_openrouter_request=fake_request):
+            assert texture_worker.run_job(job, "sk-or-v1-test")["ok"] is True
+
+            # quality가 없으면 이미지 크기 매핑으로 돌아간다.
+            without_quality = {k: v for k, v in job.items() if k != "quality"}
+            without_quality["output_path"] = str(root / "single-default.png")
+            assert texture_worker.run_job(without_quality, "sk-or-v1-test")["ok"] is True
+
+            # 배치 그룹도 같은 경로를 쓴다.
+            batch = {
+                "action": "turnaround_batch",
+                "groups": [
+                    _group_job(
+                        sheet,
+                        root / "group.png",
+                        "QUAD_FRONT",
+                        model=gpt_model,
+                        quality="low",
+                    )
+                ],
+            }
+            assert texture_worker.run_job(batch, "sk-or-v1-test")["ok"] is True
+
+    assert [payload.get("quality") for payload in captured] == ["max", "medium", "low"]
+    # resolution을 받지 않는 모델이므로 어느 경로에서도 키가 실리지 않는다.
+    assert all("resolution" not in payload for payload in captured)
+
+
 def test_single_turnaround_action_keeps_its_request_and_response_contract() -> None:
     """리팩터 후에도 "turnaround" 액션의 요청 본문과 응답 키가 그대로여야 한다."""
 

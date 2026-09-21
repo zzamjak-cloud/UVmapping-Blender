@@ -12,6 +12,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from uvmapping.texture_pipeline import (
+    IMAGE_QUALITY_OPTIONS,
     ALL_VIEWS,
     ASPECT_RATIO_OPTIONS,
     DEFAULT_LAYOUT_NAME,
@@ -361,6 +362,36 @@ def test_turnaround_request_follows_layout_contract() -> None:
         "시점(view)이 필요",
     )
     assert set(TURNAROUND_LAYOUTS) == {"THREE", "SIX"}
+
+
+def test_request_carries_optional_quality_grade() -> None:
+    sheet = InlineImage("image/png", "geometry-data", "geometry_contact_sheet", "model")
+    analysis = parse_reference_analysis('{"object_summary":"상자"}')
+    # 기본은 등급 없음: 크기를 받는 모델이 대부분이라 Provider가 알아서 정한다.
+    default = build_turnaround_request(sheet, [], analysis, "", layout_name="SIX")
+    assert default.quality is None
+    graded = build_turnaround_request(
+        sheet, [], analysis, "", layout_name="SIX", quality="xhigh"
+    )
+    assert graded.quality == "xhigh"
+    for grade in IMAGE_QUALITY_OPTIONS:
+        assert replace(graded, quality=grade).quality == grade
+    _expect_value_error(lambda: replace(graded, quality="ultra"), ", ".join(IMAGE_QUALITY_OPTIONS))
+    _expect_value_error(lambda: replace(graded, quality="XHIGH"), ", ".join(IMAGE_QUALITY_OPTIONS))
+
+
+def test_batch_request_applies_one_quality_grade_to_every_group() -> None:
+    sheets = {
+        group.name: InlineImage("image/png", f"{group.name}-data", "geometry_contact_sheet", group.name)
+        for group in resolve_composition("QUAD").groups
+    }
+    analysis = parse_reference_analysis('{"object_summary":"상자"}')
+    batch = build_turnaround_batch_request(
+        "QUAD", sheets, (), analysis, "", image_size="1K", quality="high"
+    )
+    assert all(request.quality == "high" for request in batch.requests)
+    plain = build_turnaround_batch_request("QUAD", sheets, (), analysis, "", image_size="1K")
+    assert all(request.quality is None for request in plain.requests)
 
 
 def test_sequential_view_prompt_paints_only_unpainted_regions() -> None:

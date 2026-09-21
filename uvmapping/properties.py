@@ -12,6 +12,17 @@ from bpy.props import (
 )
 from bpy.types import AddonPreferences, PropertyGroup
 
+from .texture_presets import (
+    AUTO_IMAGE_QUALITY,
+    DEFAULT_QUALITY_PRESET,
+    IMAGE_QUALITY_ITEMS,
+    QUALITY_PRESET_FIELDS,
+    QUALITY_PRESET_ITEMS,
+    TEXTURE_RESOLUTION_OPTIONS,
+    quality_preset_after_change,
+    quality_preset_values,
+)
+
 
 def addon_module_id() -> str:
     """현재 설치 방식에서 Blender가 사용하는 Extension 루트 모듈 ID를 반환한다."""
@@ -68,10 +79,16 @@ class UVMAPPING_AP_preferences(AddonPreferences):
 # OpenRouter 모델 식별자는 "제공자/모델" 형식이며 (분석 모델, 이미지 모델) 순서다.
 NANO_BANANA_PRO_MODELS = ("google/gemini-3.7-flash", "google/gemini-3-pro-image")
 GPT_IMAGE_MODELS = ("openai/gpt-5.6-sol", "openai/gpt-5.4-image-2")
+GPT_IMAGE_25_SUNBURST_MODELS = ("openai/gpt-5.6-sol", "openai/gpt-image-2.5-sunburst")
+GPT_IMAGE_25_FLARE_MODELS = ("openai/gpt-5.6-sol", "openai/gpt-image-2.5-flare")
 MODEL_PRESETS = {
     "NANO_BANANA_PRO": NANO_BANANA_PRO_MODELS,
     "GPT_IMAGE": GPT_IMAGE_MODELS,
+    "GPT_IMAGE_25_SUNBURST": GPT_IMAGE_25_SUNBURST_MODELS,
+    "GPT_IMAGE_25_FLARE": GPT_IMAGE_25_FLARE_MODELS,
 }
+# 품질 프리셋과 개별 프로퍼티의 update 콜백이 서로를 다시 부르는 것을 막는 단일 가드.
+_APPLYING_QUALITY_PRESET = False
 
 
 def _apply_model_preset(settings, _context) -> None:
@@ -81,6 +98,47 @@ def _apply_model_preset(settings, _context) -> None:
     if models is None:
         return
     settings.texture_analysis_model, settings.texture_image_model = models
+
+
+def quality_values_from(settings) -> dict:
+    """프리셋 비교에 쓰는 개별 프로퍼티 현재 값."""
+
+    return {name: getattr(settings, name) for name in QUALITY_PRESET_FIELDS}
+
+
+def _apply_quality_preset(settings, _context) -> None:
+    """품질 프리셋을 고르면 표대로 개별 프로퍼티를 덮어쓴다. CUSTOM은 현재 값을 유지한다."""
+
+    global _APPLYING_QUALITY_PRESET
+    if _APPLYING_QUALITY_PRESET:
+        return
+    values = quality_preset_values(str(settings.texture_quality_preset))
+    if values is None:
+        return
+    _APPLYING_QUALITY_PRESET = True
+    try:
+        for name, value in values.items():
+            setattr(settings, name, value)
+    finally:
+        _APPLYING_QUALITY_PRESET = False
+
+
+def _mark_quality_custom(settings, _context) -> None:
+    """고급 설정에서 개별 값을 직접 바꾸면 프리셋 표시를 CUSTOM으로 내린다."""
+
+    global _APPLYING_QUALITY_PRESET
+    if _APPLYING_QUALITY_PRESET:
+        return
+    resolved = quality_preset_after_change(
+        str(settings.texture_quality_preset), quality_values_from(settings)
+    )
+    if resolved == str(settings.texture_quality_preset):
+        return
+    _APPLYING_QUALITY_PRESET = True
+    try:
+        settings.texture_quality_preset = resolved
+    finally:
+        _APPLYING_QUALITY_PRESET = False
 
 
 class UVMAPPING_PG_reference_image(PropertyGroup):
@@ -116,18 +174,22 @@ class UVMAPPING_PG_target_object(PropertyGroup):
 class UVMAPPING_PG_settings(PropertyGroup):
     """씬에 저장되는 AI 텍스처링 설정."""
 
+    texture_quality_preset: EnumProperty(
+        name="품질",
+        description=(
+            "시점 구성·생성 이미지 크기·텍스처 크기·다시 그리기 횟수·적용 후 검증을 한 번에 정합니다. "
+            "고급 설정에서 이 값들을 직접 바꾸면 사용자 지정으로 바뀝니다"
+        ),
+        items=QUALITY_PRESET_ITEMS,
+        default=DEFAULT_QUALITY_PRESET,
+        update=_apply_quality_preset,
+    )
     texture_resolution: EnumProperty(
         name="텍스처 크기",
         description="AI 텍스처를 구울 정사각형 이미지의 가로세로 픽셀 크기입니다",
-        items=(
-            ("256", "256 px", "256 px 텍스처를 대상으로 합니다"),
-            ("512", "512 px", "512 px 텍스처를 대상으로 합니다"),
-            ("1024", "1024 px", "1K 텍스처를 대상으로 합니다"),
-            ("2048", "2048 px", "2K 텍스처를 대상으로 합니다"),
-            ("4096", "4096 px", "4K 텍스처를 대상으로 합니다"),
-            ("8192", "8192 px", "8K 텍스처를 대상으로 합니다"),
-        ),
+        items=TEXTURE_RESOLUTION_OPTIONS,
         default="1024",
+        update=_mark_quality_custom,
     )
     padding_pixels: IntProperty(
         name="UV 패딩",
@@ -138,7 +200,7 @@ class UVMAPPING_PG_settings(PropertyGroup):
         subtype="PIXEL",
     )
     turnaround_layout: EnumProperty(
-        name="다면도 구성",
+        name="시점 구성",
         description=(
             "생성할 시점 구성입니다. 6면도는 상·하·좌 시점까지 실제 그림으로 받아 투영합니다. "
             "QUAD는 같은 6면을 캔버스 4장으로 나눠 받으므로 호출이 4회입니다"
@@ -159,6 +221,7 @@ class UVMAPPING_PG_settings(PropertyGroup):
             ),
         ),
         default="SIX",
+        update=_mark_quality_custom,
     )
     generation_mode: EnumProperty(
         name="생성 방식",
@@ -191,9 +254,20 @@ class UVMAPPING_PG_settings(PropertyGroup):
             ("4K", "4K", "4K 캔버스 · 시점당 해상도가 가장 높지만 캔버스마다 비용 주의"),
         ),
         default="AUTO",
+        update=_mark_quality_custom,
+    )
+    texture_image_quality: EnumProperty(
+        name="품질 단계",
+        description=(
+            "이미지 크기 대신 품질 단계를 받는 모델(GPT 계열)에 보낼 등급입니다. "
+            "이 모델들은 결과 픽셀이 종횡비로 고정되어 1K급이므로 크기 대신 등급으로 정밀도를 올립니다"
+        ),
+        items=IMAGE_QUALITY_ITEMS,
+        default=AUTO_IMAGE_QUALITY,
+        update=_mark_quality_custom,
     )
     auto_regenerate_attempts: IntProperty(
-        name="실루엣 불일치 시 자동 재생성",
+        name="형태가 어긋나면 다시 그리기(횟수)",
         description=(
             "생성 직후 시점별 실루엣을 모델과 비교해 내부 구조가 어긋난 시점이 있으면 교정 지시를 붙여 "
             "다시 생성하는 최대 횟수입니다. 재생성마다 OpenRouter 호출과 비용이 추가됩니다. 0이면 경고만 남깁니다"
@@ -201,6 +275,7 @@ class UVMAPPING_PG_settings(PropertyGroup):
         default=1,
         min=0,
         max=2,
+        update=_mark_quality_custom,
     )
     verify_after_bake: BoolProperty(
         name="적용 후 검증",
@@ -209,6 +284,7 @@ class UVMAPPING_PG_settings(PropertyGroup):
             "검증 시트(가이드/생성/베이크 렌더)를 남깁니다. 로컬 처리라 추가 비용은 없습니다"
         ),
         default=True,
+        update=_mark_quality_custom,
     )
     blend_exponent: FloatProperty(
         name="시점 전이 폭",
@@ -282,7 +358,20 @@ class UVMAPPING_PG_settings(PropertyGroup):
             (
                 "GPT_IMAGE",
                 "GPT Image (덕테이프)",
-                "openai/gpt-5.6-sol 분석과 openai/gpt-5.4-image-2 생성",
+                "openai/gpt-5.6-sol 분석과 openai/gpt-5.4-image-2 생성 · "
+                "GPT 계열은 픽셀이 종횡비로 고정되어 '생성 이미지 크기'가 품질 단계로 전달됩니다",
+            ),
+            (
+                "GPT_IMAGE_25_SUNBURST",
+                "GPT Image 2.5 Sunburst (정밀, 느리고 비쌈)",
+                "openai/gpt-5.6-sol 분석과 openai/gpt-image-2.5-sunburst(덕테이프 2.5 선버스트) 생성 · "
+                "GPT 계열은 픽셀이 종횡비로 고정되어 '생성 이미지 크기'가 품질 단계로 전달됩니다",
+            ),
+            (
+                "GPT_IMAGE_25_FLARE",
+                "GPT Image 2.5 Flare (속도 우선)",
+                "openai/gpt-5.6-sol 분석과 openai/gpt-image-2.5-flare(덕테이프 2.5 플레어) 생성 · "
+                "GPT 계열은 픽셀이 종횡비로 고정되어 '생성 이미지 크기'가 품질 단계로 전달됩니다",
             ),
         ),
         default="NANO_BANANA_PRO",
@@ -300,6 +389,10 @@ class UVMAPPING_PG_settings(PropertyGroup):
     )
     show_texture_advanced: BoolProperty(
         name="AI 고급 설정",
+        default=False,
+    )
+    show_texture_expert: BoolProperty(
+        name="AI 전문가 설정",
         default=False,
     )
     texture_analysis_json: StringProperty(
@@ -330,6 +423,8 @@ class UVMAPPING_PG_settings(PropertyGroup):
 
 
 __all__ = (
+    "GPT_IMAGE_25_FLARE_MODELS",
+    "GPT_IMAGE_25_SUNBURST_MODELS",
     "GPT_IMAGE_MODELS",
     "MODEL_PRESETS",
     "NANO_BANANA_PRO_MODELS",
@@ -339,4 +434,5 @@ __all__ = (
     "UVMAPPING_PG_target_object",
     "addon_module_id",
     "get_addon_preferences",
+    "quality_values_from",
 )

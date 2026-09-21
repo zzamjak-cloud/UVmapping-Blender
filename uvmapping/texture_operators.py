@@ -26,8 +26,13 @@ from mathutils import Vector
 from . import clipboard_image, native_input, texture_bake
 from .properties import get_addon_preferences
 from .quality import evaluate_atlas_quality
-from .openrouter_provider import validate_model_slug
+from .openrouter_provider import (
+    effective_image_size,
+    supports_resolution,
+    validate_model_slug,
+)
 from .texture_job import TEXTURE_JOB_PROPERTY, ensure_texture_jobs
+from .texture_presets import resolved_image_quality
 from .texture_pipeline import (
     AUTO_IMAGE_SIZE,
     CONTACT_SHEET_ROLE,
@@ -373,6 +378,38 @@ def can_bake_diffuse(context) -> bool:
         bool(objects)
         and not _ACTIVE_RUNS
         and all(texture_state_status(obj) in _BAKEABLE_STATUSES for obj in objects)
+    )
+
+
+def provider_quality(model: str, quality: str, preset: str) -> str | None:
+    """요청에 실어 보낼 품질 등급. 크기를 받는 모델에는 보내지 않는다.
+
+    모델 상한을 넘는 등급은 Provider가 요청 본문을 만들 때 낮추므로 여기서는 고른
+    등급을 그대로 넘긴다.
+    """
+
+    if supports_resolution(model):
+        return None
+    return resolved_image_quality(preset, quality)
+
+
+def can_generate_turnaround(context) -> bool:
+    """대상과 스타일 근거(참조 또는 지시)가 갖춰졌고 진행 중인 작업이 없는지."""
+
+    if _ACTIVE_RUNS or not texture_targets(context):
+        return False
+    settings = context.scene.uvmapping_settings
+    return bool(settings.reference_images) or bool(settings.texture_user_prompt.strip())
+
+
+def has_applied_diffuse(context) -> bool:
+    """이미 Diffuse를 구워 적용한 대상이 있는지. 재적용 버튼 문구를 고르는 데 쓴다."""
+
+    objects = texture_targets(context)
+    return (
+        bool(objects)
+        and not _ACTIVE_RUNS
+        and any(texture_state_status(obj) == "ALBEDO_APPLIED" for obj in objects)
     )
 
 
@@ -803,6 +840,7 @@ def _turnaround_batch_job(
                 "output_path": str(output_paths[name]),
                 "aspect_ratio": request.aspect_ratio,
                 "resolution": request.image_size,
+                **({"quality": request.quality} if request.quality else {}),
             }
         )
     return {"action": "turnaround_batch", "groups": groups}
@@ -848,6 +886,7 @@ def _turnaround_job(request: TurnaroundImageRequest, image_paths: Sequence[Path]
         "output_path": str(output_path),
         "aspect_ratio": request.aspect_ratio,
         "resolution": request.image_size,
+        **({"quality": request.quality} if request.quality else {}),
     }
 
 
@@ -917,6 +956,14 @@ class _TextureRun:
         self.cleanup_job_files()
         if not result.get("ok"):
             message = str(result.get("error", "알 수 없는 AI 작업 오류"))
+            # 분석 실패가 생성 실패처럼 보이면 사용자가 다음 행동을 고르지 못한다.
+            prefix = (
+                str(self.payload.get("failure_prefix", ""))
+                if isinstance(self.payload, dict)
+                else ""
+            )
+            if prefix:
+                message = f"{prefix}{message}"
             if scene is not None:
                 scene.uvmapping_settings.texture_status = message
             _tag_texture_panels_redraw()
@@ -1288,6 +1335,54 @@ class UVMAPPING_OT_remove_reference_image(Operator):
         return {"FINISHED"}
 
 
+def _needs_reference_analysis(settings) -> bool:
+    """참조가 있는데 그 참조에 대한 분석 결과가 없거나 낡았는지."""
+
+    paths = _reference_paths(settings, allow_empty=True)
+    if not paths:
+        return False
+    if not settings.texture_analysis_json:
+        return True
+    return settings.texture_analysis_reference_hash != _reference_digest(paths)
+
+
+def _start_reference_analysis(
+    context, *, chain_generate: bool = False, objects: Sequence = ()
+) -> None:
+    """참조 분석 작업을 시작한다. 실패는 ValueError/RuntimeError로 올린다.
+
+    ``objects``는 생성까지 이어갈 때 호출 시점에 확정한 대상이다. 분석이 끝난 뒤
+    선택이 바뀌어도 같은 객체로 생성하도록 payload에 키를 실어 둔다.
+    """
+
+    settings = context.scene.uvmapping_settings
+    paths = _reference_paths(settings)
+    if not bpy.app.online_access:
+        raise ValueError(
+            "Blender 환경설정 > 시스템에서 'Allow Online Access'를 켜 주세요."
+        )
+    model, _image_model = _resolved_models(settings)
+    api_key = resolve_api_key(context)
+    payload = {
+        "reference_digest": _reference_digest(paths),
+        "chain_generate": bool(chain_generate),
+        "failure_prefix": "참조 분석 실패: ",
+        "target_keys": tuple((obj.name, obj.session_uid) for obj in objects),
+    }
+    job = {
+        "action": "analyze",
+        "model": model,
+        "prompt": build_reference_analysis_prompt(len(paths)),
+        "image_paths": [str(path) for path in paths],
+    }
+    status = (
+        "참조 이미지 분석 중… (끝나면 생성으로 이어집니다)"
+        if chain_generate
+        else "참조 이미지 분석 중…"
+    )
+    _start_worker(context.scene, job, api_key, status, payload, _finish_analysis)
+
+
 class UVMAPPING_OT_analyze_references(_AsyncTextureMixin, Operator):
     """참조 이미지에서 손맵 스타일과 디자인 규칙을 구조화해 추출한다."""
 
@@ -1299,29 +1394,12 @@ class UVMAPPING_OT_analyze_references(_AsyncTextureMixin, Operator):
         return not _ACTIVE_RUNS
 
     def execute(self, context):
-        settings = context.scene.uvmapping_settings
         try:
-            paths = _reference_paths(settings)
-            if not bpy.app.online_access:
-                raise ValueError(
-                    "Blender 환경설정 > 시스템에서 'Allow Online Access'를 켜 주세요."
-                )
-            model, _image_model = _resolved_models(settings)
-            api_key = resolve_api_key(context)
-            payload = {"reference_digest": _reference_digest(paths)}
-        except ValueError as exc:
+            _start_reference_analysis(context)
+        except (ValueError, RuntimeError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
-
-        job = {
-            "action": "analyze",
-            "model": model,
-            "prompt": build_reference_analysis_prompt(len(paths)),
-            "image_paths": [str(path) for path in paths],
-        }
-        return self._start(
-            context, job, api_key, "참조 이미지 분석 중…", payload, _finish_analysis
-        )
+        return {"FINISHED"}
 
 
 class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
@@ -1335,179 +1413,203 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
         return not _ACTIVE_RUNS and bool(texture_targets(context))
 
     def execute(self, context):
-        settings = context.scene.uvmapping_settings
         try:
             if not bpy.app.online_access:
                 raise ValueError(
                     "Blender 환경설정 > 시스템에서 'Allow Online Access'를 켜 주세요."
                 )
+            # 분석부터 시작하더라도 대상 검증은 네트워크 호출 전에 끝낸다.
             objects = _validated_texture_targets(context)
-            reference_paths = _reference_paths(settings, allow_empty=True)
-            if reference_paths:
-                if settings.texture_analysis_reference_hash != _reference_digest(
-                    reference_paths
-                ):
-                    settings.texture_analysis_json = ""
-                    settings.texture_analysis_reference_hash = ""
-                    raise ValueError("참조 이미지가 변경되었습니다. 다시 분석해 주세요.")
-                analysis = parse_reference_analysis(settings.texture_analysis_json)
-            elif settings.texture_user_prompt.strip():
-                # 참조 이미지가 없으면 사용자 프롬프트만으로 스타일을 정한다.
-                analysis = None
-            else:
-                raise ValueError(
-                    "참조 이미지가 없을 때는 추가 지시 프롬프트를 입력해 주세요."
-                )
-            # 이미지 모델은 참조 원본을 주면 그 캐릭터를 그대로 재생성해 모델
-            # 실루엣을 무시한다. 기본은 분석 결과(텍스트)만 스타일 근거로 보낸다.
-            generation_references = (
-                reference_paths if settings.send_reference_images else ()
-            )
-            _analysis_model, model = _resolved_models(settings)
-            composition = resolve_composition(settings.turnaround_layout)
-            # 단일 캔버스 구성은 그룹이 하나뿐이며 그 그룹이 곧 기존 레이아웃이다.
-            layout_spec = composition.groups[0]
-            single_canvas = composition.is_single_canvas
-            sequential = settings.generation_mode == "SEQUENTIAL"
-            # 순차 모드는 시점마다 1:1 한 장이므로 그 레이아웃의 기본 크기를 따른다.
-            image_size = resolve_image_size(
-                single_view_layout(composition.views[0])
-                if sequential
-                else (layout_spec if single_canvas else composition),
-                settings.turnaround_image_size,
-            )
-            projection = _projection_contract(context, objects)
-            output_path = _output_path(context, objects)
-            contact_sheet = None
-            group_sheets: dict[str, Path] = {}
-            if sequential:
-                # 순차 모드는 시점마다 가이드를 따로 그리므로 여기서 합성하지 않는다.
-                pass
-            elif single_canvas:
-                model_paths = _render_model_views(context, objects, projection, layout_spec.views)
-                contact_sheet = _join_grid(
-                    tuple(model_paths.values()),
-                    layout_spec,
-                    output_path.with_name(f"{output_path.stem}_geometry.png"),
-                )
-                _discard_capture_files(model_paths)
-            else:
-                group_sheets = _join_group_sheets(
-                    context, objects, projection, composition, output_path
-                )
-                # 하위 호환 대표값: 첫 그룹(FRONT) 가이드를 단일 캔버스 필드에 그대로 둔다.
-                contact_sheet = group_sheets[composition.groups[0].name]
-            user_prompt = settings.texture_user_prompt
-            target_keys = tuple((obj.name, obj.session_uid) for obj in objects)
-            reference_state = tuple(
-                {
-                    "path": str(path),
-                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                }
-                for path in reference_paths
-            )
-            source_jobs = tuple(
-                {
-                    "object_name": obj.name,
-                    **{
-                        key: job.get(key, "")
-                        for key in (
-                            "job_id",
-                            "atlas_id",
-                            "atlas_hash",
-                            "atlas_member_id",
-                            "uv_hash",
-                            "mesh_hash",
-                            "uv_layer_name",
-                            "target_resolution",
-                            "requested_padding",
-                        )
-                    },
-                }
-                for obj, job in (
-                    (obj, json.loads(obj[TEXTURE_JOB_PROPERTY])) for obj in objects
-                )
-            )
-            payload = {
-                "target_keys": target_keys,
-                "target_names": tuple(name for name, _session_uid in target_keys),
-                "contact_sheet_path": str(contact_sheet) if contact_sheet else "",
-                "reference_state": reference_state,
-                "source_jobs": source_jobs,
-                "projection": projection,
-                "user_prompt": user_prompt,
-                "model": model,
-                "analysis_payload": analysis.to_dict() if analysis is not None else None,
-                "layout_name": composition.name,
-                "composition": composition.name,
-                "image_size": image_size,
-                # 실루엣 불일치 재생성과 순차 모드가 같은 입력으로 다시 요청할 수 있게 남긴다.
-                "reference_image_paths": tuple(str(path) for path in generation_references),
-                "output_stem_path": str(output_path),
-                "attempt": 0,
-                "feedback_views": (),
-            }
-            if sequential:
-                payload.update(
-                    {
-                        "generation_mode": "SEQUENTIAL",
-                        "sequence_views": tuple(composition.views),
-                        "completed_views": {},
-                        "completed_sha256": {},
-                        "guide_paths": {},
-                        "bake_settings": _bake_settings_from(settings, composition),
-                    }
-                )
-                _launch_sequential_step(context, payload, 0)
+            if _needs_reference_analysis(context.scene.uvmapping_settings):
+                # 참조가 새로 들어왔거나 바뀌었으면 분석을 먼저 끝내고 그 콜백에서 생성을 잇는다.
+                _start_reference_analysis(context, chain_generate=True, objects=objects)
                 return {"FINISHED"}
-            api_key = resolve_api_key(context)
-            if not single_canvas:
-                rounds = split_rounds(composition, composition.group_names)
-                payload.update(
-                    {
-                        "group_sheets": {name: str(path) for name, path in group_sheets.items()},
-                        "group_results": {},
-                        "group_attempts": {},
-                        "group_feedback": {},
-                        "view_paths": {},
-                        "view_sha256": {},
-                        "pending_rounds": [list(round_names) for round_names in rounds[1:]],
-                    }
-                )
-                _start_turnaround_round(
-                    context.scene,
-                    payload,
-                    rounds[0],
-                    api_key=api_key,
-                    status=(
-                        f"{_layout_label(composition)} 1/{len(rounds)}라운드 · "
-                        f"{', '.join(rounds[0])} 요청 중…"
-                    ),
-                )
-                return {"FINISHED"}
-            # 레이아웃·종횡비·해상도·1회 호출 계약은 요청 객체가 검증한다.
-            request = build_turnaround_request(
-                _contract_image(contact_sheet, "geometry_contact_sheet"),
-                tuple(_contract_image(path, "reference") for path in generation_references),
-                analysis,
-                user_prompt,
-                model=model,
-                layout_name=layout_spec.name,
-                image_size=image_size,
-            )
-            job = _turnaround_job(request, (contact_sheet, *generation_references), output_path)
+            _start_turnaround_generation(context, objects=objects)
         except (ValueError, RuntimeError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        return {"FINISHED"}
 
-        return self._start(
-            context,
-            job,
-            api_key,
-            f"한 번의 요청으로 {_layout_label(layout_spec)} 생성 중…",
-            payload,
-            _finish_turnaround,
+
+def _start_turnaround_generation(context, *, objects: Sequence = ()) -> None:
+    """다면도 생성 작업을 시작한다.
+
+    연산자와 참조 분석 완료 콜백이 같은 경로를 공유하도록 모듈 함수로 둔다. 실패는
+    ValueError/RuntimeError로 올려 호출 측이 보고나 상태 문자열로 처리하게 한다.
+    ``objects``를 주면 그 대상만 다시 검증해 쓰고, 비우면 현재 등록·선택을 따른다.
+    """
+
+    settings = context.scene.uvmapping_settings
+    if not bpy.app.online_access:
+        raise ValueError(
+            "Blender 환경설정 > 시스템에서 'Allow Online Access'를 켜 주세요."
         )
+    objects = _validated_texture_targets(context, objects)
+    reference_paths = _reference_paths(settings, allow_empty=True)
+    if reference_paths:
+        if _needs_reference_analysis(settings):
+            raise ValueError("참조 이미지가 변경되었습니다. 먼저 참조를 분석해 주세요.")
+        analysis = parse_reference_analysis(settings.texture_analysis_json)
+    elif settings.texture_user_prompt.strip():
+        # 참조 이미지가 없으면 사용자 프롬프트만으로 스타일을 정한다.
+        analysis = None
+    else:
+        raise ValueError(
+            "참조 이미지가 없을 때는 추가 지시 프롬프트를 입력해 주세요."
+        )
+    # 이미지 모델은 참조 원본을 주면 그 캐릭터를 그대로 재생성해 모델
+    # 실루엣을 무시한다. 기본은 분석 결과(텍스트)만 스타일 근거로 보낸다.
+    generation_references = (
+        reference_paths if settings.send_reference_images else ()
+    )
+    _analysis_model, model = _resolved_models(settings)
+    composition = resolve_composition(settings.turnaround_layout)
+    # 단일 캔버스 구성은 그룹이 하나뿐이며 그 그룹이 곧 기존 레이아웃이다.
+    layout_spec = composition.groups[0]
+    single_canvas = composition.is_single_canvas
+    sequential = settings.generation_mode == "SEQUENTIAL"
+    # 순차 모드는 시점마다 1:1 한 장이므로 그 레이아웃의 기본 크기를 따른다.
+    image_size = resolve_image_size(
+        single_view_layout(composition.views[0])
+        if sequential
+        else (layout_spec if single_canvas else composition),
+        settings.turnaround_image_size,
+    )
+    # GPT 계열은 resolution을 받지 않고 결과가 1K로 고정되므로 요청 전에 맞춰 둔다.
+    image_size = effective_image_size(model, image_size)
+    quality = provider_quality(
+        model, settings.texture_image_quality, settings.texture_quality_preset
+    )
+    projection = _projection_contract(context, objects)
+    output_path = _output_path(context, objects)
+    contact_sheet = None
+    group_sheets: dict[str, Path] = {}
+    if sequential:
+        # 순차 모드는 시점마다 가이드를 따로 그리므로 여기서 합성하지 않는다.
+        pass
+    elif single_canvas:
+        model_paths = _render_model_views(context, objects, projection, layout_spec.views)
+        contact_sheet = _join_grid(
+            tuple(model_paths.values()),
+            layout_spec,
+            output_path.with_name(f"{output_path.stem}_geometry.png"),
+        )
+        _discard_capture_files(model_paths)
+    else:
+        group_sheets = _join_group_sheets(
+            context, objects, projection, composition, output_path
+        )
+        # 하위 호환 대표값: 첫 그룹(FRONT) 가이드를 단일 캔버스 필드에 그대로 둔다.
+        contact_sheet = group_sheets[composition.groups[0].name]
+    user_prompt = settings.texture_user_prompt
+    target_keys = tuple((obj.name, obj.session_uid) for obj in objects)
+    reference_state = tuple(
+        {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in reference_paths
+    )
+    source_jobs = tuple(
+        {
+            "object_name": obj.name,
+            **{
+                key: job.get(key, "")
+                for key in (
+                    "job_id",
+                    "atlas_id",
+                    "atlas_hash",
+                    "atlas_member_id",
+                    "uv_hash",
+                    "mesh_hash",
+                    "uv_layer_name",
+                    "target_resolution",
+                    "requested_padding",
+                )
+            },
+        }
+        for obj, job in (
+            (obj, json.loads(obj[TEXTURE_JOB_PROPERTY])) for obj in objects
+        )
+    )
+    payload = {
+        "target_keys": target_keys,
+        "target_names": tuple(name for name, _session_uid in target_keys),
+        "contact_sheet_path": str(contact_sheet) if contact_sheet else "",
+        "reference_state": reference_state,
+        "source_jobs": source_jobs,
+        "projection": projection,
+        "user_prompt": user_prompt,
+        "model": model,
+        "analysis_payload": analysis.to_dict() if analysis is not None else None,
+        "layout_name": composition.name,
+        "composition": composition.name,
+        "image_size": image_size,
+        "quality": quality or "",
+        # 실루엣 불일치 재생성과 순차 모드가 같은 입력으로 다시 요청할 수 있게 남긴다.
+        "reference_image_paths": tuple(str(path) for path in generation_references),
+        "output_stem_path": str(output_path),
+        "attempt": 0,
+        "feedback_views": (),
+    }
+    if sequential:
+        payload.update(
+            {
+                "generation_mode": "SEQUENTIAL",
+                "sequence_views": tuple(composition.views),
+                "completed_views": {},
+                "completed_sha256": {},
+                "guide_paths": {},
+                "bake_settings": _bake_settings_from(settings, composition),
+            }
+        )
+        _launch_sequential_step(context, payload, 0)
+        return
+    api_key = resolve_api_key(context)
+    if not single_canvas:
+        rounds = split_rounds(composition, composition.group_names)
+        payload.update(
+            {
+                "group_sheets": {name: str(path) for name, path in group_sheets.items()},
+                "group_results": {},
+                "group_attempts": {},
+                "group_feedback": {},
+                "view_paths": {},
+                "view_sha256": {},
+                "pending_rounds": [list(round_names) for round_names in rounds[1:]],
+            }
+        )
+        _start_turnaround_round(
+            context.scene,
+            payload,
+            rounds[0],
+            api_key=api_key,
+            status=(
+                f"{_layout_label(composition)} 1/{len(rounds)}라운드 · "
+                f"{', '.join(rounds[0])} 요청 중…"
+            ),
+        )
+        return
+    # 레이아웃·종횡비·해상도·1회 호출 계약은 요청 객체가 검증한다.
+    request = build_turnaround_request(
+        _contract_image(contact_sheet, "geometry_contact_sheet"),
+        tuple(_contract_image(path, "reference") for path in generation_references),
+        analysis,
+        user_prompt,
+        model=model,
+        layout_name=layout_spec.name,
+        image_size=image_size,
+        quality=quality,
+    )
+    job = _turnaround_job(request, (contact_sheet, *generation_references), output_path)
+    _start_worker(
+        context.scene,
+        job,
+        api_key,
+        f"한 번의 요청으로 {_layout_label(layout_spec)} 생성 중…",
+        payload,
+        _finish_turnaround,
+    )
 
 
 def _finish_analysis(scene, value: dict, payload: dict) -> None:
@@ -1518,6 +1620,15 @@ def _finish_analysis(scene, value: dict, payload: dict) -> None:
     )
     settings.texture_analysis_reference_hash = payload["reference_digest"]
     settings.texture_status = "참조 분석 완료"
+    if not payload.get("chain_generate"):
+        return
+    try:
+        # 분석을 시작할 때 확정한 대상으로 잇는다. 그 사이 선택이 바뀌어도 무시한다.
+        objects = _payload_objects(payload)
+        with _bake_context(scene) as context:
+            _start_turnaround_generation(context, objects=objects)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        settings.texture_status = f"참조 분석은 끝났지만 생성을 시작하지 못했습니다: {exc}"
 
 
 def _finish_turnaround(scene, value: dict, payload: dict) -> None:
@@ -1548,6 +1659,7 @@ def _finish_turnaround(scene, value: dict, payload: dict) -> None:
         "turnaround_sha256": hashlib.sha256(value.read_bytes()).hexdigest(),
         "layout": layout_spec.name,
         "image_size": payload.get("image_size", ""),
+        "quality": payload.get("quality", ""),
         "attempt": attempt,
         "regeneration_feedback": [str(view) for view in payload.get("feedback_views", ())],
         "views": {name: str(path) for name, path in crop_paths.items()},
@@ -1647,6 +1759,7 @@ def _group_state(payload: dict, composition: TurnaroundComposition, status: str,
         "user_prompt": payload["user_prompt"],
         "analysis": payload["analysis_payload"],
         "image_size": payload.get("image_size", ""),
+        "quality": payload.get("quality", ""),
     }
     entries = build_group_entries(
         composition,
@@ -1729,6 +1842,7 @@ def _start_turnaround_round(
         payload["user_prompt"],
         model=payload["model"],
         image_size=payload.get("image_size") or AUTO_IMAGE_SIZE,
+        quality=payload.get("quality") or None,
         front_reference=front_image,
         regeneration_feedback={
             str(name): tuple(views) for name, views in payload.get("group_feedback", {}).items()
@@ -1947,6 +2061,7 @@ def _launch_regeneration(scene, payload: dict, failed_views: Sequence[str], atte
         model=payload["model"],
         layout_name=payload["layout_name"],
         image_size=payload.get("image_size") or DEFAULT_IMAGE_SIZE,
+        quality=payload.get("quality") or None,
         regeneration_feedback=tuple(failed_views),
     )
     stem_path = Path(payload.get("output_stem_path") or contact_sheet)
@@ -2069,13 +2184,16 @@ def _bake_parameters(settings, objects: tuple, jobs: Sequence[dict]) -> tuple[in
 
 
 def _payload_objects(payload: dict) -> tuple:
-    """생성을 시작한 바로 그 객체들을 session_uid로 다시 찾는다."""
+    """작업을 시작한 바로 그 객체들을 session_uid로 다시 찾는다.
+
+    순차 생성의 다음 단계와 분석→생성 체인이 모두 이 목록으로 이어간다.
+    """
 
     objects = []
     for name, session_uid in payload["target_keys"]:
         obj = bpy.data.objects.get(name)
         if obj is None or obj.session_uid != session_uid:
-            raise ValueError(f"{name}: 대상 객체가 바뀌거나 삭제되어 순차 생성을 이어갈 수 없습니다.")
+            raise ValueError(f"{name}: 대상 객체가 바뀌거나 삭제되어 이어서 진행할 수 없습니다.")
         objects.append(obj)
     return tuple(objects)
 
@@ -2102,6 +2220,7 @@ def _sequential_state(payload: dict, status: str, **extra) -> dict:
         "analysis": payload["analysis_payload"],
         "layout": payload["layout_name"],
         "image_size": payload.get("image_size", ""),
+        "quality": payload.get("quality", ""),
         "sequence_views": list(payload["sequence_views"]),
         "sequential_step": int(payload.get("sequential_step", 0)),
         "guides": {view.lower(): path for view, path in guides.items()},
@@ -2230,6 +2349,7 @@ def _launch_sequential_step(context, payload: dict, step: int) -> None:
         model=payload["model"],
         layout_name=SINGLE_VIEW_LAYOUT_NAME,
         image_size=payload.get("image_size") or DEFAULT_IMAGE_SIZE,
+        quality=payload.get("quality") or None,
         view=view,
         painted_views=tuple(payload["completed_views"]),
     )

@@ -15,6 +15,9 @@ DEFAULT_IMAGE_MODEL = "google/gemini-3-pro-image"
 # 시점당 800px대, 4K에서 1600px대로 **추정**된다(Provider 실제 출력 크기를 측정하기 전의
 # 대략적인 추정치이며 확정값이 아니다). 확정 전에는 이 수치를 근거로 문서를 쓰지 않는다.
 IMAGE_SIZE_OPTIONS = ("1K", "2K", "4K")
+# resolution을 받지 않는 모델(GPT 계열)에 보낼 품질 등급. 실제 허용 목록은 모델마다
+# 다르므로 여기서는 형식만 보고, 모델별 검사는 Provider 계층이 한다.
+IMAGE_QUALITY_OPTIONS = ("auto", "low", "medium", "high", "xhigh", "max")
 # 사용자가 크기를 고르지 않았을 때 레이아웃 기본값을 쓰라는 표식.
 AUTO_IMAGE_SIZE = "AUTO"
 MAX_REFERENCE_IMAGE_BYTES = 32 * 1024 * 1024
@@ -513,6 +516,9 @@ class TurnaroundImageRequest:
     image_size: str = DEFAULT_IMAGE_SIZE
     views: tuple[str, ...] = TURNAROUND_VIEWS
     layout_name: str = LEGACY_LAYOUT_NAME
+    # resolution 대신 quality를 받는 모델에만 실어 보낸다. None이면 Provider가
+    # 이미지 크기에서 등급을 옮겨 온다.
+    quality: str | None = None
     provider_call_count: int = 1
     output_image_count: int = 1
 
@@ -533,6 +539,10 @@ class TurnaroundImageRequest:
             )
         if self.image_size not in IMAGE_SIZE_OPTIONS:
             raise ValueError(f"이미지 해상도는 {', '.join(IMAGE_SIZE_OPTIONS)} 중 하나여야 합니다.")
+        if self.quality is not None and self.quality not in IMAGE_QUALITY_OPTIONS:
+            raise ValueError(
+                f"이미지 품질 등급은 {', '.join(IMAGE_QUALITY_OPTIONS)} 중 하나여야 합니다."
+            )
         if self.provider_call_count != 1 or self.output_image_count != 1:
             raise ValueError("비용 절감을 위해 Provider 1회 호출과 결과 1장만 허용합니다.")
         if self.contact_sheet.role != CONTACT_SHEET_ROLE:
@@ -1113,6 +1123,7 @@ def build_turnaround_request(
     model: str = DEFAULT_IMAGE_MODEL,
     layout_name: str = LEGACY_LAYOUT_NAME,
     image_size: str = DEFAULT_IMAGE_SIZE,
+    quality: str | None = None,
     view: str | None = None,
     painted_views: tuple[str, ...] = (),
     regeneration_feedback: Sequence[str] = (),
@@ -1155,6 +1166,7 @@ def build_turnaround_request(
         model=model,
         aspect_ratio=layout.aspect_ratio,
         image_size=image_size,
+        quality=quality,
         views=layout.views,
         layout_name=layout.name,
     )
@@ -1239,6 +1251,7 @@ def build_turnaround_batch_request(
     *,
     model: str = DEFAULT_IMAGE_MODEL,
     image_size: str = AUTO_IMAGE_SIZE,
+    quality: str | None = None,
     front_reference: InlineImage | None = None,
     regeneration_feedback: Mapping[str, Sequence[str]] | None = None,
 ) -> TurnaroundBatchRequest:
@@ -1277,6 +1290,7 @@ def build_turnaround_batch_request(
                 model=model,
                 layout_name=group.name,
                 image_size=resolve_image_size(group, image_size),
+                quality=quality,
                 regeneration_feedback=feedback.get(group.name, ()),
                 front_reference=use_front,
             )
