@@ -19,6 +19,9 @@ ADDON_ID = "uvmapping_blender"
 MODULE_NAME = "bl_ext.user_default.uvmapping_blender"
 
 
+_ALL_VIEWS = ("FRONT", "RIGHT", "BACK", "LEFT", "TOP", "BOTTOM")
+
+
 def _same_path(left: Path, right: Path) -> bool:
     return os.path.normcase(str(left.resolve())) == os.path.normcase(str(right.resolve()))
 
@@ -103,6 +106,9 @@ def _check_full_pipeline(texture_module, bake_module) -> None:
 
     sequential_calls: list[dict] = []
     grid_calls: list[dict] = []
+    batch_calls: list[list] = []
+    # 이름이 여기 들어간 그룹은 작업자가 실패로 보고한다(부분 실패 경로 검사용).
+    fail_groups: set = set()
     # True면 다음 격자 결과의 모든 셀 한가운데에 순백 세로 틈을 그려 가이드(틈 없는
     # 둥근 큐브)와 실루엣 내부 구조가 다른 "팔을 붙여 그린" 상황을 흉내 낸다.
     mismatch_next = [False]
@@ -149,10 +155,67 @@ def _check_full_pipeline(texture_module, bake_module) -> None:
                 pixels += bytes((cell_colors[cell] if inside else (255, 255, 255)) + (255,))
         path.write_bytes(bake_module.encode_srgb_png(bytes(pixels), width, height))
 
+    def fake_group_result(path: Path, group_name: str) -> None:
+        """QUAD 그룹 결과 축소판. 그룹 레이아웃의 셀마다 다른 단색을 칠한다."""
+
+        layout = texture_module.resolve_layout(group_name)
+        columns, rows = layout.columns, layout.rows
+        # 1셀 그룹은 1:1, 2셀 그룹은 16:9 캔버스다(합성·크롭이 쓰는 그룹 레이아웃과 같다).
+        width, height = (128, 128) if columns == 1 else (256, 144)
+        cell_width, cell_height = width // columns, height // rows
+        margin = max(4, min(cell_width, cell_height) // 10)
+        pixels = bytearray()
+        for row in range(height):
+            row_from_top = min(rows - 1, (height - 1 - row) // cell_height)
+            local_row = row % cell_height
+            for column in range(width):
+                cell_index = min(columns - 1, column // cell_width)
+                local_column = column % cell_width
+                view = layout.views[row_from_top * columns + cell_index]
+                color = cell_colors[_ALL_VIEWS.index(view) % len(cell_colors)]
+                inside = (
+                    margin <= local_row < cell_height - margin
+                    and margin <= local_column < cell_width - margin
+                )
+                pixels += bytes((color if inside else (255, 255, 255)) + (255,))
+        path.write_bytes(bake_module.encode_srgb_png(bytes(pixels), width, height))
+
     class _StubWorker:
         def __init__(self, arguments, **_kwargs):
             self.stdin = io.BytesIO()
             request = json.loads(Path(arguments[-2]).read_text(encoding="utf-8"))
+            if request.get("action") == "turnaround_batch":
+                groups = list(request["groups"])
+                batch_calls.append(groups)
+                results = []
+                for group in groups:
+                    assert group["resolution"] in ("1K", "2K", "4K"), group.get("resolution")
+                    if group["name"] in fail_groups:
+                        results.append(
+                            {"name": group["name"], "ok": False, "error": "스텁 강제 실패"}
+                        )
+                        continue
+                    group_output = Path(group["output_path"])
+                    fake_group_result(group_output, str(group["name"]))
+                    results.append(
+                        {"name": group["name"], "ok": True, "output_path": str(group_output)}
+                    )
+                Path(arguments[-1]).write_text(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "groups": results,
+                            "summary": {
+                                "total": len(results),
+                                "succeeded": len(results),
+                                "failed": 0,
+                                "failed_groups": [],
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return
             output_path = Path(request["output_path"])
             assert request["resolution"] in ("1K", "2K", "4K"), request.get("resolution")
             fake_turnaround(output_path, str(request.get("aspect_ratio", "21:9")))
@@ -311,6 +374,169 @@ def _check_full_pipeline(texture_module, bake_module) -> None:
             Path(path).unlink(missing_ok=True)
         Path(auto_state["geometry_contact_sheet"]).unlink(missing_ok=True)
         settings.target_objects.clear()
+
+        # QUAD 구성: 6면을 캔버스 4장으로 나눠 2라운드(FRONT 선행)로 호출한다.
+        # 실제 API 없이 그룹별 가이드 합성 · 크롭 · 상태 1.4 기록 · 베이크까지 확인한다.
+        settings.turnaround_layout = "QUAD"
+        settings.auto_apply_diffuse = False
+        settings.auto_regenerate_attempts = 0
+        settings.texture_diffuse_path = ""
+        batch_calls.clear()
+        entry = settings.target_objects.add()
+        entry.object = cube
+        assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+        # 라운드1은 FRONT 그룹 한 건뿐이고 색 참조 없이 가이드 한 장만 붙는다.
+        assert len(batch_calls) == 1, batch_calls
+        assert [group["name"] for group in batch_calls[0]] == ["QUAD_FRONT"], batch_calls[0]
+        assert len(batch_calls[0][0]["image_paths"]) == 1, batch_calls[0][0]["image_paths"]
+        assert batch_calls[0][0]["aspect_ratio"] == "1:1", batch_calls[0][0]["aspect_ratio"]
+        assert "front_color_reference" not in batch_calls[0][0]["prompt"]
+        assert len(texture_module._ACTIVE_RUNS) == 1
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        # 라운드2는 나머지 3그룹이 한 배치로 나가고 FRONT 크롭이 색 참조로 붙는다.
+        assert len(batch_calls) == 2, batch_calls
+        assert len(texture_module._ACTIVE_RUNS) == 1, "라운드2가 이어서 시작되어야 합니다."
+        second = {group["name"]: group for group in batch_calls[1]}
+        assert set(second) == {"QUAD_BACK", "QUAD_SIDES", "QUAD_CAPS"}, sorted(second)
+        assert all(len(group["image_paths"]) == 2 for group in second.values()), second
+        assert all("front_color_reference" in group["prompt"] for group in second.values())
+        assert second["QUAD_BACK"]["aspect_ratio"] == "1:1"
+        assert second["QUAD_SIDES"]["aspect_ratio"] == "16:9"
+        assert second["QUAD_CAPS"]["aspect_ratio"] == "16:9"
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert not texture_module._ACTIVE_RUNS
+        # 총 호출은 그룹 수와 같아야 한다(비용 계약).
+        assert sum(len(groups) for groups in batch_calls) == 4, batch_calls
+
+        quad_state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert quad_state["schema_version"] == "1.4", quad_state["schema_version"]
+        assert quad_state["status"] == "TURNAROUND_READY", settings.texture_status
+        assert quad_state["composition"] == "QUAD" and quad_state["layout"] == "QUAD"
+        assert [group["name"] for group in quad_state["groups"]] == [
+            "QUAD_FRONT",
+            "QUAD_BACK",
+            "QUAD_SIDES",
+            "QUAD_CAPS",
+        ], quad_state["groups"]
+        assert [group["round"] for group in quad_state["groups"]] == [0, 1, 1, 1]
+        # 평탄 시점 매핑은 1.3과 같은 형태를 유지해 베이크 계약을 건드리지 않는다.
+        assert set(quad_state["views"]) == {"front", "right", "back", "left", "top", "bottom"}
+        assert all(Path(path).is_file() for path in quad_state["views"].values())
+        assert quad_state["turnaround_path"] == quad_state["groups"][0]["image_path"]
+        # 그룹 가이드 크기: 1셀 1:1은 정사각, 2셀 16:9는 캡처 1024 기준 2048×1152다.
+        for index, expected_size in ((0, (1024, 1024)), (2, (2048, 1152))):
+            guide = bpy.data.images.load(
+                quad_state["groups"][index]["geometry_contact_sheet"], check_existing=False
+            )
+            try:
+                assert tuple(guide.size) == expected_size, (index, tuple(guide.size))
+            finally:
+                bpy.data.images.remove(guide)
+        # 완전한 6시점이 이미 확보된 뒤 재생성이 실패하면 베이크 가능한 상태를 되돌리면 안 된다.
+        quad_payload = {
+            "target_keys": ((cube.name, cube.session_uid),),
+            "target_names": (cube.name,),
+            "source_jobs": quad_state["source_jobs"],
+            "projection": quad_state["projection"],
+            "reference_state": quad_state["references"],
+            "user_prompt": quad_state["user_prompt"],
+            "analysis_payload": quad_state["analysis"],
+            "model": quad_state["model"],
+            "image_size": quad_state["image_size"],
+            "created_at": quad_state["created_at"],
+            # 정리 대상 glob이 실제 산출물과 겹치지 않도록 쓰이지 않는 stem을 준다.
+            "output_stem_path": str(
+                Path(quad_state["groups"][0]["image_path"]).with_name("unused_stem.png")
+            ),
+            "group_sheets": {
+                group["name"]: group["geometry_contact_sheet"] for group in quad_state["groups"]
+            },
+            "group_results": {group["name"]: group["image_path"] for group in quad_state["groups"]},
+            "group_attempts": {group["name"]: group["attempt"] for group in quad_state["groups"]},
+            "group_feedback": {},
+            "view_paths": dict(quad_state["views"]),
+            "view_sha256": dict(quad_state["view_sha256"]),
+            "attempt": 1,
+            "feedback_views": ("LEFT",),
+            "pending_rounds": [["QUAD_CAPS"]],
+        }
+        texture_module._report_round_failure(
+            bpy.context.scene,
+            quad_payload,
+            texture_module.resolve_composition("QUAD"),
+            "6면도",
+            1,
+            "QUAD_SIDES(스텁 강제 실패)",
+            failed_groups=["QUAD_SIDES(스텁 강제 실패)"],
+        )
+        preserved = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert preserved["status"] == "TURNAROUND_READY", preserved["status"]
+        assert preserved["failed_groups"] == ["QUAD_SIDES(스텁 강제 실패)"], preserved
+        assert set(preserved["views"]) == set(quad_state["views"]), preserved["views"]
+        assert quad_payload["pending_rounds"] == [], quad_payload["pending_rounds"]
+        assert texture_module.can_bake_diffuse(bpy.context)
+        assert not texture_module.has_stalled_texture_state(bpy.context)
+        assert all(Path(path).is_file() for path in preserved["views"].values())
+
+        # 상태 1.4가 베이크 검증을 통과하고 6시점 소스를 모두 쓴다.
+        _objects, validated, _jobs = texture_module._validated_bake_targets(bpy.context)
+        assert validated["composition"] == "QUAD"
+        assert texture_module.can_bake_diffuse(bpy.context)
+        assert bpy.ops.uvmapping.bake_diffuse() == {"FINISHED"}, settings.texture_status
+        quad_applied = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert quad_applied["status"] == "ALBEDO_APPLIED"
+        assert quad_applied["bake_settings"]["layout"] == "QUAD"
+        assert set(quad_applied["bake_stats"]["view_names"]) == {
+            "FRONT",
+            "RIGHT",
+            "BACK",
+            "LEFT",
+            "TOP",
+            "BOTTOM",
+        }, quad_applied["bake_stats"].get("view_names")
+        Path(quad_applied["verification"]["sheet"]).unlink(missing_ok=True)
+        Path(settings.texture_diffuse_path).unlink(missing_ok=True)
+        for group in quad_state["groups"]:
+            Path(group["image_path"]).unlink(missing_ok=True)
+            Path(group["geometry_contact_sheet"]).unlink(missing_ok=True)
+        for path in quad_state["views"].values():
+            Path(path).unlink(missing_ok=True)
+        settings.target_objects.clear()
+
+        # 첫 생성에서 그룹 하나가 실패하면 6시점이 채워지지 않으므로 베이크를 막고,
+        # 초기화 버튼이 노출되어 빠져나갈 길이 있어야 한다.
+        batch_calls.clear()
+        fail_groups.add("QUAD_CAPS")
+        entry = settings.target_objects.add()
+        entry.object = cube
+        try:
+            assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+            assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+            assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+            assert not texture_module._ACTIVE_RUNS
+        finally:
+            fail_groups.clear()
+        failed_state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert failed_state["status"] == "TURNAROUND_FAILED_GROUPS", failed_state["status"]
+        assert failed_state["failed_groups"], failed_state
+        # 성공한 그룹의 크롭은 버리지 않는다.
+        assert set(failed_state["views"]) == {"front", "back", "left", "right"}, failed_state["views"]
+        assert not texture_module.can_bake_diffuse(bpy.context)
+        assert texture_module.has_stalled_texture_state(bpy.context)
+        assert bpy.ops.uvmapping.reset_texture_state() == {"FINISHED"}
+        assert cube.get(texture_module.TEXTURE_DESIGN_STATE_PROPERTY) is None
+        assert not texture_module.has_stalled_texture_state(bpy.context)
+        for path in failed_state["views"].values():
+            Path(path).unlink(missing_ok=True)
+        for group in failed_state["groups"]:
+            # 실패한 그룹은 결과 경로가 비어 있다.
+            for recorded in (group["image_path"], group["geometry_contact_sheet"]):
+                if recorded:
+                    Path(recorded).unlink(missing_ok=True)
+        settings.target_objects.clear()
+        settings.turnaround_layout = "SIX"
+        settings.auto_regenerate_attempts = 1
+        settings.texture_diffuse_path = ""
 
         # 순차 인페인팅 모드: 시점마다 1회씩 호출하고, 앞 시점의 부분 베이크를
         # 텍스처 가이드로 넘기며, 마지막 시점 뒤 자동 적용까지 이어져야 한다.

@@ -15,20 +15,29 @@ from uvmapping.texture_pipeline import (
     ALL_VIEWS,
     ASPECT_RATIO_OPTIONS,
     DEFAULT_LAYOUT_NAME,
+    FRONT_COLOR_REFERENCE_ROLE,
+    GROUP_LAYOUTS,
     IMAGE_SIZE_OPTIONS,
+    INLINE_IMAGE_ROLES,
+    MAX_TURNAROUND_GROUPS,
     resolve_image_size,
     InlineImage,
     LEGACY_LAYOUT_NAME,
+    TURNAROUND_COMPOSITIONS,
     TURNAROUND_LAYOUTS,
     TURNAROUND_VIEWS,
+    TurnaroundBatchRequest,
+    TurnaroundComposition,
     TurnaroundLayout,
     aspect_value,
     build_reference_analysis_prompt,
+    build_turnaround_batch_request,
     build_turnaround_request,
     compile_sequential_view_prompt,
     compile_turnaround_prompt,
     normalize_reference_analysis,
     parse_reference_analysis,
+    resolve_composition,
     resolve_layout,
     single_view_layout,
     validate_reference_image_path,
@@ -316,7 +325,7 @@ def test_contact_sheet_cells_and_crop_cells_share_one_rule() -> None:
             assert right - left == width // layout.columns and top - bottom == height // layout.rows
         # 첫 셀은 항상 캔버스 위쪽 행이다.
         assert layout.grid_cell_bounds(width, height, 0)[3] == height - (height % layout.rows)
-    assert ASPECT_RATIO_OPTIONS == ("1:1", "21:9", "3:2")
+    assert ASPECT_RATIO_OPTIONS == ("16:9", "1:1", "21:9", "3:2")
     assert resolve_layout(None).name == LEGACY_LAYOUT_NAME == "THREE"
     assert DEFAULT_LAYOUT_NAME == "SIX"
     try:
@@ -480,6 +489,346 @@ def test_regeneration_feedback_adds_mask_contract_outside_shape_contract() -> No
         regeneration_feedback=("LEFT",),
     )
     assert "LEFT SIDE 시점" in request.prompt
+
+
+def _quad_contact_sheets() -> dict[str, InlineImage]:
+    return {
+        name: InlineImage("image/png", f"{name}-guide", "geometry_contact_sheet", name)
+        for name in resolve_composition("QUAD").group_names
+    }
+
+
+def test_quad_composition_covers_every_view_exactly_once_in_two_rounds() -> None:
+    quad = resolve_composition("QUAD")
+
+    assert quad.name == "QUAD"
+    assert len(quad.groups) == MAX_TURNAROUND_GROUPS == 4
+    assert quad.group_names == ("QUAD_FRONT", "QUAD_BACK", "QUAD_SIDES", "QUAD_CAPS")
+    # 시점 합집합은 6면 전체이고 그룹 간 중복이 없다(순서는 그룹 순서를 따른다).
+    assert set(quad.views) == set(ALL_VIEWS)
+    assert len(quad.views) == len(set(quad.views)) == len(ALL_VIEWS)
+    assert quad.views == ("FRONT", "BACK", "LEFT", "RIGHT", "TOP", "BOTTOM")
+    # 라운드1은 FRONT 단독, 라운드2는 나머지 3그룹 병렬.
+    assert quad.rounds == (("QUAD_FRONT",), ("QUAD_BACK", "QUAD_SIDES", "QUAD_CAPS"))
+    assert sorted(name for names in quad.rounds for name in names) == sorted(quad.group_names)
+    assert quad.round_index("QUAD_FRONT") == 0
+    assert quad.round_index("QUAD_CAPS") == 1
+    assert quad.group_of_view("left").name == "QUAD_SIDES"
+    assert quad.group_of_view("BOTTOM").name == "QUAD_CAPS"
+    assert quad.default_image_size == "2K"
+    assert quad.is_single_canvas is False
+
+    # THREE/SIX는 그룹 1개짜리 구성으로 감싼 것이며 기존 레이아웃을 그대로 쓴다.
+    for name in ("THREE", "SIX"):
+        composition = resolve_composition(name)
+        assert composition.groups == (TURNAROUND_LAYOUTS[name],)
+        assert composition.rounds == ((name,),)
+        assert composition.views == TURNAROUND_LAYOUTS[name].views
+        assert composition.is_single_canvas is True
+    assert resolve_composition(None).name == LEGACY_LAYOUT_NAME == "THREE"
+    assert resolve_composition("") .name == "THREE"
+    assert resolve_composition(resolve_composition("SIX")).name == "SIX"
+    assert set(TURNAROUND_COMPOSITIONS) == {"THREE", "SIX", "QUAD"}
+    _expect_value_error(lambda: resolve_composition("NINE"), "지원하지 않는 다면도 구성")
+    _expect_value_error(lambda: quad.group("QUAD_NOSE"), "구성에 없는 그룹")
+    _expect_value_error(lambda: quad.group_of_view("DIAGONAL"), "구성에 없는 시점")
+
+
+def test_composition_rejects_broken_invariants() -> None:
+    front = GROUP_LAYOUTS["QUAD_FRONT"]
+    sides = GROUP_LAYOUTS["QUAD_SIDES"]
+    caps = GROUP_LAYOUTS["QUAD_CAPS"]
+    back = GROUP_LAYOUTS["QUAD_BACK"]
+    overlapping = TurnaroundLayout("OVERLAP", ("LEFT", "TOP"), 2, 1, "16:9")
+
+    _expect_value_error(
+        lambda: TurnaroundComposition("TOO_MANY", (front, back, sides, caps, overlapping), ()),
+        f"{MAX_TURNAROUND_GROUPS}개 이하",
+    )
+    _expect_value_error(lambda: TurnaroundComposition("EMPTY", (), ()), "1개 이상")
+    _expect_value_error(
+        lambda: TurnaroundComposition("DUP", (front, front), (("QUAD_FRONT",), ("QUAD_FRONT",))),
+        "그룹 이름은 중복될 수 없습니다",
+    )
+    _expect_value_error(
+        lambda: TurnaroundComposition("VIEWDUP", (sides, overlapping), (("QUAD_SIDES", "OVERLAP"),)),
+        "그룹 간에도 중복될 수 없습니다",
+    )
+    _expect_value_error(
+        lambda: TurnaroundComposition("MISSING", (front, back), (("QUAD_FRONT",),)),
+        "정확히 한 번씩",
+    )
+
+
+def test_quad_group_cells_share_one_rule_on_wide_and_square_canvases() -> None:
+    """2×1 16:9와 1×1 1:1에서도 합성 원점과 크롭 경계가 같은 셀 규칙을 공유해야 한다."""
+
+    sides = GROUP_LAYOUTS["QUAD_SIDES"]
+    assert (sides.views, sides.columns, sides.rows, sides.aspect_ratio) == (
+        ("LEFT", "RIGHT"),
+        2,
+        1,
+        "16:9",
+    )
+    assert GROUP_LAYOUTS["QUAD_CAPS"].views == ("TOP", "BOTTOM")
+    assert GROUP_LAYOUTS["QUAD_FRONT"].views == ("FRONT",)
+    assert GROUP_LAYOUTS["QUAD_BACK"].views == ("BACK",)
+    # 계획서 결정 1의 배치 산술: 캡처 1024의 2셀 16:9 캔버스는 2048×1152다.
+    assert sides.canvas_size(1024) == (2048, 1152)
+    assert GROUP_LAYOUTS["QUAD_FRONT"].canvas_size(1024) == (1024, 1024)
+    assert sides.centered_cell_origin(2048, 1152, 0, 1024, 1024) == (0, 64)
+    assert sides.centered_cell_origin(2048, 1152, 1, 1024, 1024) == (1024, 64)
+    # 크롭 셀은 캔버스를 좌/우 절반으로 정확히 나누고 겹치지 않는다.
+    assert sides.grid_cell_bounds(2048, 1152, 0) == (0, 0, 1024, 1152)
+    assert sides.grid_cell_bounds(2048, 1152, 1) == (1024, 0, 2048, 1152)
+
+    for name in ("QUAD_FRONT", "QUAD_BACK", "QUAD_SIDES", "QUAD_CAPS"):
+        layout = GROUP_LAYOUTS[name]
+        for capture in (1024, 112):
+            width, height = layout.canvas_size(capture)
+            assert abs(width / height - aspect_value(layout.aspect_ratio)) < 0.01, (name, capture)
+            for index in range(layout.cell_count):
+                left, bottom, right, top = layout.grid_cell_bounds(width, height, index)
+                x, y = layout.centered_cell_origin(width, height, index, capture, capture)
+                assert left <= x and x + capture <= right, (name, index)
+                assert bottom <= y and y + capture <= top, (name, index)
+                assert right - left == width // layout.columns
+                assert top - bottom == height // layout.rows
+    # 그룹 레이아웃은 별도 레지스트리에 있고 기존 enum 이름 공간을 오염시키지 않는다.
+    assert set(TURNAROUND_LAYOUTS) == {"THREE", "SIX"}
+    assert resolve_layout("quad_sides") is GROUP_LAYOUTS["QUAD_SIDES"]
+    assert "16:9" in ASPECT_RATIO_OPTIONS
+    assert {"1:1", "21:9", "3:2"} <= set(ASPECT_RATIO_OPTIONS)
+    _expect_value_error(lambda: resolve_layout("QUAD"), "resolve_composition")
+    assert resolve_image_size("QUAD", "AUTO") == "2K"
+    assert resolve_image_size("QUAD_SIDES", None) == "2K"
+    assert resolve_image_size("QUAD", "1k") == "1K"
+    _expect_value_error(lambda: resolve_image_size("QUAD", "8K"), ", ".join(IMAGE_SIZE_OPTIONS))
+
+
+def test_batch_request_keeps_one_call_one_image_per_group() -> None:
+    analysis = parse_reference_analysis('{"object_summary":"상자"}')
+    batch = build_turnaround_batch_request(
+        "QUAD", _quad_contact_sheets(), (), analysis, "푸른 천"
+    )
+
+    assert isinstance(batch, TurnaroundBatchRequest)
+    assert batch.composition_name == "QUAD"
+    assert len(batch.requests) == batch.provider_call_count == MAX_TURNAROUND_GROUPS
+    assert batch.views == resolve_composition("QUAD").views
+    assert sorted(batch.views) == sorted(ALL_VIEWS)
+    assert tuple(request.layout_name for request in batch.requests) == (
+        "QUAD_FRONT",
+        "QUAD_BACK",
+        "QUAD_SIDES",
+        "QUAD_CAPS",
+    )
+    assert tuple(request.aspect_ratio for request in batch.requests) == (
+        "1:1",
+        "1:1",
+        "16:9",
+        "16:9",
+    )
+    assert all(request.image_size == "2K" for request in batch.requests)
+    assert all(request.provider_call_count == 1 for request in batch.requests)
+    assert all(request.output_image_count == 1 for request in batch.requests)
+    # 라운드는 requests 인덱스로 옮겨진다.
+    assert batch.rounds == ((0,), (1, 2, 3))
+    assert batch.request_for("quad_caps").views == ("TOP", "BOTTOM")
+    _expect_value_error(lambda: batch.request_for("QUAD_NOSE"), "묶음에 없는 그룹")
+
+    # 그룹 하나라도 비용 계약을 바꾸면 묶음이 거부된다.
+    for changed in ({"provider_call_count": 2}, {"output_image_count": 2}):
+        broken = list(batch.requests)
+        broken[0] = TurnaroundImageRequestStub(batch.requests[0], **changed)
+        _expect_value_error(
+            lambda broken=broken: TurnaroundBatchRequest("QUAD", tuple(broken)),
+            "1회 호출" if "provider_call_count" in changed else "1장만",
+        )
+    # 그룹 수, 순서, 시점 합집합이 어긋나면 거부한다.
+    _expect_value_error(
+        lambda: TurnaroundBatchRequest("QUAD", batch.requests[:3]), "그룹 4개의 요청"
+    )
+    _expect_value_error(
+        lambda: TurnaroundBatchRequest("QUAD", (batch.requests[1], *batch.requests[1:])),
+        "그룹 순서와 달라집니다",
+    )
+    reordered = (batch.requests[0], batch.requests[1], batch.requests[3], batch.requests[2])
+    _expect_value_error(
+        lambda: TurnaroundBatchRequest("QUAD", reordered), "그룹 순서와 달라집니다"
+    )
+    _expect_value_error(
+        lambda: build_turnaround_batch_request("QUAD", {}, (), analysis, "천"),
+        "형상 가이드 이미지가 없습니다",
+    )
+    _expect_value_error(
+        lambda: build_turnaround_batch_request(
+            "QUAD", _quad_contact_sheets(), (), analysis, "천",
+            regeneration_feedback={"QUAD_NOSE": ("FRONT",)},
+        ),
+        "구성에 없는 그룹",
+    )
+    # 단일 캔버스 구성도 같은 자료구조로 표현된다.
+    six = build_turnaround_batch_request(
+        "SIX",
+        {"SIX": InlineImage("image/png", "guide", "geometry_contact_sheet")},
+        (),
+        analysis,
+        "",
+    )
+    assert len(six.requests) == 1 and six.rounds == ((0,),)
+    assert six.requests[0].layout_name == "SIX" and six.requests[0].aspect_ratio == "3:2"
+
+
+class TurnaroundImageRequestStub:
+    """비용 계약 위반을 만들기 위해 계약 검증을 건너뛴 가짜 요청."""
+
+    def __init__(self, source, **overrides) -> None:
+        for field in ("layout_name", "views", "provider_call_count", "output_image_count"):
+            setattr(self, field, overrides.get(field, getattr(source, field)))
+
+
+def test_quad_group_prompts_fix_cell_wording_and_front_reference_numbering() -> None:
+    analysis = normalize_reference_analysis({"object_summary": "낡은 나무 상자"})
+
+    sides = compile_turnaround_prompt(analysis, "", layout="QUAD_SIDES")
+    assert "2시점도 한 장" in sides
+    assert "16:9 캔버스를 같은 너비의 2열로 나눕니다" in sides
+    assert "왼쪽부터 LEFT SIDE | RIGHT SIDE 순서" in sides
+    assert "두 칸을 하나의 넓은 그림으로 합치지 마십시오" in sides
+    assert "두 칸 사이에 구분선, 테두리, 배경색 차이를 넣지 않습니다" in sides
+    assert "실제 왼쪽 면" in sides
+
+    front = compile_turnaround_prompt(analysis, "", layout="QUAD_FRONT")
+    assert "단일 시점도 한 장" in front
+    assert "하나의 1:1 캔버스에 시점 하나만 담습니다" in front
+    # 1셀에서 "1열로 나눕니다" 같은 어색한 분할 문구가 나오면 안 된다.
+    assert "나눕니다" not in front
+    assert "1열" not in front
+    # 순차 모드의 인페인팅 문장은 라운드1에 칠해진 영역이 없으므로 들어가지 않는다.
+    assert "회색(미채색) 영역만" not in front
+    assert "이미 일부가 채색된" not in front
+    assert "두 칸" not in front
+    assert "중앙 정사각형 viewport" in front
+
+    caps = compile_turnaround_prompt(analysis, "", layout="QUAD_CAPS")
+    assert "윗줄" not in caps
+    assert "왼쪽부터 TOP | BOTTOM 순서" in caps
+    assert "정면(FRONT)이 아래쪽" in caps and "정면(FRONT)이 위쪽" in caps
+
+    # FRONT 색 참조가 붙으면 문단이 생기고 사용자 참조 번호가 한 칸 밀린다.
+    plain = compile_turnaround_prompt(analysis, "", layout="QUAD_BACK", reference_image_count=2)
+    assert "두 번째 이후 이미지 2장(role=palette_only)" in plain
+    assert "FRONT 색 기준" not in plain
+
+    shifted = compile_turnaround_prompt(
+        analysis, "", layout="QUAD_BACK", reference_image_count=2, front_reference=True
+    )
+    assert f"- 두 번째 이미지(role={FRONT_COLOR_REFERENCE_ROLE})" in shifted
+    assert "세 번째 이후 이미지 2장(role=palette_only)" in shifted
+    assert "두 번째 이후 이미지" not in shifted
+    assert "FRONT 색 기준(형상 계약 다음으로 우선):" in shifted
+    assert "형상은 첫 번째, 색은 두 번째를 따릅니다" in shifted
+    # FRONT 참조 문단은 형상 계약 뒤, 스타일 근거 앞에 온다.
+    assert shifted.index("형상 계약") < shifted.index("FRONT 색 기준") < shifted.index("분석 JSON")
+
+    # 참조 이미지가 없을 때도 FRONT 참조만으로 번호가 어긋나지 않는다.
+    only_front = compile_turnaround_prompt(
+        analysis, "", layout="QUAD_SIDES", reference_image_count=0, front_reference=True
+    )
+    assert f"- 두 번째 이미지(role={FRONT_COLOR_REFERENCE_ROLE})" in only_front
+    assert "세 번째" not in only_front
+    assert "입력 이미지는 첫 번째 한 장뿐입니다" not in only_front
+    # 분석 없이 사용자 지시만 있는 경로도 같은 번호 규칙을 쓴다.
+    prompt_only = compile_turnaround_prompt(
+        None, "빨간 주사위", layout="QUAD_CAPS", front_reference=True
+    )
+    assert f"- 두 번째 이미지(role={FRONT_COLOR_REFERENCE_ROLE})" in prompt_only
+    assert "이 외의 입력 이미지는 없습니다" not in prompt_only
+
+
+def test_batch_request_attaches_front_reference_only_to_later_rounds() -> None:
+    analysis = parse_reference_analysis('{"object_summary":"상자"}')
+    front_image = InlineImage("image/png", "front-result", FRONT_COLOR_REFERENCE_ROLE, "front")
+    user_reference = InlineImage("image/jpeg", "palette", "reference", "pinterest")
+    batch = build_turnaround_batch_request(
+        "QUAD",
+        _quad_contact_sheets(),
+        (user_reference,),
+        analysis,
+        "푸른 천",
+        front_reference=front_image,
+    )
+
+    first = batch.request_for("QUAD_FRONT")
+    assert first.reference_images == (user_reference,)
+    assert "FRONT 색 기준" not in first.prompt
+    assert "두 번째 이후 이미지 1장(role=palette_only)" in first.prompt
+    for name in ("QUAD_BACK", "QUAD_SIDES", "QUAD_CAPS"):
+        later = batch.request_for(name)
+        assert later.reference_images == (front_image, user_reference)
+        assert "FRONT 색 기준(형상 계약 다음으로 우선):" in later.prompt
+        assert "세 번째 이후 이미지 1장(role=palette_only)" in later.prompt
+
+    # 라운드1을 아직 실행하지 않았으면 참조 없이도 묶음을 만들 수 있다.
+    pending = build_turnaround_batch_request(
+        "QUAD", _quad_contact_sheets(), (), analysis, "천"
+    )
+    assert all(request.reference_images == () for request in pending.requests)
+    _expect_value_error(
+        lambda: build_turnaround_batch_request(
+            "QUAD",
+            _quad_contact_sheets(),
+            (),
+            analysis,
+            "천",
+            front_reference=InlineImage("image/png", "front-result", "reference"),
+        ),
+        f"역할은 {FRONT_COLOR_REFERENCE_ROLE}",
+    )
+
+
+def test_composition_declares_its_color_reference_view() -> None:
+    """뒤 라운드가 색을 맞출 기준 시점은 위치가 아니라 구성이 명시한다."""
+
+    quad = resolve_composition("QUAD")
+    assert quad.color_reference_view == "FRONT"
+    assert quad.reference_view == "FRONT"
+    # 기준 시점은 첫 라운드에서 반드시 확보되는 시점이어야 한다.
+    assert quad.reference_view in quad.group(quad.rounds[0][0]).views
+    # 선언하지 않은 구성은 첫 라운드 첫 그룹의 첫 시점을 쓴다(기존 동작).
+    six = resolve_composition("SIX")
+    assert six.color_reference_view == ""
+    assert six.reference_view == six.groups[0].views[0] == "FRONT"
+    _expect_value_error(
+        lambda: TurnaroundComposition(
+            "BADREF",
+            (GROUP_LAYOUTS["QUAD_FRONT"], GROUP_LAYOUTS["QUAD_CAPS"]),
+            (("QUAD_FRONT",), ("QUAD_CAPS",)),
+            "TOP",
+        ),
+        "첫 라운드 그룹의 시점",
+    )
+
+
+def test_inline_image_rejects_unknown_roles() -> None:
+    assert INLINE_IMAGE_ROLES == (
+        "geometry_contact_sheet",
+        "reference",
+        FRONT_COLOR_REFERENCE_ROLE,
+    )
+    assert InlineImage("image/png", "data").role == "reference"
+    for role in INLINE_IMAGE_ROLES:
+        assert InlineImage("image/png", "data", role).role == role
+    _expect_value_error(
+        lambda: InlineImage("image/png", "data", "palette_only"), "인라인 이미지 역할은"
+    )
+    _expect_value_error(
+        lambda: build_turnaround_request(
+            InlineImage("image/png", "data", "reference"), [], None, "지시"
+        ),
+        "contact sheet의 역할",
+    )
 
 
 if __name__ == "__main__":

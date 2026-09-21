@@ -186,6 +186,30 @@ def test_turnaround_payload_enforces_openrouter_reference_limit() -> None:
     assert (grid["aspect_ratio"], grid["resolution"], grid["n"]) == ("3:2", "4K", 1)
 
 
+def test_turnaround_payload_accepts_two_cell_group_canvas() -> None:
+    """QUAD의 2셀 그룹 캔버스(16:9)가 화이트리스트를 통과하고 비표준 비율은 막힌다."""
+
+    payload = build_turnaround_payload(
+        "좌우 2칸 캔버스를 그리세요",
+        (("image/png", _PNG),),
+        aspect_ratio="16:9",
+        resolution="2K",
+    )
+    assert (payload["aspect_ratio"], payload["resolution"], payload["n"]) == ("16:9", "2K", 1)
+    # 비표준 2:1은 레이아웃 계약에 없으므로 거부해야 한다.
+    _expect_error(
+        lambda: build_turnaround_payload("p", (("image/png", _PNG),), aspect_ratio="2:1"),
+        "이미지 종횡비는",
+    )
+
+    # contact sheet 1 + FRONT 색 참조 1 + 사용자 참조 5 = 7장까지는 그대로 실린다.
+    references = ((("image/png", _PNG),) * 2) + ((("image/jpeg", _JPG),) * 5)
+    group = build_turnaround_payload("p", references, aspect_ratio="16:9")
+    assert len(group["input_references"]) == 7 <= MAX_INPUT_REFERENCES
+    assert group["n"] == 1
+    json.dumps(group, ensure_ascii=False)
+
+
 def test_worker_forwards_layout_aspect_ratio_and_resolution() -> None:
     """작업 JSON의 종횡비·해상도가 네트워크 호출 본문까지 그대로 전달되는지 본다."""
 

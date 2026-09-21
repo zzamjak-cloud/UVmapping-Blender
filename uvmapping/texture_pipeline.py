@@ -11,7 +11,9 @@ from typing import Any, Mapping, Sequence
 
 ANALYSIS_SCHEMA_VERSION = "1.0"
 DEFAULT_IMAGE_MODEL = "google/gemini-3-pro-image"
-# 6면도 3:2 캔버스에서 2K는 시점당 512px에 그치므로 4K(시점당 1024px)를 기본으로 둔다.
+# 한 캔버스를 여러 칸으로 나눌수록 시점당 실효 픽셀이 줄어든다. 6면도 3:2 6칸은 2K에서
+# 시점당 800px대, 4K에서 1600px대로 **추정**된다(Provider 실제 출력 크기를 측정하기 전의
+# 대략적인 추정치이며 확정값이 아니다). 확정 전에는 이 수치를 근거로 문서를 쓰지 않는다.
 IMAGE_SIZE_OPTIONS = ("1K", "2K", "4K")
 # 사용자가 크기를 고르지 않았을 때 레이아웃 기본값을 쓰라는 표식.
 AUTO_IMAGE_SIZE = "AUTO"
@@ -56,8 +58,8 @@ class TurnaroundLayout:
     columns: int
     rows: int
     aspect_ratio: str
-    # 비용과 시점당 해상도의 절충값. 6면도는 2K(시점당 512px), 3면도는 1K로 충분하고
-    # 4K는 비용이 크므로 사용자가 직접 고를 때만 쓴다.
+    # 비용과 시점당 해상도의 절충값. 6면도는 2K, 3면도는 1K로 충분하고 4K는 비용이 크므로
+    # 사용자가 직접 고를 때만 쓴다. 시점당 픽셀 수의 절대값은 아직 추정이다(모듈 상단 주석 참고).
     default_image_size: str = "2K"
 
     def __post_init__(self) -> None:
@@ -141,6 +143,15 @@ TURNAROUND_LAYOUTS: Mapping[str, TurnaroundLayout] = {
     "THREE": TurnaroundLayout("THREE", ("FRONT", "RIGHT", "BACK"), 3, 1, "21:9", "1K"),
     "SIX": TurnaroundLayout("SIX", ALL_VIEWS, 3, 2, "3:2", "2K"),
 }
+# 한 번의 "다면도 생성"을 여러 캔버스로 쪼갤 때 쓰는 그룹 레이아웃. 그룹 하나가 캔버스 하나이자
+# Provider 1회 호출이다. TURNAROUND_LAYOUTS와 이름 공간을 나눠 두어야 기존 레이아웃 enum과
+# 구성(composition) 이름이 섞이지 않는다.
+GROUP_LAYOUTS: Mapping[str, TurnaroundLayout] = {
+    "QUAD_FRONT": TurnaroundLayout("QUAD_FRONT", ("FRONT",), 1, 1, "1:1", "2K"),
+    "QUAD_BACK": TurnaroundLayout("QUAD_BACK", ("BACK",), 1, 1, "1:1", "2K"),
+    "QUAD_SIDES": TurnaroundLayout("QUAD_SIDES", ("LEFT", "RIGHT"), 2, 1, "16:9", "2K"),
+    "QUAD_CAPS": TurnaroundLayout("QUAD_CAPS", ("TOP", "BOTTOM"), 2, 1, "16:9", "2K"),
+}
 SINGLE_VIEW_LAYOUT_NAME = "SINGLE_VIEW"
 SINGLE_VIEW_ASPECT_RATIO = "1:1"
 # 새 생성의 기본 구성. 구버전 상태(레이아웃 기록 없음) 해석에는 쓰지 않는다.
@@ -153,7 +164,11 @@ TURNAROUND_VIEWS = TURNAROUND_LAYOUTS[LEGACY_LAYOUT_NAME].views
 DEFAULT_ASPECT_RATIO = TURNAROUND_LAYOUTS[LEGACY_LAYOUT_NAME].aspect_ratio
 # Provider에 보낼 수 있는 종횡비는 레이아웃 계약에서만 나온다.
 ASPECT_RATIO_OPTIONS = tuple(
-    sorted({layout.aspect_ratio for layout in TURNAROUND_LAYOUTS.values()} | {SINGLE_VIEW_ASPECT_RATIO})
+    sorted(
+        {layout.aspect_ratio for layout in TURNAROUND_LAYOUTS.values()}
+        | {layout.aspect_ratio for layout in GROUP_LAYOUTS.values()}
+        | {SINGLE_VIEW_ASPECT_RATIO}
+    )
 )
 
 
@@ -166,12 +181,32 @@ def single_view_layout(view: str) -> TurnaroundLayout:
     return TurnaroundLayout(SINGLE_VIEW_LAYOUT_NAME, (name,), 1, 1, SINGLE_VIEW_ASPECT_RATIO, "1K")
 
 
-def resolve_image_size(layout: TurnaroundLayout | str | None, requested: str | None) -> str:
-    """요청 크기가 비어 있거나 AUTO면 레이아웃 기본 크기를 돌려준다."""
+def _default_image_size_source(
+    layout: "TurnaroundComposition | TurnaroundLayout | str | None",
+) -> "TurnaroundComposition | TurnaroundLayout":
+    """기본 이미지 크기의 근거가 될 구성 또는 레이아웃을 고른다.
+
+    ``"SIX"``처럼 구성과 레이아웃이 같은 이름을 쓰는 경우 구성을 먼저 찾지만, 구성의
+    기본 크기는 첫 그룹 레이아웃에서 나오므로 기존 반환값과 동일하다.
+    """
+
+    if isinstance(layout, TurnaroundComposition):
+        return layout
+    if layout is not None and not isinstance(layout, TurnaroundLayout):
+        name = str(layout).upper()
+        if name in TURNAROUND_COMPOSITIONS:
+            return TURNAROUND_COMPOSITIONS[name]
+    return resolve_layout(layout)
+
+
+def resolve_image_size(
+    layout: "TurnaroundComposition | TurnaroundLayout | str | None", requested: str | None
+) -> str:
+    """요청 크기가 비어 있거나 AUTO면 구성 또는 레이아웃의 기본 크기를 돌려준다."""
 
     value = str(requested or "").strip().upper()
     if not value or value == AUTO_IMAGE_SIZE:
-        return resolve_layout(layout).default_image_size
+        return _default_image_size_source(layout).default_image_size
     if value not in IMAGE_SIZE_OPTIONS:
         raise ValueError(f"이미지 해상도는 {', '.join(IMAGE_SIZE_OPTIONS)} 중 하나여야 합니다.")
     return value
@@ -187,9 +222,148 @@ def resolve_layout(layout: TurnaroundLayout | str | None) -> TurnaroundLayout:
     name = str(layout).upper()
     if name == SINGLE_VIEW_LAYOUT_NAME:
         raise ValueError("SINGLE_VIEW 레이아웃은 single_view_layout(view)로 만들어야 합니다.")
-    if name not in TURNAROUND_LAYOUTS:
-        raise ValueError(f"지원하지 않는 3면도 레이아웃입니다: {layout}")
-    return TURNAROUND_LAYOUTS[name]
+    if name in TURNAROUND_LAYOUTS:
+        return TURNAROUND_LAYOUTS[name]
+    if name in GROUP_LAYOUTS:
+        return GROUP_LAYOUTS[name]
+    if name in TURNAROUND_COMPOSITIONS and name not in TURNAROUND_LAYOUTS:
+        # 여러 캔버스로 나뉘는 구성은 단일 격자가 아니므로 레이아웃으로 해석하면 안 된다.
+        raise ValueError(
+            f"{name}은(는) 단일 격자가 아닙니다. resolve_composition을 사용하십시오."
+        )
+    raise ValueError(f"지원하지 않는 3면도 레이아웃입니다: {layout}")
+
+
+# 그룹 하나가 곧 Provider 1회 호출이므로 이 값이 "다면도 생성" 1번의 호출 수 상한이다.
+MAX_TURNAROUND_GROUPS = 4
+
+
+@dataclass(frozen=True, slots=True)
+class TurnaroundComposition:
+    """"다면도 생성" 1번이 만드는 그룹 묶음.
+
+    그룹 하나 = 캔버스 하나 = Provider 1회 호출이다. 단일 캔버스 구성(THREE/SIX)도
+    그룹이 하나인 구성으로 표현해 실행 경로가 같은 자료구조를 공유하게 한다.
+    """
+
+    name: str
+    groups: tuple[TurnaroundLayout, ...]
+    # 라운드별 그룹 이름. 뒤 라운드는 앞 라운드의 결과를 색 참조로 받는다.
+    rounds: tuple[tuple[str, ...], ...]
+    # 뒤 라운드가 팔레트를 맞출 기준 시점. 비우면 첫 라운드 첫 그룹의 첫 시점을 쓴다.
+    color_reference_view: str = ""
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.groups) <= MAX_TURNAROUND_GROUPS:
+            raise ValueError(f"구성의 그룹 수는 1개 이상 {MAX_TURNAROUND_GROUPS}개 이하여야 합니다.")
+        names = [group.name for group in self.groups]
+        if len(set(names)) != len(names):
+            raise ValueError("구성 안의 그룹 이름은 중복될 수 없습니다.")
+        views = [view for group in self.groups for view in group.views]
+        if len(set(views)) != len(views):
+            raise ValueError("구성 안의 시점은 그룹 간에도 중복될 수 없습니다.")
+        covered = [name for round_names in self.rounds for name in round_names]
+        if sorted(covered) != sorted(names):
+            raise ValueError("라운드는 모든 그룹을 정확히 한 번씩 덮어야 합니다.")
+        if self.color_reference_view and self.color_reference_view not in self._first_round_views():
+            raise ValueError(
+                "색 기준 시점은 첫 라운드 그룹의 시점이어야 합니다: "
+                f"{self.color_reference_view}"
+            )
+
+    def _first_round_views(self) -> tuple[str, ...]:
+        return tuple(
+            view for name in self.rounds[0] for view in self.group(name).views
+        )
+
+    @property
+    def reference_view(self) -> str:
+        """뒤 라운드 그룹이 색을 맞출 기준 시점. 첫 라운드에서 반드시 확보된다."""
+
+        return self.color_reference_view or self._first_round_views()[0]
+
+    @property
+    def views(self) -> tuple[str, ...]:
+        """그룹 순서대로 평탄화한 시점 목록."""
+
+        return tuple(view for group in self.groups for view in group.views)
+
+    @property
+    def group_names(self) -> tuple[str, ...]:
+        return tuple(group.name for group in self.groups)
+
+    @property
+    def default_image_size(self) -> str:
+        """구성의 기본 이미지 크기. 그룹별 기본값이 같으므로 첫 그룹에서 가져온다."""
+
+        return self.groups[0].default_image_size
+
+    @property
+    def is_single_canvas(self) -> bool:
+        """그룹이 하나면 기존 단일 호출 경로를 그대로 쓸 수 있다."""
+
+        return len(self.groups) == 1
+
+    def group(self, name: str) -> TurnaroundLayout:
+        wanted = str(name).upper()
+        for candidate in self.groups:
+            if candidate.name == wanted:
+                return candidate
+        raise ValueError(f"{self.name} 구성에 없는 그룹입니다: {name}")
+
+    def group_of_view(self, view: str) -> TurnaroundLayout:
+        """시점이 속한 그룹을 돌려준다. 그룹 단위 재생성이 이 매핑을 쓴다."""
+
+        wanted = str(view).upper()
+        for candidate in self.groups:
+            if wanted in candidate.views:
+                return candidate
+        raise ValueError(f"{self.name} 구성에 없는 시점입니다: {view}")
+
+    def round_index(self, group_name: str) -> int:
+        wanted = str(group_name).upper()
+        for index, round_names in enumerate(self.rounds):
+            if wanted in round_names:
+                return index
+        raise ValueError(f"{self.name} 구성에 없는 그룹입니다: {group_name}")
+
+
+TURNAROUND_COMPOSITIONS: Mapping[str, TurnaroundComposition] = {
+    "THREE": TurnaroundComposition("THREE", (TURNAROUND_LAYOUTS["THREE"],), (("THREE",),)),
+    "SIX": TurnaroundComposition("SIX", (TURNAROUND_LAYOUTS["SIX"],), (("SIX",),)),
+    # QUAD는 FRONT를 먼저 만들고 그 결과를 색 기준으로 삼아 나머지 3그룹을 병렬 생성한다.
+    "QUAD": TurnaroundComposition(
+        "QUAD",
+        (
+            GROUP_LAYOUTS["QUAD_FRONT"],
+            GROUP_LAYOUTS["QUAD_BACK"],
+            GROUP_LAYOUTS["QUAD_SIDES"],
+            GROUP_LAYOUTS["QUAD_CAPS"],
+        ),
+        (("QUAD_FRONT",), ("QUAD_BACK", "QUAD_SIDES", "QUAD_CAPS")),
+        "FRONT",
+    ),
+}
+# 새 생성의 기본 구성과 구버전 상태(구성 기록 없음) 해석용 구성.
+DEFAULT_COMPOSITION_NAME = DEFAULT_LAYOUT_NAME
+LEGACY_COMPOSITION_NAME = LEGACY_LAYOUT_NAME
+
+
+def resolve_composition(
+    composition: TurnaroundComposition | str | None,
+) -> TurnaroundComposition:
+    """구성 이름 또는 객체를 정규화한다. ``None``은 구버전 상태와 같은 3면도 구성이다."""
+
+    if composition is None:
+        return TURNAROUND_COMPOSITIONS[LEGACY_COMPOSITION_NAME]
+    if isinstance(composition, TurnaroundComposition):
+        return composition
+    name = str(composition).strip().upper()
+    if not name:
+        return TURNAROUND_COMPOSITIONS[LEGACY_COMPOSITION_NAME]
+    if name not in TURNAROUND_COMPOSITIONS:
+        raise ValueError(f"지원하지 않는 다면도 구성입니다: {composition}")
+    return TURNAROUND_COMPOSITIONS[name]
 
 
 def validate_reference_image_path(path: str | Path) -> tuple[Path, str]:
@@ -297,13 +471,23 @@ class ReferenceAnalysis:
         return asdict(self)
 
 
+# 실제 모델 형상 가이드. 프롬프트의 "첫 번째 이미지"가 항상 이 역할이다.
+CONTACT_SHEET_ROLE = "geometry_contact_sheet"
+# 사용자가 고른 스타일 참조. 색과 재질 표현만 가져온다.
+USER_REFERENCE_ROLE = "reference"
+# 앞 라운드에서 만든 FRONT 완성본. 뒤 라운드의 색 기준이다.
+FRONT_COLOR_REFERENCE_ROLE = "front_color_reference"
+# 역할이 늘어나면 프롬프트의 입력 이미지 번호 매기기도 함께 바뀌어야 하므로 화이트리스트로 못 박는다.
+INLINE_IMAGE_ROLES = (CONTACT_SHEET_ROLE, USER_REFERENCE_ROLE, FRONT_COLOR_REFERENCE_ROLE)
+
+
 @dataclass(frozen=True, slots=True)
 class InlineImage:
     """Provider에 전달할 base64 인라인 이미지."""
 
     mime_type: str
     data_base64: str
-    role: str = "reference"
+    role: str = USER_REFERENCE_ROLE
     name: str = ""
 
     def __post_init__(self) -> None:
@@ -311,6 +495,10 @@ class InlineImage:
             raise ValueError("인라인 이미지는 image/* MIME 형식이어야 합니다.")
         if not self.data_base64.strip():
             raise ValueError("인라인 이미지 데이터가 비어 있습니다.")
+        if self.role not in INLINE_IMAGE_ROLES:
+            raise ValueError(
+                f"인라인 이미지 역할은 {', '.join(INLINE_IMAGE_ROLES)} 중 하나여야 합니다: {self.role}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,7 +535,7 @@ class TurnaroundImageRequest:
             raise ValueError(f"이미지 해상도는 {', '.join(IMAGE_SIZE_OPTIONS)} 중 하나여야 합니다.")
         if self.provider_call_count != 1 or self.output_image_count != 1:
             raise ValueError("비용 절감을 위해 Provider 1회 호출과 결과 1장만 허용합니다.")
-        if self.contact_sheet.role != "geometry_contact_sheet":
+        if self.contact_sheet.role != CONTACT_SHEET_ROLE:
             raise ValueError("실제 모델 contact sheet의 역할이 올바르지 않습니다.")
         # 참조 이미지는 선택 사항이다. 없으면 프롬프트만으로 스타일을 정한다.
 
@@ -580,19 +768,46 @@ def parse_reference_analysis(raw_text: str) -> ReferenceAnalysis:
     return normalize_reference_analysis(payload)
 
 
+# FRONT 색 참조가 끼면 사용자 참조는 세 번째 이미지부터 시작한다. 번호가 어긋나면
+# 모델이 참조 역할을 뒤바꿔 해석하므로 한 곳에서만 만들어 쓴다.
+_FRONT_REFERENCE_ROLE_LINE = (
+    f"- 두 번째 이미지(role={FRONT_COLOR_REFERENCE_ROLE}): 같은 모델의 FRONT 시점 완성본입니다. "
+    "색과 재질의 기준으로만 사용하고 형상은 첫 번째 이미지를 따릅니다."
+)
+
+
 def _style_sections(
     analysis: ReferenceAnalysis | Mapping[str, Any] | None,
     user_prompt: str,
     reference_image_count: int,
     guide_description: str,
+    *,
+    front_reference: bool = False,
 ) -> tuple[str, str]:
-    """입력 이미지 역할 문단과 스타일 근거 문단을 만든다."""
+    """입력 이미지 역할 문단과 스타일 근거 문단을 만든다.
+
+    ``front_reference``가 참이면 두 번째 이미지가 FRONT 완성본이므로 사용자 참조의
+    번호를 "세 번째 이후"로 한 칸 밀어 적는다.
+    """
 
     if reference_image_count and analysis is None:
         raise ValueError("참조 이미지를 함께 보낼 때는 참조 분석이 필요합니다.")
     if analysis is None:
         if not user_prompt.strip():
             raise ValueError("참조 분석이 없으면 사용자 지시가 필요합니다.")
+        if front_reference:
+            role_section = (
+                f"- 첫 번째 이미지(role={CONTACT_SHEET_ROLE}): {guide_description} "
+                "실루엣, 비율, 부품 배치를 반드시 이 이미지에 맞춥니다.\n"
+                f"{_FRONT_REFERENCE_ROLE_LINE}"
+            )
+            style_section = (
+                "스타일 근거:\n"
+                "- 참조 이미지가 없습니다. 아래 사용자 지시와 두 번째 이미지의 색을 색, 재질 표현, "
+                "분위기의 근거로 사용합니다.\n"
+                "- 지시가 다루지 않는 부분은 깔끔한 캐주얼 게임 손맵 스타일로 절제해 표현합니다."
+            )
+            return role_section, style_section
         role_section = (
             f"- 첫 번째 이미지(role=geometry_contact_sheet): {guide_description} "
             "실루엣, 비율, 부품 배치를 반드시 이 이미지에 맞춥니다. 이 외의 입력 이미지는 없습니다."
@@ -617,6 +832,19 @@ def _style_sections(
         if key in ("object_summary", "style", "surface_regions", "design_rules")
     }
     analysis_json = json.dumps(analysis_payload, ensure_ascii=False, separators=(",", ":"))
+    if front_reference:
+        role_section = (
+            f"- 첫 번째 이미지(role={CONTACT_SHEET_ROLE}): {guide_description} "
+            "실루엣, 비율, 자세, 부품 배치를 반드시 이 이미지에 맞춥니다.\n"
+            f"{_FRONT_REFERENCE_ROLE_LINE}"
+        )
+        if reference_image_count:
+            role_section += (
+                f"\n- 세 번째 이후 이미지 {reference_image_count}장(role=palette_only): "
+                "색과 재질 표현만 참고합니다. "
+                "이 이미지의 캐릭터, 비율, 자세, 실루엣, 부품 구성은 절대 가져오지 않습니다."
+            )
+        return role_section, f"분석 JSON:\n{analysis_json}"
     if reference_image_count:
         role_section = (
             f"- 첫 번째 이미지(role=geometry_contact_sheet): {guide_description} "
@@ -662,8 +890,43 @@ def _common_output_rules() -> str:
     )
 
 
+def _front_color_reference_section() -> str:
+    """앞 라운드의 FRONT 완성본을 색 기준으로 삼으라는 문단.
+
+    형상은 언제나 가이드(첫 번째 이미지)가 이기고, 색만 FRONT 완성본을 따른다.
+    캔버스를 여러 장으로 쪼개면 한 캔버스 안에서 모델이 스스로 맞춰 주던 색 일관성이
+    사라지므로, 그 보장을 프롬프트로 대신 세운다.
+    """
+
+    return (
+        "FRONT 색 기준(형상 계약 다음으로 우선):\n"
+        f"- 두 번째 입력 이미지(role={FRONT_COLOR_REFERENCE_ROLE})는 같은 모델의 FRONT 시점 완성본입니다.\n"
+        "- 팔레트, 각 부위의 색상과 명도, 무늬 밀도, 부위 경계의 색을 이 이미지와 정확히 일치시킵니다.\n"
+        "- 다만 형상·실루엣·배치는 여전히 첫 번째 이미지(가이드)를 따릅니다. "
+        "두 이미지가 충돌하면 형상은 첫 번째, 색은 두 번째를 따릅니다."
+    )
+
+
 def _layout_output_contract(layout: TurnaroundLayout) -> str:
     """그리드 레이아웃별 캔버스 분할과 시점 순서 지시."""
+
+    if layout.cell_count == 1:
+        # 셀이 하나면 "같은 너비의 1열로 나눕니다"가 어색하므로 단일 캔버스 문구를 쓴다.
+        # 순차 모드의 인페인팅 문장은 넣지 않는다. 이 경로에는 이미 칠해진 영역이 없다.
+        single_descriptions = " ".join(
+            _VIEW_DESCRIPTIONS[view] for view in layout.views if view not in ("FRONT", "BACK")
+        )
+        return (
+            f"- 하나의 {layout.aspect_ratio} 캔버스에 시점 하나만 담습니다. "
+            f"첫 번째 입력 이미지가 정확히 같은 {layout.aspect_ratio} 단일 캔버스이므로 "
+            "그 레이아웃을 그대로 따릅니다.\n"
+            "- 캔버스 중앙 정사각형 viewport 안에 물체를 배치하고, "
+            "viewport의 상하좌우 여백을 동일하게 유지합니다.\n"
+            + (f"- {single_descriptions}\n" if single_descriptions else "")
+            + "- 첫 번째 입력 이미지의 실루엣 위에 색만 덧입히듯, 물체의 외곽선 위치, 크기, 중심을 "
+            "입력과 최대한 일치시킵니다. "
+            "부위 경계(예: 장갑과 소매, 신발과 바지)도 입력 실루엣의 같은 위치에 맞춥니다."
+        )
 
     row_labels = []
     for row in range(layout.rows):
@@ -691,6 +954,14 @@ def _layout_output_contract(layout: TurnaroundLayout) -> str:
         "부위 경계(예: 장갑과 소매, 신발과 바지)도 입력 실루엣의 같은 위치에 맞춥니다.\n"
         f"- {count_word} 시점의 색, 무늬, 마모, 부품 연결은 서로 연속되고 일관되어야 합니다. "
         "같은 부위는 어느 시점에서 보아도 같은 색과 명도로 칠합니다."
+        # 두 칸짜리 캔버스는 모델이 두 시점을 하나의 넓은 그림으로 합칠 위험이 가장 크다.
+        + (
+            "\n- 두 칸 사이에 구분선, 테두리, 배경색 차이를 넣지 않습니다. "
+            "두 칸은 같은 배경 위의 서로 다른 viewport이며, 같은 물체를 두 방향에서 본 모습입니다. "
+            "두 칸을 하나의 넓은 그림으로 합치지 마십시오."
+            if layout.cell_count == 2
+            else ""
+        )
     )
 
 
@@ -721,6 +992,7 @@ def compile_turnaround_prompt(
     reference_image_count: int = 0,
     layout: TurnaroundLayout | str | None = None,
     regeneration_feedback: Sequence[str] = (),
+    front_reference: bool = False,
 ) -> str:
     """모델 형상과 참조 스타일(또는 프롬프트만)을 한 장의 그리드 시점도에 결합하도록 지시한다.
 
@@ -728,6 +1000,8 @@ def compile_turnaround_prompt(
     정하는 프롬프트를 만든다. 이때 사용자 지시는 비어 있으면 안 된다.
     ``layout``이 ``None``이면 3열 21:9 레이아웃이다. ``regeneration_feedback``에
     시점 이름이 있으면 그 시점의 실루엣 불일치를 교정하는 문단을 덧붙인다.
+    ``front_reference``가 참이면 두 번째 입력 이미지가 앞 라운드의 FRONT 완성본이라고
+    보고 색 기준 문단을 넣고 사용자 참조 번호를 한 칸 민다.
     """
 
     resolved_layout = resolve_layout(layout)
@@ -738,16 +1012,23 @@ def compile_turnaround_prompt(
         user_prompt,
         reference_image_count,
         "Blender의 실제 모델 형상입니다.",
+        front_reference=front_reference,
     )
+    front_section = f"\n{_front_color_reference_section()}\n" if front_reference else ""
     view_count = len(resolved_layout.views)
-    title_noun = "3면도" if view_count == 3 else f"{view_count}시점도"
+    if view_count == 1:
+        title_noun = "단일 시점도"
+    elif view_count == 3:
+        title_noun = "3면도"
+    else:
+        title_noun = f"{view_count}시점도"
     return f"""캐주얼 게임용 스타일리시 손맵 diffuse/albedo 제작을 위한 {title_noun} 한 장을 생성하세요.
 
 입력 이미지 역할:
 {role_section}
 
 {_shape_contract("첫 번째 이미지는 흰 배경 위의 회색 3D 모델입니다.")}
-
+{front_section}
 {feedback_section}{style_section}
 
 사용자 한 줄 지시:
@@ -835,6 +1116,7 @@ def build_turnaround_request(
     view: str | None = None,
     painted_views: tuple[str, ...] = (),
     regeneration_feedback: Sequence[str] = (),
+    front_reference: bool = False,
 ) -> TurnaroundImageRequest:
     """비용 계약이 고정된 단일 이미지 요청을 만든다.
 
@@ -855,12 +1137,16 @@ def build_turnaround_request(
         )
     else:
         layout = resolve_layout(layout_name)
+        palette_reference_count = len(reference_images) - (1 if front_reference else 0)
+        if palette_reference_count < 0:
+            raise ValueError("FRONT 색 참조를 쓰려면 참조 이미지 목록의 첫 장이 그 참조여야 합니다.")
         prompt = compile_turnaround_prompt(
             analysis,
             user_instruction,
-            reference_image_count=len(reference_images),
+            reference_image_count=palette_reference_count,
             layout=layout,
             regeneration_feedback=regeneration_feedback,
+            front_reference=front_reference,
         )
     return TurnaroundImageRequest(
         prompt=prompt,
@@ -872,3 +1158,127 @@ def build_turnaround_request(
         views=layout.views,
         layout_name=layout.name,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class TurnaroundBatchRequest:
+    """구성의 그룹마다 요청 하나를 담은, 비용 계약 검증을 통과한 묶음.
+
+    그룹 하나 = 캔버스 하나 = Provider 1회 호출 = 결과 1장이라는 기존 계약을 그대로
+    유지하면서, "다면도 생성" 1번의 총 호출 수만 위에서 한 번 더 제한한다.
+    """
+
+    composition_name: str
+    requests: tuple[TurnaroundImageRequest, ...]
+
+    def __post_init__(self) -> None:
+        composition = resolve_composition(self.composition_name)
+        if len(self.requests) != len(composition.groups):
+            raise ValueError(
+                f"{composition.name} 구성은 그룹 {len(composition.groups)}개의 요청이 모두 필요합니다."
+            )
+        if len(self.requests) > MAX_TURNAROUND_GROUPS:
+            raise ValueError(f"한 번의 생성은 최대 {MAX_TURNAROUND_GROUPS}개 그룹까지만 허용합니다.")
+        for request, group in zip(self.requests, composition.groups):
+            if request.layout_name != group.name:
+                raise ValueError(
+                    f"요청 순서가 구성의 그룹 순서와 달라집니다: {request.layout_name} != {group.name}"
+                )
+        call_count = sum(request.provider_call_count for request in self.requests)
+        image_count = sum(request.output_image_count for request in self.requests)
+        if call_count != len(self.requests) or call_count > MAX_TURNAROUND_GROUPS:
+            raise ValueError(
+                f"그룹당 Provider 1회 호출만 허용하며 총 호출은 {MAX_TURNAROUND_GROUPS}회를 넘을 수 없습니다."
+            )
+        if image_count != len(self.requests):
+            raise ValueError("그룹당 결과 이미지 1장만 허용합니다.")
+        views = tuple(view for request in self.requests for view in request.views)
+        if len(set(views)) != len(views):
+            raise ValueError("그룹 간에 같은 시점이 중복될 수 없습니다.")
+        if views != composition.views:
+            raise ValueError(
+                f"{composition.name} 구성의 시점 목록과 일치해야 합니다: {', '.join(composition.views)}"
+            )
+
+    @property
+    def composition(self) -> TurnaroundComposition:
+        return resolve_composition(self.composition_name)
+
+    @property
+    def views(self) -> tuple[str, ...]:
+        return tuple(view for request in self.requests for view in request.views)
+
+    @property
+    def provider_call_count(self) -> int:
+        return sum(request.provider_call_count for request in self.requests)
+
+    @property
+    def rounds(self) -> tuple[tuple[int, ...], ...]:
+        """구성의 라운드를 ``requests`` 인덱스로 옮긴 것."""
+
+        index_by_name = {request.layout_name: index for index, request in enumerate(self.requests)}
+        return tuple(
+            tuple(index_by_name[name] for name in round_names)
+            for round_names in self.composition.rounds
+        )
+
+    def request_for(self, group_name: str) -> TurnaroundImageRequest:
+        wanted = str(group_name).upper()
+        for request in self.requests:
+            if request.layout_name == wanted:
+                return request
+        raise ValueError(f"{self.composition_name} 묶음에 없는 그룹입니다: {group_name}")
+
+
+def build_turnaround_batch_request(
+    composition: TurnaroundComposition | str | None,
+    contact_sheets: Mapping[str, InlineImage],
+    reference_images: Sequence[InlineImage] = (),
+    analysis: ReferenceAnalysis | Mapping[str, Any] | None = None,
+    user_instruction: str = "",
+    *,
+    model: str = DEFAULT_IMAGE_MODEL,
+    image_size: str = AUTO_IMAGE_SIZE,
+    front_reference: InlineImage | None = None,
+    regeneration_feedback: Mapping[str, Sequence[str]] | None = None,
+) -> TurnaroundBatchRequest:
+    """구성의 그룹마다 요청 하나씩을 만들어 묶는다.
+
+    ``contact_sheets``는 그룹 이름 → 그 그룹 배치로 합성한 형상 가이드다.
+    ``front_reference``는 라운드 0의 FRONT 결과이며, 있으면 라운드 1 이상의 그룹에만
+    두 번째 입력 이미지로 붙는다. 라운드 0을 아직 실행하지 않아 FRONT 결과가 없을 때는
+    ``None``으로 두고, 라운드 1을 띄울 때 이 함수를 다시 불러 참조를 채운다.
+    """
+
+    resolved = resolve_composition(composition)
+    if front_reference is not None and front_reference.role != FRONT_COLOR_REFERENCE_ROLE:
+        raise ValueError(f"FRONT 색 참조의 역할은 {FRONT_COLOR_REFERENCE_ROLE}이어야 합니다.")
+    feedback = {
+        str(key).upper(): tuple(value) for key, value in (regeneration_feedback or {}).items()
+    }
+    unknown_feedback = sorted(set(feedback) - set(resolved.group_names))
+    if unknown_feedback:
+        raise ValueError(f"{resolved.name} 구성에 없는 그룹입니다: {', '.join(unknown_feedback)}")
+
+    user_references = tuple(reference_images)
+    requests: list[TurnaroundImageRequest] = []
+    for group in resolved.groups:
+        sheet = contact_sheets.get(group.name)
+        if sheet is None:
+            raise ValueError(f"{group.name} 그룹의 형상 가이드 이미지가 없습니다.")
+        use_front = front_reference is not None and resolved.round_index(group.name) > 0
+        group_references = (front_reference, *user_references) if use_front else user_references
+        requests.append(
+            build_turnaround_request(
+                sheet,
+                group_references,
+                analysis,
+                user_instruction,
+                model=model,
+                layout_name=group.name,
+                image_size=resolve_image_size(group, image_size),
+                regeneration_feedback=feedback.get(group.name, ()),
+                front_reference=use_front,
+            )
+        )
+    return TurnaroundBatchRequest(resolved.name, tuple(requests))

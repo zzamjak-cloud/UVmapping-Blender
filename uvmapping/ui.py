@@ -9,12 +9,12 @@ from bpy.types import Panel, UIList
 from .properties import get_addon_preferences
 from .texture_operators import (
     can_bake_diffuse,
-    has_stalled_sequential_state,
+    has_stalled_texture_state,
     registered_targets,
     texture_targets,
     texture_verification_summary,
 )
-from .texture_pipeline import resolve_layout
+from .texture_pipeline import resolve_composition
 
 
 def _has_texture_target(context) -> bool:
@@ -207,18 +207,30 @@ class UVMAPPING_PT_ai_texture(Panel):
         composition_box.prop(settings, "turnaround_layout", text="")
         composition_box.prop(settings, "turnaround_image_size")
         composition_box.prop(settings, "generation_mode", text="")
-        if settings.generation_mode == "SEQUENTIAL":
-            call_count = len(resolve_layout(settings.turnaround_layout).views)
+        composition = resolve_composition(settings.turnaround_layout)
+        sequential = settings.generation_mode == "SEQUENTIAL"
+        # 호출 수는 순차 모드면 시점 수, 아니면 캔버스(그룹) 수다. 1회를 넘을 때만 경고한다.
+        call_count = len(composition.views) if sequential else len(composition.groups)
+        if call_count > 1:
             composition_box.label(
-                text=f"OpenRouter 호출 {call_count}회 · 비용 {call_count}배", icon="ERROR"
+                text=f"OpenRouter 호출 {call_count}회 · 비용 약 {call_count}배", icon="ERROR"
             )
-        else:
+        if not sequential:
+            if len(composition.rounds) > 1:
+                composition_box.label(
+                    text="정면을 먼저 만든 뒤 나머지를 그 색에 맞춰 병렬 생성합니다(2라운드)",
+                    icon="INFO",
+                )
             composition_box.prop(settings, "auto_regenerate_attempts")
             if settings.auto_regenerate_attempts:
                 composition_box.label(
-                    text=f"불일치 시 최대 {settings.auto_regenerate_attempts}회 추가 호출", icon="INFO"
+                    text=(
+                        f"불일치 시 최대 {settings.auto_regenerate_attempts}회 재시도"
+                        f"(회당 최대 {len(composition.groups)}회 호출)"
+                    ),
+                    icon="INFO",
                 )
-        if settings.turnaround_layout == "SIX":
+        if "TOP" in composition.views:
             composition_box.label(
                 text="상·하·좌 시점을 실제 그림으로 받아 투영합니다", icon="CHECKMARK"
             )
@@ -252,8 +264,8 @@ class UVMAPPING_PT_ai_texture(Panel):
         apply_texture.scale_y = 1.5
         apply_texture.enabled = can_bake_diffuse(context)
         apply_texture.operator("uvmapping.bake_diffuse", icon="MATERIAL_DATA")
-        if has_stalled_sequential_state(context):
-            # 중단된 순차 생성은 베이크할 수 없으므로 상태를 지우는 길을 바로 보여 준다.
+        if has_stalled_texture_state(context):
+            # 중단된 순차 생성과 그룹 실패 상태는 베이크할 수 없으므로 초기화 길을 바로 보여 준다.
             stalled = layout.row()
             stalled.alert = True
             stalled.operator("uvmapping.reset_texture_state", icon="TRASH")

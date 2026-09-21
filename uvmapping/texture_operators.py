@@ -14,7 +14,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from typing import Sequence
+from typing import Mapping, Sequence
 import uuid
 
 import bpy
@@ -29,19 +29,40 @@ from .quality import evaluate_atlas_quality
 from .openrouter_provider import validate_model_slug
 from .texture_job import TEXTURE_JOB_PROPERTY, ensure_texture_jobs
 from .texture_pipeline import (
+    AUTO_IMAGE_SIZE,
+    CONTACT_SHEET_ROLE,
     DEFAULT_IMAGE_SIZE,
+    FRONT_COLOR_REFERENCE_ROLE,
+    USER_REFERENCE_ROLE,
     resolve_image_size,
     REFERENCE_IMAGE_MIME_TYPES,
     SINGLE_VIEW_LAYOUT_NAME,
     InlineImage,
+    TurnaroundComposition,
     TurnaroundImageRequest,
     TurnaroundLayout,
     build_reference_analysis_prompt,
+    build_turnaround_batch_request,
     build_turnaround_request,
     parse_reference_analysis,
+    resolve_composition,
     resolve_layout,
     single_view_layout,
     validate_reference_image_path,
+)
+from .texture_state import (
+    FAILED_GROUPS_STATUS,
+    build_group_entries,
+    build_turnaround_state,
+    design_signature,
+    group_output_path,
+    group_sheet_path,
+    merged_view_mapping,
+    regeneration_feedback_by_group,
+    split_rounds,
+    stale_artifacts,
+    state_composition,
+    views_cover_composition,
 )
 
 # 형상 가이드는 AI가 실루엣을 따라 그릴 수 있을 만큼 선명해야 한다.
@@ -248,18 +269,8 @@ def _validated_bake_targets(context, objects=None) -> tuple[tuple, dict, tuple[d
         jobs.append(job)
 
     first = states[0]
-    signature = (
-        first.get("turnaround_sha256"),
-        json.dumps(first.get("views", {}), sort_keys=True),
-    )
-    if any(
-        (
-            state.get("turnaround_sha256"),
-            json.dumps(state.get("views", {}), sort_keys=True),
-        )
-        != signature
-        for state in states[1:]
-    ):
+    signature = design_signature(first)
+    if any(design_signature(state) != signature for state in states[1:]):
         raise ValueError("선택 객체들이 서로 다른 3면도 디자인을 사용하고 있습니다.")
 
     target_names = tuple(first.get("target_objects", ()))
@@ -320,9 +331,9 @@ def _validated_bake_targets(context, objects=None) -> tuple[tuple, dict, tuple[d
 
     view_paths = first.get("views", {})
     expected_hashes = first.get("view_sha256", {})
-    # 레이아웃이 없는 구버전 상태는 3열 3면도로 해석한다.
-    layout_spec = resolve_layout(first.get("layout"))
-    for view in layout_spec.views:
+    # 구성이 없는 구버전 상태(1.0~1.3)는 layout 이름을 구성 이름으로 보고, 둘 다 없으면 3면도다.
+    composition = state_composition(first)
+    for view in composition.views:
         name = view.lower()
         path = Path(str(view_paths.get(name, "")))
         if not path.is_file():
@@ -333,7 +344,7 @@ def _validated_bake_targets(context, objects=None) -> tuple[tuple, dict, tuple[d
     return objects, first, tuple(jobs)
 
 
-def _layout_label(layout: TurnaroundLayout) -> str:
+def _layout_label(layout: TurnaroundComposition | TurnaroundLayout) -> str:
     """사용자 문구용 시점 수 표기. 3열은 익숙한 '3면도'를 그대로 쓴다."""
 
     return f"{len(layout.views)}면도"
@@ -365,12 +376,20 @@ def can_bake_diffuse(context) -> bool:
     )
 
 
-def has_stalled_sequential_state(context) -> bool:
-    """진행 중이 아닌데 순차 생성 상태가 남은 대상이 있는지. 초기화 버튼 노출 기준."""
+def has_stalled_texture_state(context) -> bool:
+    """진행 중이 아닌데 베이크할 수 없는 생성 상태가 남은 대상이 있는지.
+
+    중단된 순차 생성과 그룹 일부가 실패한 다면도 모두 초기화 없이는 빠져나갈 길이
+    없으므로 같은 기준으로 초기화 버튼을 노출한다.
+    """
 
     if _ACTIVE_RUNS:
         return False
-    return any(texture_state_status(obj).startswith("SEQUENTIAL_") for obj in texture_targets(context))
+    return any(
+        texture_state_status(obj).startswith("SEQUENTIAL_")
+        or texture_state_status(obj) == FAILED_GROUPS_STATUS
+        for obj in texture_targets(context)
+    )
 
 
 def _world_bounds(context, objects: tuple) -> tuple[Vector, Vector]:
@@ -714,6 +733,79 @@ def _crop_turnaround(path: Path, layout: TurnaroundLayout) -> dict[str, Path]:
     finally:
         bpy.data.images.remove(source)
     return outputs
+
+
+def _join_group_sheets(
+    context,
+    objects: tuple,
+    projection: dict,
+    composition: TurnaroundComposition,
+    stem_path: Path,
+) -> dict[str, Path]:
+    """그룹마다 그 그룹 배치의 형상 가이드를 한 장씩 만든다.
+
+    시점 캡처는 구성 전체에 대해 한 번만 돌린다. 카메라 셋업과 씬 복원 비용을 그룹
+    수만큼 치를 이유가 없고, 투영 계약이 그룹과 무관하게 같기 때문이다.
+    """
+
+    captures = _render_model_views(context, objects, projection, composition.views)
+    try:
+        return {
+            group.name: _join_grid(
+                tuple(captures[view] for view in group.views),
+                group,
+                group_sheet_path(stem_path, group.name),
+            )
+            for group in composition.groups
+        }
+    finally:
+        _discard_capture_files(captures)
+
+
+def _crop_group_results(
+    results: Mapping[str, Path], composition: TurnaroundComposition
+) -> dict[str, Path]:
+    """그룹 결과 이미지를 각자 레이아웃으로 잘라 하나의 시점→경로 매핑으로 합친다.
+
+    그룹마다 결과 파일 stem이 다르므로 크롭 파일명(``{stem}_{view}.png``)도 충돌하지
+    않는다. 1셀 그룹도 크롭을 건너뛰지 않아야 결과 형식(PNG)과 해시 계산 경로가
+    모든 그룹에서 같아진다.
+    """
+
+    merged: dict[str, Path] = {}
+    for name, path in results.items():
+        group = composition.group(name)
+        crops = _crop_turnaround(Path(path), group)
+        overlap = set(crops) & set(merged)
+        if overlap:
+            raise RuntimeError(f"그룹 간 시점 크롭이 겹칩니다: {', '.join(sorted(overlap))}")
+        merged.update(crops)
+    return merged
+
+
+def _turnaround_batch_job(
+    batch,
+    group_names: Sequence[str],
+    group_image_paths: Mapping[str, Sequence[Path]],
+    output_paths: Mapping[str, Path],
+) -> dict:
+    """계약 검증을 통과한 묶음에서 이번 라운드에 보낼 그룹만 골라 작업자 JSON을 만든다."""
+
+    groups = []
+    for name in group_names:
+        request = batch.request_for(name)
+        groups.append(
+            {
+                "name": name,
+                "model": request.model,
+                "prompt": request.prompt,
+                "image_paths": [str(path) for path in group_image_paths[name]],
+                "output_path": str(output_paths[name]),
+                "aspect_ratio": request.aspect_ratio,
+                "resolution": request.image_size,
+            }
+        )
+    return {"action": "turnaround_batch", "groups": groups}
 
 
 def _stem_in_use(candidate: Path) -> bool:
@@ -1272,17 +1364,26 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
                 reference_paths if settings.send_reference_images else ()
             )
             _analysis_model, model = _resolved_models(settings)
-            layout_spec = resolve_layout(settings.turnaround_layout)
+            composition = resolve_composition(settings.turnaround_layout)
+            # 단일 캔버스 구성은 그룹이 하나뿐이며 그 그룹이 곧 기존 레이아웃이다.
+            layout_spec = composition.groups[0]
+            single_canvas = composition.is_single_canvas
             sequential = settings.generation_mode == "SEQUENTIAL"
             # 순차 모드는 시점마다 1:1 한 장이므로 그 레이아웃의 기본 크기를 따른다.
             image_size = resolve_image_size(
-                single_view_layout(layout_spec.views[0]) if sequential else layout_spec,
+                single_view_layout(composition.views[0])
+                if sequential
+                else (layout_spec if single_canvas else composition),
                 settings.turnaround_image_size,
             )
             projection = _projection_contract(context, objects)
             output_path = _output_path(context, objects)
             contact_sheet = None
-            if not sequential:
+            group_sheets: dict[str, Path] = {}
+            if sequential:
+                # 순차 모드는 시점마다 가이드를 따로 그리므로 여기서 합성하지 않는다.
+                pass
+            elif single_canvas:
                 model_paths = _render_model_views(context, objects, projection, layout_spec.views)
                 contact_sheet = _join_grid(
                     tuple(model_paths.values()),
@@ -1290,6 +1391,12 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
                     output_path.with_name(f"{output_path.stem}_geometry.png"),
                 )
                 _discard_capture_files(model_paths)
+            else:
+                group_sheets = _join_group_sheets(
+                    context, objects, projection, composition, output_path
+                )
+                # 하위 호환 대표값: 첫 그룹(FRONT) 가이드를 단일 캔버스 필드에 그대로 둔다.
+                contact_sheet = group_sheets[composition.groups[0].name]
             user_prompt = settings.texture_user_prompt
             target_keys = tuple((obj.name, obj.session_uid) for obj in objects)
             reference_state = tuple(
@@ -1331,7 +1438,8 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
                 "user_prompt": user_prompt,
                 "model": model,
                 "analysis_payload": analysis.to_dict() if analysis is not None else None,
-                "layout_name": layout_spec.name,
+                "layout_name": composition.name,
+                "composition": composition.name,
                 "image_size": image_size,
                 # 실루엣 불일치 재생성과 순차 모드가 같은 입력으로 다시 요청할 수 있게 남긴다.
                 "reference_image_paths": tuple(str(path) for path in generation_references),
@@ -1343,16 +1451,40 @@ class UVMAPPING_OT_generate_turnaround(_AsyncTextureMixin, Operator):
                 payload.update(
                     {
                         "generation_mode": "SEQUENTIAL",
-                        "sequence_views": tuple(layout_spec.views),
+                        "sequence_views": tuple(composition.views),
                         "completed_views": {},
                         "completed_sha256": {},
                         "guide_paths": {},
-                        "bake_settings": _bake_settings_from(settings, layout_spec),
+                        "bake_settings": _bake_settings_from(settings, composition),
                     }
                 )
                 _launch_sequential_step(context, payload, 0)
                 return {"FINISHED"}
             api_key = resolve_api_key(context)
+            if not single_canvas:
+                rounds = split_rounds(composition, composition.group_names)
+                payload.update(
+                    {
+                        "group_sheets": {name: str(path) for name, path in group_sheets.items()},
+                        "group_results": {},
+                        "group_attempts": {},
+                        "group_feedback": {},
+                        "view_paths": {},
+                        "view_sha256": {},
+                        "pending_rounds": [list(round_names) for round_names in rounds[1:]],
+                    }
+                )
+                _start_turnaround_round(
+                    context.scene,
+                    payload,
+                    rounds[0],
+                    api_key=api_key,
+                    status=(
+                        f"{_layout_label(composition)} 1/{len(rounds)}라운드 · "
+                        f"{', '.join(rounds[0])} 요청 중…"
+                    ),
+                )
+                return {"FINISHED"}
             # 레이아웃·종횡비·해상도·1회 호출 계약은 요청 객체가 검증한다.
             request = build_turnaround_request(
                 _contract_image(contact_sheet, "geometry_contact_sheet"),
@@ -1430,6 +1562,27 @@ def _finish_turnaround(scene, value: dict, payload: dict) -> None:
     except RuntimeError:
         pass
 
+    _finalize_turnaround(scene, payload, state, targets, crop_paths, label, attempt)
+
+
+def _finalize_turnaround(
+    scene,
+    payload: dict,
+    state: dict,
+    targets: tuple,
+    crop_paths: dict,
+    label: str,
+    attempt: int,
+    *,
+    allow_regeneration: bool = True,
+) -> None:
+    """생성 완료 뒤의 실루엣 검증·재생성 판단·자동 적용. 단일 캔버스와 그룹 구성이 공유한다.
+
+    ``allow_regeneration``이 거짓이면 불일치가 남아도 다시 요청하지 않는다. 재생성
+    자체가 실패해 직전 결과로 마무리하는 경로가 다시 재생성을 시도하지 않게 한다.
+    """
+
+    settings = scene.uvmapping_settings
     # 생성 직후 시점별 실루엣을 모델과 대조한다. 팔을 붙여 그리는 식의 내부 구조
     # 불일치는 베이크 뒤에 몸통 질감이 늘어나는 원인이라 미리 잡아 재생성한다.
     report, failed_views = _precheck_silhouettes(scene, payload, targets, crop_paths)
@@ -1437,7 +1590,7 @@ def _finish_turnaround(scene, value: dict, payload: dict) -> None:
     _store_state(payload, state)
     max_attempts = int(settings.auto_regenerate_attempts)
     settings.texture_status = f"{label} 생성 완료 · Diffuse/Albedo를 적용해 주세요"
-    if failed_views and attempt < max_attempts:
+    if allow_regeneration and failed_views and attempt < max_attempts:
         try:
             _launch_regeneration(scene, payload, failed_views, attempt + 1, max_attempts)
             return
@@ -1467,6 +1620,283 @@ def _finish_turnaround(scene, value: dict, payload: dict) -> None:
         return
     if warning:
         settings.texture_status = f"{settings.texture_status} · {warning}"
+
+
+def _file_sha256(path: Path) -> str:
+    """상태에 남길 파일 지문. 파일이 없으면 빈 문자열로 둔다."""
+
+    candidate = Path(path)
+    if not str(candidate) or not candidate.is_file():
+        return ""
+    return hashlib.sha256(candidate.read_bytes()).hexdigest()
+
+
+def _group_state(payload: dict, composition: TurnaroundComposition, status: str, **extra) -> dict:
+    """그룹 구성의 상태(스키마 1.4)를 payload의 누적 결과로 만든다."""
+
+    results = {str(name): str(path) for name, path in payload.get("group_results", {}).items()}
+    sheets = {str(name): str(path) for name, path in payload.get("group_sheets", {}).items()}
+    base = {
+        "created_at": payload.setdefault("created_at", datetime.now(timezone.utc).isoformat()),
+        "provider": "openrouter",
+        "model": payload["model"],
+        "target_objects": payload["target_names"],
+        "source_jobs": payload["source_jobs"],
+        "projection": payload["projection"],
+        "references": payload["reference_state"],
+        "user_prompt": payload["user_prompt"],
+        "analysis": payload["analysis_payload"],
+        "image_size": payload.get("image_size", ""),
+    }
+    entries = build_group_entries(
+        composition,
+        image_paths=results,
+        image_hashes={name: _file_sha256(Path(path)) for name, path in results.items()},
+        sheet_paths=sheets,
+        sheet_hashes={name: _file_sha256(Path(path)) for name, path in sheets.items()},
+        image_size=str(payload.get("image_size", "")),
+        attempts=payload.get("group_attempts", {}),
+        feedback=payload.get("group_feedback", {}),
+    )
+    state = build_turnaround_state(
+        base,
+        composition,
+        entries,
+        payload.get("view_paths", {}),
+        payload.get("view_sha256", {}),
+        status=status,
+        attempt=int(payload.get("attempt", 0)),
+        feedback_views=tuple(payload.get("feedback_views", ())),
+    )
+    state.update(extra)
+    return state
+
+
+def _group_views_ready(composition: TurnaroundComposition, payload: dict) -> bool:
+    """구성의 모든 시점 크롭이 매핑에 있고 파일도 실제로 남아 있는지."""
+
+    view_paths = payload.get("view_paths", {})
+    if not views_cover_composition(composition, view_paths):
+        return False
+    lowered = {str(key).lower(): str(value) for key, value in view_paths.items()}
+    return all(Path(lowered[view.lower()]).is_file() for view in composition.views)
+
+
+def _discard_stale_group_artifacts(payload: dict, state: dict) -> None:
+    """상태가 참조하지 않는 이전 시도의 그룹 캔버스와 크롭을 지운다.
+
+    생성마다 고유한 stem을 쓰므로(:func:`_output_path`) 같은 stem으로 시작하는 파일은
+    모두 이번 생성의 산출물이다. 상태가 가리키는 파일은 후보에서 빠진다.
+    """
+
+    stem_path = Path(str(payload.get("output_stem_path", "")))
+    if not str(stem_path) or not stem_path.parent.is_dir():
+        return
+    try:
+        candidates = sorted(stem_path.parent.glob(f"{stem_path.stem}_*"))
+        for path in stale_artifacts(candidates, state):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+    except OSError:
+        # 정리 실패가 생성 결과를 무효로 만들지는 않는다.
+        pass
+
+
+def _start_turnaround_round(
+    scene, payload: dict, group_names: Sequence[str], *, api_key: str, status: str
+) -> None:
+    """그룹 한 라운드를 배치 작업자에 넘긴다. 연산자 없이(타이머 안에서) 호출 가능하다.
+
+    라운드 0보다 뒤인 그룹에는 이미 확보한 FRONT 크롭을 색 참조로 붙인다. 참조 순서는
+    요청 계약이 기대하는 [가이드, FRONT 참조, 사용자 참조…]와 정확히 같아야 한다.
+    """
+
+    composition = resolve_composition(payload["composition"])
+    sheets = {str(name): Path(str(path)) for name, path in payload["group_sheets"].items()}
+    references = tuple(Path(str(path)) for path in payload.get("reference_image_paths", ()))
+    attempt = int(payload.get("attempt", 0))
+    stem_path = Path(payload["output_stem_path"])
+    front_raw = str(payload.get("view_paths", {}).get(composition.reference_view.lower(), ""))
+    front_crop = Path(front_raw) if front_raw and Path(front_raw).is_file() else None
+    front_image = (
+        _contract_image(front_crop, FRONT_COLOR_REFERENCE_ROLE) if front_crop is not None else None
+    )
+    batch = build_turnaround_batch_request(
+        composition,
+        {name: _contract_image(path, CONTACT_SHEET_ROLE) for name, path in sheets.items()},
+        tuple(_contract_image(path, USER_REFERENCE_ROLE) for path in references),
+        payload["analysis_payload"],
+        payload["user_prompt"],
+        model=payload["model"],
+        image_size=payload.get("image_size") or AUTO_IMAGE_SIZE,
+        front_reference=front_image,
+        regeneration_feedback={
+            str(name): tuple(views) for name, views in payload.get("group_feedback", {}).items()
+        },
+    )
+    output_paths: dict[str, Path] = {}
+    image_paths: dict[str, tuple[Path, ...]] = {}
+    for name in group_names:
+        output_paths[name] = group_output_path(stem_path, name, attempt)
+        prefix = (sheets[name],)
+        if front_image is not None and composition.round_index(name) > 0:
+            prefix = (sheets[name], front_crop)
+        image_paths[name] = (*prefix, *references)
+    job = _turnaround_batch_job(batch, tuple(group_names), image_paths, output_paths)
+    payload["round_groups"] = list(group_names)
+    _start_worker(scene, job, api_key, status, payload, _finish_turnaround_round)
+
+
+def _report_round_failure(
+    scene,
+    payload: dict,
+    composition: TurnaroundComposition,
+    label: str,
+    attempt: int,
+    detail: str,
+    **extra,
+) -> None:
+    """라운드 실패를 객체 상태에 남긴다.
+
+    이미 구성의 모든 시점이 확보돼 있으면(재생성이 실패한 경우) 베이크 가능한 결과를
+    되돌리지 않고 실패한 그룹만 경고 필드로 기록한다. 첫 생성이 실패해 시점이
+    비어 있을 때만 베이크를 막는 상태를 쓴다.
+    """
+
+    settings = scene.uvmapping_settings
+    payload["pending_rounds"] = []
+    if not _group_views_ready(composition, payload):
+        _store_state(payload, _group_state(payload, composition, FAILED_GROUPS_STATUS, **extra))
+        settings.texture_status = f"{label} 그룹 생성 실패: {detail}"
+        return
+    state = _group_state(payload, composition, "TURNAROUND_READY", **extra)
+    targets = _store_state(payload, state)
+    if _ACTIVE_RUNS:
+        # 다음 작업이 이미 떠 있으면 그 콜백이 마무리를 맡는다.
+        settings.texture_status = f"{label} 일부 그룹 실패: {detail}"
+        return
+    _discard_stale_group_artifacts(payload, state)
+    crop_paths = {view: Path(path) for view, path in payload.get("view_paths", {}).items()}
+    _finalize_turnaround(
+        scene, payload, state, targets, crop_paths, label, attempt, allow_regeneration=False
+    )
+    settings.texture_status = f"{settings.texture_status} · 그룹 재생성 실패: {detail}"
+
+
+def _finish_turnaround_round(scene, value: dict, payload: dict) -> None:
+    """배치 한 라운드의 결과를 회수한다. 어떤 실패도 객체 상태로 남긴다.
+
+    후처리 예외가 그대로 올라가면 진행 중 표시만 남고 빠져나갈 길이 없으므로,
+    순차 모드가 SEQUENTIAL_FAILED로 감싸는 것과 같은 방식으로 상태를 기록한다.
+    """
+
+    composition = resolve_composition(payload["composition"])
+    label = _layout_label(composition)
+    attempt = int(payload.get("attempt", 0))
+    try:
+        _finish_turnaround_round_impl(scene, value, payload, composition, label, attempt)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _report_round_failure(scene, payload, composition, label, attempt, str(exc), error=str(exc))
+
+
+def _finish_turnaround_round_impl(
+    scene,
+    value: dict,
+    payload: dict,
+    composition: TurnaroundComposition,
+    label: str,
+    attempt: int,
+) -> None:
+    """라운드 결과를 크롭해 누적하고 다음 라운드를 잇거나 마지막이면 마무리한다."""
+
+    settings = scene.uvmapping_settings
+    dispatched = tuple(payload.get("round_groups", ()))
+    entries = {
+        str(entry.get("name", "")): entry
+        for entry in value.get("groups", ())
+        if isinstance(entry, dict)
+    }
+    succeeded: dict[str, Path] = {}
+    failures: list[str] = []
+    for name in dispatched:
+        entry = entries.get(name) or {}
+        output_path = str(entry.get("output_path", ""))
+        if entry.get("ok") and output_path and Path(output_path).is_file():
+            succeeded[name] = Path(output_path)
+        else:
+            failures.append(f"{name}({entry.get('error') or '결과 파일이 없습니다'})")
+
+    if succeeded:
+        settings.texture_output_path = str(next(iter(succeeded.values())))
+        _set_status(scene, f"{label} 그룹 결과 크롭 중…")
+        crops = _crop_group_results(succeeded, composition)
+        payload["group_results"] = {
+            **{str(name): str(path) for name, path in payload.get("group_results", {}).items()},
+            **{name: str(path) for name, path in succeeded.items()},
+        }
+        payload["group_attempts"] = {
+            **{str(name): int(step) for name, step in payload.get("group_attempts", {}).items()},
+            **{name: attempt for name in succeeded},
+        }
+        payload["view_paths"] = merged_view_mapping(
+            payload.get("view_paths", {}), {view: str(path) for view, path in crops.items()}
+        )
+        payload["view_sha256"] = merged_view_mapping(
+            payload.get("view_sha256", {}),
+            {view: _file_sha256(path) for view, path in crops.items()},
+        )
+
+    if failures:
+        # 성공한 그룹의 결과와 크롭은 남긴다. 시점이 모두 차 있으면 베이크도 막지 않는다.
+        _report_round_failure(
+            scene,
+            payload,
+            composition,
+            label,
+            attempt,
+            ", ".join(failures),
+            failed_groups=failures,
+        )
+        return
+
+    pending = [tuple(round_names) for round_names in payload.get("pending_rounds", ())]
+    if pending:
+        payload["pending_rounds"] = [list(round_names) for round_names in pending[1:]]
+        try:
+            with _bake_context(scene) as context:
+                api_key = resolve_api_key(context)
+            _start_turnaround_round(
+                scene,
+                payload,
+                pending[0],
+                api_key=api_key,
+                status=f"{label} 다음 라운드 · {', '.join(pending[0])} 요청 중…",
+            )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            # 앞 라운드 결과는 보존해 사용자가 원인을 고친 뒤 확인할 수 있게 한다.
+            _report_round_failure(
+                scene,
+                payload,
+                composition,
+                label,
+                attempt,
+                f"다음 라운드를 시작하지 못했습니다: {exc}",
+                error=str(exc),
+            )
+        return
+
+    state = _group_state(payload, composition, "TURNAROUND_READY")
+    targets = _store_state(payload, state)
+    representative = str(state.get("turnaround_path", ""))
+    if representative:
+        try:
+            bpy.data.images.load(representative, check_existing=False)
+        except RuntimeError:
+            pass
+    # 재생성으로 밀려난 이전 시도 캔버스·크롭은 상태가 참조하지 않으므로 여기서 정리한다.
+    _discard_stale_group_artifacts(payload, state)
+    crop_paths = {view: Path(path) for view, path in payload.get("view_paths", {}).items()}
+    _finalize_turnaround(scene, payload, state, targets, crop_paths, label, attempt)
 
 
 def _uv_layer_names_from_jobs(source_jobs, objects: tuple) -> tuple[str, ...]:
@@ -1503,6 +1933,10 @@ def _precheck_silhouettes(scene, payload: dict, targets: tuple, crop_paths: dict
 def _launch_regeneration(scene, payload: dict, failed_views: Sequence[str], attempt: int, max_attempts: int) -> None:
     """같은 가이드·참조로 불일치 시점 교정 문단을 붙여 다면도를 다시 요청한다."""
 
+    composition = resolve_composition(payload.get("composition") or payload.get("layout_name"))
+    if not composition.is_single_canvas:
+        _launch_group_regeneration(scene, payload, composition, failed_views, attempt, max_attempts)
+        return
     contact_sheet = Path(payload["contact_sheet_path"])
     references = tuple(Path(path) for path in payload.get("reference_image_paths", ()))
     request = build_turnaround_request(
@@ -1534,6 +1968,45 @@ def _launch_regeneration(scene, payload: dict, failed_views: Sequence[str], atte
     )
 
 
+def _launch_group_regeneration(
+    scene,
+    payload: dict,
+    composition: TurnaroundComposition,
+    failed_views: Sequence[str],
+    attempt: int,
+    max_attempts: int,
+) -> None:
+    """불일치 시점이 속한 그룹만 다시 요청한다.
+
+    셀 하나만 어긋나도 그 캔버스 전체를 다시 그려야 하므로 재생성 단위는 그룹이다.
+    대상이 아닌 그룹의 결과·크롭은 payload에 그대로 남아 상태에 다시 합쳐진다.
+    FRONT 그룹이 대상이면 라운드 규칙대로 먼저 만들고 나머지가 그 결과를 참조한다.
+    """
+
+    feedback = regeneration_feedback_by_group(composition, failed_views)
+    rounds = split_rounds(composition, tuple(feedback))
+    if not rounds:
+        raise ValueError("재생성할 그룹을 정하지 못했습니다.")
+    next_payload = dict(payload)
+    next_payload["attempt"] = attempt
+    next_payload["feedback_views"] = tuple(failed_views)
+    next_payload["group_feedback"] = {name: list(views) for name, views in feedback.items()}
+    next_payload["pending_rounds"] = [list(round_names) for round_names in rounds[1:]]
+    with _bake_context(scene) as context:
+        api_key = resolve_api_key(context)
+    views_text = ", ".join(failed_views)
+    _start_turnaround_round(
+        scene,
+        next_payload,
+        rounds[0],
+        api_key=api_key,
+        status=(
+            f"실루엣 불일치({views_text}) → 재생성 {attempt}/{max_attempts} · "
+            f"{', '.join(rounds[0])} 요청 중…"
+        ),
+    )
+
+
 def _discard_capture_files(paths: dict[str, Path]) -> None:
     """임시 캡처 파일과 그 디렉터리를 정리한다."""
 
@@ -1545,11 +2018,11 @@ def _discard_capture_files(paths: dict[str, Path]) -> None:
         pass
 
 
-def _bake_settings_from(settings, layout_spec: TurnaroundLayout) -> dict:
+def _bake_settings_from(settings, composition: TurnaroundComposition) -> dict:
     """상태에 기록하고 베이크에 넘길 투영 블렌딩 설정."""
 
     return {
-        "layout": layout_spec.name,
+        "layout": composition.name,
         "blend_exponent": float(settings.blend_exponent),
         "harmonize_view_colors": bool(settings.harmonize_view_colors),
         "silhouette_warp": bool(settings.silhouette_warp),
@@ -1891,11 +2364,11 @@ def apply_diffuse(context, objects=None, *, bake_settings: dict | None = None) -
     objects, state, jobs = _validated_bake_targets(context, objects)
     resolution, padding, uv_layer_names = _bake_parameters(settings, objects, jobs)
     output_path = _diffuse_output_path(state, objects)
-    layout_spec = resolve_layout(state.get("layout"))
-    view_paths = {view: Path(state["views"][view.lower()]) for view in layout_spec.views}
-    bake_settings = dict(bake_settings) if bake_settings else _bake_settings_from(settings, layout_spec)
+    composition = state_composition(state)
+    view_paths = {view: Path(state["views"][view.lower()]) for view in composition.views}
+    bake_settings = dict(bake_settings) if bake_settings else _bake_settings_from(settings, composition)
     bake_kwargs = _bake_kwargs_from(bake_settings)
-    settings.texture_status = f"{_layout_label(layout_spec)}에서 Diffuse/Albedo 베이크 중…"
+    settings.texture_status = f"{_layout_label(composition)}에서 Diffuse/Albedo 베이크 중…"
     result = texture_bake.bake_diffuse(
         context,
         objects,
@@ -2004,8 +2477,8 @@ def _verify_bake(
     실루엣 불일치 시점과 함께 상태에 기록되어 패널에 표시된다.
     """
 
-    layout_spec = resolve_layout(state.get("layout"))
-    view_paths = {view: Path(state["views"][view.lower()]) for view in layout_spec.views}
+    composition = state_composition(state)
+    view_paths = {view: Path(state["views"][view.lower()]) for view in composition.views}
     projection = state["projection"]
     analysis = texture_bake.analyze_view_sources(
         context,
@@ -2016,12 +2489,12 @@ def _verify_bake(
         silhouette_warp=bool(bake_kwargs.get("silhouette_warp", False)),
     )
     rendered = _render_model_views(
-        context, objects, projection, layout_spec.views, textured=True, resolution=VERIFY_RENDER_RESOLUTION
+        context, objects, projection, composition.views, textured=True, resolution=VERIFY_RENDER_RESOLUTION
     )
     guides: dict[str, Path] = {}
     try:
         guides = _render_model_views(
-            context, objects, projection, layout_spec.views, flat_shading=True, resolution=VERIFY_RENDER_RESOLUTION
+            context, objects, projection, composition.views, flat_shading=True, resolution=VERIFY_RENDER_RESOLUTION
         )
         metrics = texture_bake.verify_rendered_views(analysis, rendered)
         rows = []
@@ -2029,7 +2502,7 @@ def _verify_bake(
             rows.append(
                 [
                     texture_bake.load_image_pixels(mapping[view], linearize=False) if view in mapping else None
-                    for view in layout_spec.views
+                    for view in composition.views
                 ]
             )
         rgba, width, height = texture_bake.compose_verification_sheet(rows, VERIFY_SHEET_CELL)
@@ -2040,7 +2513,7 @@ def _verify_bake(
         if guides:
             _discard_capture_files(guides)
     silhouette_failed = [
-        view for view in layout_spec.views if not analysis.report.get(view, {}).get("passed", True)
+        view for view in composition.views if not analysis.report.get(view, {}).get("passed", True)
     ]
     passed = (
         bool(metrics)
