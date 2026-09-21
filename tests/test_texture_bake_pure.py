@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 import struct
 import sys
 
@@ -11,6 +12,13 @@ if __package__ in {None, ""}:
 
 from uvmapping.texture_bake import (
     ALIGNMENT_MIN_IOU,
+    DEFAULT_TRANSITION_BAND_DEGREES,
+    FOREGROUND_EXTEND_RATIO,
+    MAX_TRANSITION_BAND_DEGREES,
+    MIN_TRANSITION_BAND_DEGREES,
+    _extend_radius,
+    _linear_to_srgb_byte as _srgb_byte,
+    transition_band_taper_degrees,
     SILHOUETTE_HOLE_LIMIT,
     SILHOUETTE_SEGMENT_MISMATCH_LIMIT,
     VIEW_GAIN_RANGE,
@@ -139,6 +147,19 @@ def test_vertex_normals_blend_views_per_pixel() -> None:
         (flat,), sources, 32, 0, (0.0, 0.0, 0.0), 1.0, harmonize_colors=False
     )
     assert flat_rgba[(24 * 32 + 30) * 4] == flat_rgba[(0 * 32 + 2) * 4]
+    # 전이 띠는 두 시점의 입사각이 비슷한 이 면을 그대로 섞는다. 띠를 꺼도 순서는 같다.
+    # (띠를 끄면 1단계 필터만 사라진다. 실루엣 밖 신뢰도 감쇠는 항상 적용되므로
+    #  기능 도입 전과 바이트 단위로 같은 결과는 아니다.)
+    legacy_rgba, _ = rasterize_atlas(
+        (triangle,), sources, 32, 0, (0.0, 0.0, 0.0), 1.0,
+        harmonize_colors=False, dominant_view_blend=False,
+    )
+
+    def legacy_red_minus_green(x: int, y: int) -> int:
+        offset = (y * 32 + x) * 4
+        return legacy_rgba[offset] - legacy_rgba[offset + 1]
+
+    assert legacy_red_minus_green(2, 0) > legacy_red_minus_green(16, 8) > legacy_red_minus_green(30, 24)
 
 
 def test_blend_exponent_narrows_transition() -> None:
@@ -1123,6 +1144,311 @@ def test_verification_sheet_places_first_row_on_top() -> None:
     assert rgba[top_left] > rgba[top_left + 2], "첫 행이 위쪽이어야 합니다."
     assert rgba[bottom_left + 2] > rgba[bottom_left]
     assert rgba[top_right : top_right + 3] == b"\xff\xff\xff"
+
+
+
+
+def _tilted_triangle(degrees: float) -> BakeTriangle:
+    """FRONT에서 RIGHT 쪽으로 ``degrees``만큼 돌린 평면 삼각형."""
+
+    radians = math.radians(degrees)
+    normal = (math.sin(radians), -math.cos(radians), 0.0)
+    across = (-math.cos(radians), -math.sin(radians), 0.0)
+    return BakeTriangle(
+        positions=(
+            (across[0] * -0.4, across[1] * -0.4, -0.4),
+            (across[0] * 0.4, across[1] * 0.4, -0.4),
+            (across[0] * 0.4, across[1] * 0.4, 0.4),
+        ),
+        uvs=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0)),
+        normal=normal,
+    )
+
+
+def _three_view_sources() -> dict:
+    return {
+        "FRONT": _solid_source((0.8, 0.1, 0.1, 1.0)),
+        "RIGHT": _solid_source((0.1, 0.8, 0.1, 1.0)),
+        "BACK": _solid_source((0.1, 0.1, 0.8, 1.0)),
+    }
+
+
+def test_view_outside_transition_band_is_dropped_from_blend() -> None:
+    """지배 시점과 입사각이 50도 벌어진 시점은 색을 한 방울도 섞지 못한다."""
+
+    # FRONT 20도, RIGHT 70도. 기본 띠(12도)는 물론 최대 띠(30도)로도 RIGHT는 밖이다.
+    triangle = _tilted_triangle(20.0)
+    sources = _three_view_sources()
+    rgba, metrics = rasterize_atlas(
+        (triangle,), sources, 32, 0, (0.0, 0.0, 0.0), 1.0, harmonize_colors=False
+    )
+    offset = (8 * 32 + 24) * 4
+    assert rgba[offset] == _srgb_byte(0.8)
+    assert rgba[offset + 1] == _srgb_byte(0.1), "띠 밖 RIGHT의 초록이 섞이면 안 됩니다."
+    assert metrics["band_pixels"] == 0
+    assert metrics["dominant_only_pixels"] == metrics["filled_pixels"]
+
+    # 띠를 끄면 1단계 필터만 사라져 약한 RIGHT가 다시 초록을 끌어올린다.
+    # 2단계 신뢰도 감쇠는 끌 수 없으므로 이 결과가 기능 도입 전과 같지는 않다.
+    legacy, legacy_metrics = rasterize_atlas(
+        (triangle,), sources, 32, 0, (0.0, 0.0, 0.0), 1.0,
+        harmonize_colors=False, dominant_view_blend=False,
+    )
+    assert legacy[offset + 1] > rgba[offset + 1]
+    assert legacy_metrics["dominant_only_pixels"] == 0
+
+
+def test_views_inside_transition_band_still_blend() -> None:
+    """입사각이 같은 45도 면은 두 시점을 그대로 섞는다."""
+
+    triangle = _tilted_triangle(45.0)
+    sources = _three_view_sources()
+    rgba, metrics = rasterize_atlas(
+        (triangle,), sources, 32, 0, (0.0, 0.0, 0.0), 1.0, harmonize_colors=False
+    )
+    offset = (8 * 32 + 24) * 4
+    assert _srgb_byte(0.1) < rgba[offset] < _srgb_byte(0.8)
+    assert _srgb_byte(0.1) < rgba[offset + 1] < _srgb_byte(0.8)
+    assert abs(rgba[offset] - rgba[offset + 1]) <= 1, "50:50 면은 두 색이 같은 비율이어야 합니다."
+    assert metrics["band_pixels"] == metrics["filled_pixels"]
+    assert metrics["dominant_only_pixels"] == 0
+
+
+def test_transition_band_width_grows_blended_pixel_count() -> None:
+    """띠를 넓힐수록 두 시점이 섞이는 픽셀이 단조 증가한다."""
+
+    front_normal = (0.0, -1.0, 0.0)
+    right_normal = (1.0, 0.0, 0.0)
+    triangle = BakeTriangle(
+        positions=((-0.3, -0.3, -0.4), (0.3, 0.3, -0.4), (0.3, 0.3, 0.4)),
+        uvs=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0)),
+        normal=front_normal,
+        vertex_normals=(front_normal, right_normal, right_normal),
+    )
+    sources = _three_view_sources()
+    counts = []
+    for band in (MIN_TRANSITION_BAND_DEGREES, DEFAULT_TRANSITION_BAND_DEGREES, MAX_TRANSITION_BAND_DEGREES):
+        _rgba, metrics = rasterize_atlas(
+            (triangle,), sources, 64, 0, (0.0, 0.0, 0.0), 1.0,
+            harmonize_colors=False, transition_band_degrees=band,
+        )
+        counts.append(metrics["band_pixels"])
+        assert metrics["band_pixels"] + metrics["dominant_only_pixels"] == metrics["filled_pixels"]
+    assert counts[0] < counts[1] < counts[2]
+
+    for band in (MIN_TRANSITION_BAND_DEGREES - 0.1, MAX_TRANSITION_BAND_DEGREES + 0.1):
+        try:
+            rasterize_atlas(
+                (triangle,), sources, 32, 0, (0.0, 0.0, 0.0), 1.0, transition_band_degrees=band
+            )
+        except ValueError as error:
+            assert "4~30" in str(error)
+        else:
+            raise AssertionError(f"{band}도는 거부해야 합니다.")
+
+
+def _edge_strip_source(width: int, height: int) -> RasterSource:
+    """좌우 끝 6px만 그려진 소스. 가운데는 배경이라 표본이 실루엣 밖으로 나간다."""
+
+    pixels = []
+    for _y in range(height):
+        for x in range(width):
+            drawn = x < 6 or x >= width - 6
+            pixels.extend((0.8, 0.2, 0.1, 1.0) if drawn else (1.0, 1.0, 1.0, 1.0))
+    return build_raster_source(
+        width=width,
+        height=height,
+        pixels=pixels,
+        subject_bbox=(0, 0, width, height),
+        background=(1.0, 1.0, 1.0, 1.0),
+        background_threshold=0.2,
+        fallback_color=(0.8, 0.2, 0.1, 1.0),
+    )
+
+
+def test_outside_silhouette_confidence_decays_quadratically() -> None:
+    """실루엣 밖 확장 표본의 신뢰도는 거리에 대해 선형이 아니라 제곱으로 떨어진다."""
+
+    from uvmapping.texture_bake import _aligned_source_sample
+
+    width = height = 64
+    source = _edge_strip_source(width, height)
+    bbox = (0.0, 0.0, 1.0, 1.0)
+    limit = max(4.0, FOREGROUND_EXTEND_RATIO * width)
+    for pixel_x in (6, 7, 8):
+        # 표본 좌표는 정규화 후 (width - 1)로 늘어나므로 같은 픽셀을 겨냥해 되돌린다.
+        sample = _aligned_source_sample(source, (pixel_x / (width - 1.0), 0.5, 0.0), bbox)
+        assert sample is not None
+        distance = source.foreground_distance[int(round(0.5 * (height - 1))) * width + pixel_x]
+        assert 0.0 < distance < limit
+        expected = (1.0 - distance / limit) ** 2
+        assert abs(sample[1] - expected) < 1.0e-9, f"{pixel_x}px 신뢰도가 제곱 감쇠가 아닙니다."
+        # 같은 거리의 선형 감쇠보다 반드시 낮아야 확장 표본이 지배 시점을 뺏지 않는다.
+        assert sample[1] < 1.0 - distance / limit
+
+
+def test_foreground_extend_limit_is_halved() -> None:
+    """확장 한계 0.03 -> 0.015. 큰 피사체에서 정면 색이 번지는 거리가 절반이 된다."""
+
+    from uvmapping.texture_bake import _aligned_source_sample
+
+    assert FOREGROUND_EXTEND_RATIO == 0.015
+    # 1000px 피사체: 15px + 여유 2px. 0.03이었다면 32px까지 이어 붙였다.
+    assert _extend_radius((0, 0, 1000, 1000)) == 17.0
+
+    width, height = 320, 32
+    source = _edge_strip_source(width, height)
+    bbox = (0.0, 0.0, 1.0, 1.0)
+    # 한계는 320 * 0.015 = 4.8px. 옛 비율이었다면 9.6px까지 버텼다.
+    near = _aligned_source_sample(source, (9.0 / (width - 1.0), 0.5, 0.0), bbox)
+    assert near is not None and 0.0 < near[1] < 0.1
+    assert _aligned_source_sample(source, (12.0 / (width - 1.0), 0.5, 0.0), bbox) is None
+
+
+def _vertex_normal_ramp() -> BakeTriangle:
+    """정점 법선이 FRONT에서 RIGHT로 도는 면. 픽셀마다 입사각 차가 달라진다."""
+
+    front_normal = (0.0, -1.0, 0.0)
+    right_normal = (1.0, 0.0, 0.0)
+    return BakeTriangle(
+        positions=((-0.3, -0.3, -0.4), (0.3, 0.3, -0.4), (0.3, 0.3, 0.4)),
+        uvs=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0)),
+        normal=front_normal,
+        vertex_normals=(front_normal, right_normal, right_normal),
+    )
+
+
+def test_transition_band_keeps_unpainted_marker_competition_unchanged() -> None:
+    """띠 필터가 가중치 총합을 줄이면 미채색 마커가 이겨 순차 베이크가 회색으로 물든다."""
+
+    triangle = _vertex_normal_ramp()
+    sources = {"FRONT": _solid_source((0.8, 0.1, 0.1, 1.0)), "RIGHT": _solid_source((0.1, 0.8, 0.1, 1.0))}
+    common = dict(
+        harmonize_colors=False,
+        unpainted_color=(0.5, 0.5, 0.5),
+        require_all_sources=False,
+        allow_view_substitution=False,
+    )
+    _off, off = rasterize_atlas(
+        (triangle,), sources, 64, 0, (0.0, 0.0, 0.0), 1.0, dominant_view_blend=False, **common
+    )
+    _on, on = rasterize_atlas((triangle,), sources, 64, 0, (0.0, 0.0, 0.0), 1.0, **common)
+    assert on["band_pixels"] > 0, "필터가 실제로 표본을 줄이는 형상이어야 의미 있는 검사입니다."
+    assert on["unpainted_pixels"] == off["unpainted_pixels"] == 0
+    assert on["fallback_pixels"] == off["fallback_pixels"]
+    assert on["filled_pixels"] == off["filled_pixels"]
+
+
+def test_transition_band_edge_fades_without_a_step() -> None:
+    """띠 경계에서 보조 시점을 한 번에 자르면 곡면에 계단 등고선이 남는다."""
+
+    assert transition_band_taper_degrees(DEFAULT_TRANSITION_BAND_DEGREES) == 4.0
+    assert transition_band_taper_degrees(MIN_TRANSITION_BAND_DEGREES) == MIN_TRANSITION_BAND_DEGREES
+    assert transition_band_taper_degrees(MAX_TRANSITION_BAND_DEGREES) == 9.0
+
+    sources = _three_view_sources()
+
+    def green(tilt: float, **kwargs) -> int:
+        rgba, _metrics = rasterize_atlas(
+            (_tilted_triangle(tilt),), sources, 32, 0, (0.0, 0.0, 0.0), 1.0,
+            harmonize_colors=False, **kwargs,
+        )
+        return rgba[(8 * 32 + 24) * 4 + 1]
+
+    # 기울기 t에서 FRONT 입사각은 t, RIGHT는 90 - t. 입사각 차가 12도인 경계는 39도.
+    outside = green(38.5)
+    edge = green(39.0)
+    inside = green(39.5)
+    assert outside == edge == _srgb_byte(0.1), "띠 밖은 지배 시점 색만 있어야 합니다."
+    # 띠 안 첫 구간은 감쇠 덕분에 온전 혼합값까지 한 번에 뛰지 않는다.
+    blended = green(39.0, transition_band_degrees=MAX_TRANSITION_BAND_DEGREES)
+    assert edge < inside < blended
+    assert inside - edge < (blended - edge) // 2, "경계 단차가 온전 혼합값의 절반 이상이면 계단이 보입니다."
+
+
+def test_front_and_top_resolve_to_one_view_once_angles_differ() -> None:
+    """FRONT와 TOP이 겹치는 모서리도 입사각이 띠 밖으로 벌어지면 한 시점만 남는다."""
+
+    sources = _three_view_sources()
+    sources["TOP"] = _solid_source((0.1, 0.1, 0.8, 1.0))
+
+    def bake(normal, positions):
+        triangle = BakeTriangle(positions=positions, uvs=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0)), normal=normal)
+        rgba, metrics = rasterize_atlas(
+            (triangle,), sources, 32, 0, (0.0, 0.0, 0.0), 1.0, harmonize_colors=False
+        )
+        offset = (8 * 32 + 24) * 4
+        return tuple(rgba[offset : offset + 3]), metrics
+
+    # FRONT 30도 / TOP 60도. 차이 30도는 기본 띠 밖이라 TOP의 파랑이 섞이면 안 된다.
+    radians = math.radians(30.0)
+    normal = (0.0, -math.cos(radians), math.sin(radians))
+    across = (1.0, 0.0, 0.0)
+    depth = (0.0, math.sin(radians), math.cos(radians))
+    positions = (
+        tuple(across[i] * -0.4 + depth[i] * -0.4 for i in range(3)),
+        tuple(across[i] * 0.4 + depth[i] * -0.4 for i in range(3)),
+        tuple(across[i] * 0.4 + depth[i] * 0.4 for i in range(3)),
+    )
+    color, metrics = bake(normal, positions)
+    assert color == (_srgb_byte(0.8), _srgb_byte(0.1), _srgb_byte(0.1))
+    assert metrics["band_pixels"] == 0
+
+    # 정확히 45도면 두 시점의 입사각이 같다. 기하학적으로 우열이 없으므로 대칭 혼합을
+    # 유지하고, 지배 시점 동률은 VIEW_NAMES 순서(FRONT 우선)로 결정적으로 정해진다.
+    tie_normal = (0.0, -0.7071067811865476, 0.7071067811865476)
+    tie_positions = (
+        (-0.4, -0.28284271247461906, -0.28284271247461906),
+        (0.4, -0.28284271247461906, -0.28284271247461906),
+        (0.4, 0.28284271247461906, 0.28284271247461906),
+    )
+    tie_color, tie_metrics = bake(tie_normal, tie_positions)
+    assert tie_metrics["band_pixels"] > 0
+    assert tie_color == bake(tie_normal, tie_positions)[0], "동률 결과는 재현 가능해야 합니다."
+    # FRONT(0.8, 0.1, 0.1)와 TOP(0.1, 0.1, 0.8)의 50:50이라 빨강과 파랑이 같아진다.
+    assert tie_color[0] == tie_color[2] > tie_color[1], "45도 모서리는 두 시점을 대칭으로 씁니다."
+    assert tie_color[1] == _srgb_byte(0.1)
+
+
+def test_occlusion_fallback_keeps_its_own_dominant_view() -> None:
+    """가림 폴백은 가려진 표본만의 지배 시점으로 판단하고 임계값 동작을 바꾸지 않는다."""
+
+    cube = _closed_cube()
+    sources = {
+        "FRONT": _solid_source((0.8, 0.1, 0.1, 1.0)),
+        "RIGHT": _solid_source((0.1, 0.8, 0.1, 1.0)),
+        "BACK": _solid_source((0.1, 0.1, 0.8, 1.0)),
+    }
+    _off_rgba, off = rasterize_atlas(
+        cube, sources, 48, 0, (0.0, 0.0, 0.0), 1.0, harmonize_colors=False, dominant_view_blend=False
+    )
+    on_rgba, on = rasterize_atlas(cube, sources, 48, 0, (0.0, 0.0, 0.0), 1.0, harmonize_colors=False)
+    assert on["occluded_fallback_pixels"] > 0, "윗면이 가림 폴백으로 복구되는 형상이어야 합니다."
+    # 총합 보존 덕분에 필터를 켜도 어떤 픽셀이 폴백으로 넘어가는지가 달라지지 않는다.
+    assert on["occluded_fallback_pixels"] == off["occluded_fallback_pixels"]
+    assert on["fallback_pixels"] == off["fallback_pixels"]
+    assert on_rgba == rasterize_atlas(
+        cube, sources, 48, 0, (0.0, 0.0, 0.0), 1.0, harmonize_colors=False
+    )[0], "가림 폴백 결과도 결정적이어야 합니다."
+
+
+def test_band_range_is_only_checked_when_the_filter_runs() -> None:
+    """띠를 끄면 쓰지 않는 값이므로 범위 검증도 하지 않는다."""
+
+    sources = _three_view_sources()
+    triangle = _tilted_triangle(45.0)
+    _rgba, _metrics = rasterize_atlas(
+        (triangle,), sources, 32, 0, (0.0, 0.0, 0.0), 1.0,
+        harmonize_colors=False, dominant_view_blend=False, transition_band_degrees=0.0,
+    )
+    try:
+        rasterize_atlas(
+            (triangle,), sources, 32, 0, (0.0, 0.0, 0.0), 1.0, transition_band_degrees=0.0
+        )
+    except ValueError as error:
+        assert "4~30" in str(error)
+    else:
+        raise AssertionError("띠를 켜면 범위를 검증해야 합니다.")
 
 
 if __name__ == "__main__":

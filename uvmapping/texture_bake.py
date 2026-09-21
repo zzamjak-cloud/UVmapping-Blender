@@ -67,8 +67,9 @@ SOURCE_VIEW_NAMES = REQUIRED_SOURCE_VIEW_NAMES
 _VIEW_SOURCE_FALLBACKS = {"LEFT": ("RIGHT", True)}
 MAX_ATLAS_RESOLUTION = 4096
 # 생성 실루엣 밖 표본을 최근접 전경 색으로 이어 붙일 최대 거리(피사체 크기 대비).
-# 넓히면 실루엣이 좁게 그려진 부위(벌린 팔 등)에 가로 줄무늬 띠가 생긴다.
-FOREGROUND_EXTEND_RATIO = 0.03
+# 넓히면 실루엣이 좁게 그려진 부위(벌린 팔 등)에 가로 줄무늬 띠가 생기고,
+# 정면 실루엣이 1~2%만 좁아도 정면 색이 측면까지 번져 이음새에 이중상이 남는다.
+FOREGROUND_EXTEND_RATIO = 0.015
 # 배경보다 밝은 무채색 픽셀을 배경으로 볼 때의 채도 상한과, 이 규칙을 켤 배경 휘도 하한.
 # AI가 팔·몸통 틈을 배경(0.93)보다 밝은 순백으로 채우면 색 거리만으로는 전경이 된다.
 BRIGHT_BACKGROUND_MAX_SATURATION = 0.06
@@ -76,6 +77,11 @@ BRIGHT_BACKGROUND_MIN_LUMINANCE = 0.6
 # 테두리에서 시작하는 배경 플러드필의 이웃 차 허용치와 배경색과의 최대 거리.
 BACKGROUND_FLOOD_NEIGHBOR_TOLERANCE = 0.02
 BACKGROUND_FLOOD_MAX_DISTANCE = 0.15
+# 지배 시점 전이 띠의 기본 폭(도)과 허용 범위. 좁히면 이음새가 칼같이 갈리고
+# 넓히면 두 시점이 겹쳐 그린 이중상이 다시 보인다.
+DEFAULT_TRANSITION_BAND_DEGREES = 12.0
+MIN_TRANSITION_BAND_DEGREES = 4.0
+MAX_TRANSITION_BAND_DEGREES = 30.0
 # 부분 베이크에서 "미채색" 마커가 실제 뷰와 경쟁하는 기준 입사각. 이 각도보다
 # 비스듬히 보이는 면은 색이 늘어진 표본이라 다음 시점이 다시 칠하도록 회색이 이긴다.
 UNPAINTED_MARKER_ANGLE_DEGREES = 35.0
@@ -1934,10 +1940,10 @@ def _aligned_source_sample(
     mirror_x: bool = False,
     vertical_fallback: int = 0,
 ) -> tuple[tuple[float, float, float, float], float] | None:
-    """표본 색과 신뢰도(0.05~1.0)를 돌려준다.
+    """표본 색과 신뢰도(0.0~1.0)를 돌려준다.
 
-    신뢰도는 생성 실루엣 안이면 1.0이고, 실루엣 밖으로 멀어질수록 낮아진다.
-    경계에서 다른 뷰로 부드럽게 넘어가도록 호출부가 가중치에 곱한다.
+    신뢰도는 생성 실루엣 안이면 1.0이고, 실루엣 밖으로 멀어질수록 제곱으로
+    낮아진다. 경계에서 다른 뷰로 부드럽게 넘어가도록 호출부가 가중치에 곱한다.
     """
 
     target_x, target_y = _source_coordinates(
@@ -1956,7 +1962,10 @@ def _aligned_source_sample(
     elif distance >= limit:
         return None
     else:
-        confidence = 1.0 - distance / limit
+        # 제곱 감쇠. 선형이면 한계의 절반 지점에서도 신뢰도가 0.5라 실루엣 밖
+        # 확장 표본이 정상 표본을 가진 시점을 이기고 지배 시점이 되어 색이 번진다.
+        remaining = 1.0 - distance / limit
+        confidence = remaining * remaining
     return (
         bilinear_sample(source.filled, source.width, source.height, target_x, target_y),
         confidence,
@@ -2018,14 +2027,101 @@ def _normal_view_weights(
     return weights
 
 
+def _normal_view_weights_with_cosines(
+    normal: Vec3, exponent: float, views: Sequence[str]
+) -> tuple[dict[str, float], dict[str, float]]:
+    """가중치와 그 바탕이 된 코사인을 함께 돌려준다.
+
+    전이 띠 판정은 가중치가 아니라 각도를 그대로 써야 지수를 바꿔도 띠 폭이
+    변하지 않는다. 가중치에서 코사인을 되돌리려면 픽셀마다 거듭제곱근이 필요하다.
+    """
+
+    x, y, z = normal
+    weights = {}
+    cosines = {}
+    for name in views:
+        toward = VIEW_SPECS[name].toward_camera
+        cosine = x * toward[0] + y * toward[1] + z * toward[2]
+        if cosine > 0.0:
+            weights[name] = cosine ** exponent
+            cosines[name] = cosine
+        else:
+            weights[name] = 0.0
+            cosines[name] = 0.0
+    return weights, cosines
+
+
+def _dominant_band_limit(dominant_cosine: float, band_cosine: float, band_sine: float) -> float:
+    """지배 시점 각도에 띠 각도를 더한 각도의 코사인. 이보다 작으면 띠 밖이다."""
+
+    sine = math.sqrt(max(0.0, 1.0 - dominant_cosine * dominant_cosine))
+    return dominant_cosine * band_cosine - sine * band_sine
+
+
+def transition_band_taper_degrees(band_degrees: float) -> float:
+    """전이 띠 안쪽 감쇠 구간의 폭(도).
+
+    띠를 좁힐수록 경계에서 잘려 나가는 보조 시점의 기여도가 커진다(기본 12도
+    기준 30% 안팎). 그래서 감쇠 폭에 하한을 두어 좁은 띠일수록 띠 전체가
+    부드럽게 줄어들게 한다.
+    """
+
+    return min(band_degrees, max(4.0, band_degrees * 0.3))
+
+
+def _filter_dominant_band(
+    colors: list,
+    dominant_cosine: float,
+    band_cosine: float,
+    band_sine: float,
+    inner_cosine: float,
+    inner_sine: float,
+) -> list:
+    """전이 띠 밖 표본을 빼되 가중치 총합은 필터 전 그대로 유지한 목록을 돌려준다.
+
+    총합을 보존해야 미채색 마커 경쟁과 가림 폴백의 1e-4 임계값이 필터를 켜기
+    전과 똑같이 동작한다. 남은 표본에 같은 상수를 곱하는 것이라 합성 색은
+    영향을 받지 않고 시점 사이 비율만 바뀐다.
+
+    띠 경계에서 기여도를 한 번에 0으로 자르면 곡면에 계단 등고선이 남으므로,
+    띠 안쪽 끝 구간에서 smoothstep으로 0까지 줄인다. 감쇠 구간을 띠 바깥이
+    아니라 안쪽에 두어 "띠 밖 시점은 기여 0"이라는 규칙은 그대로 지킨다.
+    """
+
+    outer = _dominant_band_limit(dominant_cosine, band_cosine, band_sine)
+    inner = _dominant_band_limit(dominant_cosine, inner_cosine, inner_sine)
+    span = inner - outer
+    kept = []
+    before = 0.0
+    after = 0.0
+    for item in colors:
+        weight = item[1]
+        before += weight
+        cosine = item[2]
+        if cosine >= inner:
+            kept.append(item)
+            after += weight
+            continue
+        if cosine <= outer or span <= 1.0e-12:
+            continue
+        ratio = (cosine - outer) / span
+        weight *= ratio * ratio * (3.0 - 2.0 * ratio)
+        kept.append((item[0], weight, cosine))
+        after += weight
+    if after <= 0.0 or before <= 0.0 or abs(after - before) <= 1.0e-12:
+        return kept
+    scale = before / after
+    return [(item[0], item[1] * scale, item[2]) for item in kept]
+
+
 def _pixel_view_weights(
     normal: Vec3,
     exponent: float,
     active_views: Sequence[str],
     has_top: bool,
     has_bottom: bool,
-) -> tuple[dict[str, float], int]:
-    """픽셀 법선의 뷰 가중치와 상·하면 대체 방향(-1/0/1)을 정한다.
+) -> tuple[dict[str, float], int, dict[str, float]]:
+    """픽셀 법선의 뷰 가중치, 상·하면 대체 방향(-1/0/1), 뷰별 코사인을 정한다.
 
     위·아래 소스가 없으면 법선의 수평 성분으로 측면 뷰를 고르고, 위·아래가
     지배적인 면은 측면 이미지의 최상·최하단 색을 끌어오도록 표시한다.
@@ -2038,9 +2134,21 @@ def _pixel_view_weights(
             vertical_fallback = 1 if z > 0.0 else -1
         horizontal = math.hypot(x, y)
         if horizontal < 1.0e-6:
-            return {name: 1.0 for name in active_views if name not in ("TOP", "BOTTOM")}, vertical_fallback
+            # 수평 성분이 0인 정수직 면. 측면 뷰는 모두 같은 자격이라 가중치를
+            # 똑같이 주되, 코사인은 실제 값(모두 0 근처)을 넘긴다. 1.0 더미를
+            # 넣으면 전이 띠가 실제 입사각이 아닌 가짜 각도로 판정하게 된다.
+            flat = {}
+            flat_cosines = {}
+            for name in active_views:
+                if name in ("TOP", "BOTTOM"):
+                    continue
+                toward = VIEW_SPECS[name].toward_camera
+                flat[name] = 1.0
+                flat_cosines[name] = x * toward[0] + y * toward[1] + z * toward[2]
+            return flat, vertical_fallback, flat_cosines
         normal = (x / horizontal, y / horizontal, 0.0)
-    return _normal_view_weights(normal, exponent, active_views), vertical_fallback
+    weights, cosines = _normal_view_weights_with_cosines(normal, exponent, active_views)
+    return weights, vertical_fallback, cosines
 
 
 def _interpolated_normal(
@@ -2205,6 +2313,8 @@ def rasterize_atlas(
     scale: float,
     *,
     blend_exponent: float = DEFAULT_BLEND_EXPONENT,
+    dominant_view_blend: bool = True,
+    transition_band_degrees: float = DEFAULT_TRANSITION_BAND_DEGREES,
     harmonize_colors: bool = True,
     silhouette_warp: bool = False,
     unpainted_color: tuple[float, float, float] | None = None,
@@ -2220,6 +2330,10 @@ def rasterize_atlas(
     ``allow_view_substitution``을 끄면 LEFT의 RIGHT 미러 대체와 TOP/BOTTOM의
     측면 색 늘리기 대체를 모두 막아, 소스가 있는 뷰가 직접 보는 면만 칠한다.
     순차 모드의 다음 시점 가이드에 미채색 영역이 실제로 남아야 하기 때문이다.
+    ``dominant_view_blend``가 켜지면 픽셀마다 가장 강한 시점을 고르고, 그 시점과의
+    입사각 차가 ``transition_band_degrees`` 밖인 시점은 합성에서 빼 이중상을 막는다.
+    끄면 이 전이 띠 필터만 사라진다. 실루엣 밖 확장 표본의 신뢰도 감쇠는 끄고
+    켤 수 없고 언제나 적용되므로, 끈 결과가 이 기능 도입 전과 같지는 않다.
     """
 
     if not triangles:
@@ -2240,6 +2354,12 @@ def rasterize_atlas(
         raise ValueError(f"지원하지 않는 생성 뷰입니다: {', '.join(unknown)}")
     if blend_exponent <= 0.0:
         raise ValueError("뷰 블렌딩 지수는 0보다 커야 합니다.")
+    if dominant_view_blend and not (
+        MIN_TRANSITION_BAND_DEGREES <= transition_band_degrees <= MAX_TRANSITION_BAND_DEGREES
+    ):
+        raise ValueError(
+            f"전이 띠 폭은 {MIN_TRANSITION_BAND_DEGREES:g}~{MAX_TRANSITION_BAND_DEGREES:g}도만 지원합니다."
+        )
     if not allow_view_substitution and unpainted_color is None:
         raise ValueError("뷰 대체를 끄려면 미채색 영역을 칠할 unpainted_color가 필요합니다.")
 
@@ -2308,6 +2428,14 @@ def rasterize_atlas(
     occluded_fallback_pixels = 0
     fallback_pixels = 0
     unpainted_pixels = 0
+    dominant_only_pixels = 0
+    band_pixels = 0
+    band_radians = math.radians(transition_band_degrees)
+    band_cosine = math.cos(band_radians)
+    band_sine = math.sin(band_radians)
+    inner_radians = band_radians - math.radians(transition_band_taper_degrees(transition_band_degrees))
+    inner_cosine = math.cos(inner_radians)
+    inner_sine = math.sin(inner_radians)
     unpainted_rgba = None
     marker_weight = 0.0
     if unpainted_color is not None:
@@ -2327,7 +2455,7 @@ def rasterize_atlas(
         positions = triangle.positions
         uniform_normal = _uniform_normal(triangle)
         if uniform_normal:
-            view_weights, vertical_fallback = _pixel_view_weights(
+            view_weights, vertical_fallback, view_cosines = _pixel_view_weights(
                 triangle.normal, blend_exponent, active_views, has_top, has_bottom
             )
         for y in range(bounds[1], bounds[3] + 1):
@@ -2345,19 +2473,22 @@ def rasterize_atlas(
                 py = w0 * positions[0][1] + w1 * positions[1][1] + w2 * positions[2][1] - center[1]
                 pz = w0 * positions[0][2] + w1 * positions[1][2] + w2 * positions[2][2] - center[2]
                 if not uniform_normal:
-                    view_weights, vertical_fallback = _pixel_view_weights(
+                    view_weights, vertical_fallback, view_cosines = _pixel_view_weights(
                         _interpolated_normal(triangle, weights),
                         blend_exponent,
                         active_views,
                         has_top,
                         has_bottom,
                     )
-                colors: list[tuple[tuple[float, float, float, float], float]] = []
+                colors: list[tuple[tuple[float, float, float, float], float, float]] = []
                 occluded_views: list[tuple] = []
+                dominant_weight = 0.0
+                dominant_cosine = 0.0
                 for name, right, up, toward, source, mirror_x, depth_buffer, bbox, gain in view_table:
                     view_weight = view_weights.get(name, 0.0)
                     if view_weight <= 1.0e-8:
                         continue
+                    view_cosine = view_cosines.get(name, 0.0)
                     projected = (
                         0.5 + (px * right[0] + py * right[1] + pz * right[2]) * inverse_scale,
                         0.5 + (px * up[0] + py * up[1] + pz * up[2]) * inverse_scale,
@@ -2371,7 +2502,7 @@ def rasterize_atlas(
                     if visibility <= 0.0:
                         occluded_samples += 1
                         occluded_views.append(
-                            (source, projected, bbox, mirror_x, view_weight, gain, vertical_fallback)
+                            (source, projected, bbox, mirror_x, view_weight, gain, vertical_fallback, view_cosine)
                         )
                         continue
                     sample = _aligned_source_sample(
@@ -2383,35 +2514,68 @@ def rasterize_atlas(
                     )
                     if sample is not None:
                         color, confidence = sample
+                        # 실루엣 밖 확장 표본은 신뢰도가 낮아 지배 시점 경쟁에서 밀린다.
+                        weight = view_weight * visibility * confidence
                         colors.append(
                             (
                                 (color[0] * gain[0], color[1] * gain[1], color[2] * gain[2], color[3]),
-                                view_weight * visibility * confidence,
+                                weight,
+                                view_cosine,
                             )
                         )
+                        # 동률이면 앞선 시점이 이긴다. view_table은 VIEW_NAMES 순서라
+                        # FRONT가 TOP·RIGHT보다 먼저 지배 시점이 되어 결과가 결정적이다.
+                        if weight > dominant_weight:
+                            dominant_weight = weight
+                            dominant_cosine = view_cosine
+                if dominant_view_blend and colors:
+                    if len(colors) > 1:
+                        colors = _filter_dominant_band(
+                            colors, dominant_cosine, band_cosine, band_sine, inner_cosine, inner_sine
+                        )
+                    if len(colors) > 1:
+                        band_pixels += 1
+                    else:
+                        dominant_only_pixels += 1
                 total_weight = sum(item[1] for item in colors)
                 if marker_weight > 0.0:
                     if marker_weight >= total_weight:
                         unpainted_pixels += 1
-                    colors.append((unpainted_rgba, marker_weight))
+                    colors.append((unpainted_rgba, marker_weight, 1.0))
                     total_weight += marker_weight
                 if total_weight < 1.0e-4 and occluded_views:
                     # 다리 안쪽처럼 모든 시점에서 가려진 면은 전체 평균색을 칠하면
                     # 텍스처가 빠진 것처럼 보인다. 가림을 무시하고 같은 시점의 같은
                     # 좌표를 다시 읽어 주변과 이어지는 색을 쓴다. 가중치가 사실상 0인
                     # 표본 하나가 픽셀을 독점하지 않도록 개수가 아니라 가중치 합으로 판단한다.
-                    for source, projected, bbox, mirror_x, view_weight, gain, fallback_direction in occluded_views:
+                    recovered: list = []
+                    recovered_cosine = 0.0
+                    recovered_weight = 0.0
+                    for source, projected, bbox, mirror_x, view_weight, gain, fallback_direction, view_cosine in occluded_views:
                         sample = _aligned_source_sample(
                             source, projected, bbox, mirror_x=mirror_x, vertical_fallback=fallback_direction
                         )
                         if sample is not None:
                             color, confidence = sample
-                            colors.append(
+                            weight = view_weight * confidence
+                            recovered.append(
                                 (
                                     (color[0] * gain[0], color[1] * gain[1], color[2] * gain[2], color[3]),
-                                    view_weight * confidence,
+                                    weight,
+                                    view_cosine,
                                 )
                             )
+                            if weight > recovered_weight:
+                                recovered_weight = weight
+                                recovered_cosine = view_cosine
+                    if dominant_view_blend and len(recovered) > 1:
+                        recovered = _filter_dominant_band(
+                            recovered, recovered_cosine, band_cosine, band_sine, inner_cosine, inner_sine
+                        )
+                    # 가림 폴백은 가려진 표본만의 지배 시점 하나로 판단한다. 남아 있던
+                    # colors는 합이 1e-4 미만이라 색에 기여하지 못하면서 기준만 뒤섞으므로
+                    # 버린다. 서로 다른 지배 시점으로 걸러진 두 목록을 합치면 안 된다.
+                    colors = recovered
                     total_weight = sum(item[1] for item in colors)
                     if total_weight >= 1.0e-4:
                         occluded_fallback_pixels += 1
@@ -2419,7 +2583,7 @@ def rasterize_atlas(
                     fallback_pixels += 1
                     if unpainted_rgba is not None:
                         unpainted_pixels += 1
-                        colors = [(unpainted_rgba, 1.0)]
+                        colors = [(unpainted_rgba, 1.0, 1.0)]
                     else:
                         # 소스 단위로 가중치를 모아 각 생성 이미지의 전경 평균색을 섞는다.
                         # 주변 픽셀과 같은 gain을 곱해야 폴백 픽셀만 원래 색조로 튀지 않는다.
@@ -2434,6 +2598,7 @@ def rasterize_atlas(
                                 (
                                     (base[0] * gain[0], base[1] * gain[1], base[2] * gain[2], base[3]),
                                     max(0.001, weight),
+                                    1.0,
                                 )
                             )
                     total_weight = sum(item[1] for item in colors)
@@ -2457,6 +2622,8 @@ def rasterize_atlas(
         "dilated_pixels": dilated_pixels,
         "occluded_samples": occluded_samples,
         "occluded_fallback_pixels": occluded_fallback_pixels,
+        "dominant_only_pixels": dominant_only_pixels,
+        "band_pixels": band_pixels,
         "fallback_pixels": fallback_pixels,
         "unpainted_pixels": unpainted_pixels,
         "depth_resolution": depth_resolution,
@@ -3018,6 +3185,8 @@ def rasterize_to_png(
     uv_layer_names=None,
     *,
     blend_exponent: float = DEFAULT_BLEND_EXPONENT,
+    dominant_view_blend: bool = True,
+    transition_band_degrees: float = DEFAULT_TRANSITION_BAND_DEGREES,
     harmonize_colors: bool = True,
     silhouette_warp: bool = False,
     unpainted_color: tuple[float, float, float] | None = None,
@@ -3042,6 +3211,8 @@ def rasterize_to_png(
         uv_layer_names,
         {
             "blend_exponent": blend_exponent,
+            "dominant_view_blend": dominant_view_blend,
+            "transition_band_degrees": transition_band_degrees,
             "harmonize_colors": harmonize_colors,
             "silhouette_warp": silhouette_warp,
             "unpainted_color": unpainted_color,
@@ -3096,6 +3267,8 @@ def bake_diffuse(
     uv_layer_names=None,
     *,
     blend_exponent: float = DEFAULT_BLEND_EXPONENT,
+    dominant_view_blend: bool = True,
+    transition_band_degrees: float = DEFAULT_TRANSITION_BAND_DEGREES,
     harmonize_colors: bool = True,
     silhouette_warp: bool = False,
     unpainted_color: tuple[float, float, float] | None = None,
@@ -3121,6 +3294,8 @@ def bake_diffuse(
         uv_layer_names,
         {
             "blend_exponent": blend_exponent,
+            "dominant_view_blend": dominant_view_blend,
+            "transition_band_degrees": transition_band_degrees,
             "harmonize_colors": harmonize_colors,
             "silhouette_warp": silhouette_warp,
             "unpainted_color": unpainted_color,
@@ -3217,6 +3392,10 @@ __all__ = (
     "verify_rendered_views",
     "BakeTriangle",
     "DEFAULT_BLEND_EXPONENT",
+    "DEFAULT_TRANSITION_BAND_DEGREES",
+    "transition_band_taper_degrees",
+    "MIN_TRANSITION_BAND_DEGREES",
+    "MAX_TRANSITION_BAND_DEGREES",
     "FOREGROUND_EXTEND_RATIO",
     "MAX_ATLAS_RESOLUTION",
     "REQUIRED_SOURCE_VIEW_NAMES",

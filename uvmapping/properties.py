@@ -12,6 +12,11 @@ from bpy.props import (
 )
 from bpy.types import AddonPreferences, PropertyGroup
 
+from .texture_bake import (
+    DEFAULT_TRANSITION_BAND_DEGREES,
+    MAX_TRANSITION_BAND_DEGREES,
+    MIN_TRANSITION_BAND_DEGREES,
+)
 from .texture_presets import (
     AUTO_IMAGE_QUALITY,
     DEFAULT_QUALITY_PRESET,
@@ -22,6 +27,10 @@ from .texture_presets import (
     quality_preset_after_change,
     quality_preset_values,
 )
+
+
+# 투영 블렌딩 기본값. 패널 기본값과 상태에 값이 없을 때의 대체값을 한곳에서 정한다.
+DEFAULT_DOMINANT_VIEW_BLEND = True
 
 
 def addon_module_id() -> str:
@@ -295,6 +304,26 @@ class UVMAPPING_PG_settings(PropertyGroup):
         step=50,
         precision=1,
     )
+    dominant_view_blend: BoolProperty(
+        name="시점 경계 선명하게",
+        description=(
+            "픽셀마다 가장 정면으로 보이는 시점 하나를 쓰고 경계 띠에서만 색을 섞습니다. "
+            "정합이 어긋난 두 시점이 겹쳐 보이는 이중상을 줄입니다"
+        ),
+        default=DEFAULT_DOMINANT_VIEW_BLEND,
+    )
+    transition_band_degrees: FloatProperty(
+        name="경계 혼합 폭(도)",
+        description=(
+            "지배 시점과 입사각 차가 이 각도 안인 시점만 함께 섞습니다. "
+            "좁을수록 경계가 선명하고, 넓을수록 전이가 부드럽습니다"
+        ),
+        default=DEFAULT_TRANSITION_BAND_DEGREES,
+        min=MIN_TRANSITION_BAND_DEGREES,
+        max=MAX_TRANSITION_BAND_DEGREES,
+        step=100,
+        precision=1,
+    )
     harmonize_view_colors: BoolProperty(
         name="시점 간 색조 보정",
         description="두 시점이 함께 보는 면의 평균색을 비교해 측면·뒷면의 밝기와 색조를 정면 기준으로 맞춥니다",
@@ -420,9 +449,20 @@ class UVMAPPING_PG_settings(PropertyGroup):
         default="참조 이미지를 추가해 주세요",
         options={"SKIP_SAVE"},
     )
+    texture_last_error: StringProperty(
+        name="마지막 실패 원문",
+        default="",
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+    texture_last_error_kind: StringProperty(
+        name="마지막 실패 분류",
+        default="",
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
 
 
 __all__ = (
+    "DEFAULT_DOMINANT_VIEW_BLEND",
     "GPT_IMAGE_25_FLARE_MODELS",
     "GPT_IMAGE_25_SUNBURST_MODELS",
     "GPT_IMAGE_MODELS",

@@ -533,6 +533,70 @@ def test_image_response_requires_exactly_one_decodable_image() -> None:
     )
 
 
+def test_image_response_carries_text_only_refusal_reason() -> None:
+    """이미지 없이 글로만 돌아온 거부는 그 사유가 오류 메시지에 실려야 한다."""
+
+    refusal = (
+        "I can't generate that image because the request involves a copyrighted "
+        "character. Try describing the outfit instead."
+    )
+    try:
+        extract_image_response({"data": [], "choices": [{"message": {"content": refusal}}]})
+    except ValueError as error:
+        message = str(error)
+    else:  # pragma: no cover - 위 호출은 반드시 실패한다.
+        raise AssertionError("이미지 없는 응답이 통과했습니다.")
+    assert "정확히 한 장" in message
+    assert "모델 응답:" in message
+    assert "copyrighted" in message
+
+    # 본문이 list 형태의 content여도 문장만 모은다.
+    try:
+        extract_image_response(
+            {"data": [], "choices": [{"message": {"content": [{"type": "text", "text": refusal}]}}]}
+        )
+    except ValueError as error:
+        assert "copyrighted" in str(error)
+
+    # 300자를 넘는 사유는 잘라 싣는다.
+    long_reason = "정책 위반 " * 200
+    try:
+        extract_image_response({"data": [], "text": long_reason})
+    except ValueError as error:
+        message = str(error)
+    assert "…" in message
+    assert len(message) < 600
+
+    # 사유가 없으면 기존 문구를 그대로 둔다.
+    try:
+        extract_image_response({"data": []})
+    except ValueError as error:
+        assert "모델 응답:" not in str(error)
+
+
+def test_image_response_carries_finish_reason_style_refusals() -> None:
+    """거부 사유가 문장이 아니라 종료 코드로만 오는 제공사도 있다."""
+
+    cases = (
+        ({"data": [], "choices": [{"finish_reason": "content_filter"}]}, "content_filter"),
+        (
+            {"data": [], "choices": [{"native_finish_reason": "PROHIBITED_CONTENT"}]},
+            "PROHIBITED_CONTENT",
+        ),
+        ({"data": [], "blockReason": "IMAGE_SAFETY"}, "IMAGE_SAFETY"),
+        ({"data": [], "prompt_feedback": {"block_reason": "SAFETY"}}, "SAFETY"),
+    )
+    for response, expected in cases:
+        try:
+            extract_image_response(response)
+        except ValueError as error:
+            message = str(error)
+        else:  # pragma: no cover - 위 호출은 반드시 실패한다.
+            raise AssertionError(f"이미지 없는 응답이 통과했습니다: {response}")
+        assert expected in message, message
+        assert "모델 응답:" in message, message
+
+
 def test_worker_routes_both_actions_through_openrouter_only() -> None:
     """작업자가 두 작업 모두 OpenRouter 엔드포인트로만 보내는지 확인한다."""
 

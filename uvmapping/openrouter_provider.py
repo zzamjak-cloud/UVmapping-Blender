@@ -385,6 +385,56 @@ def build_turnaround_payload(
     return payload
 
 
+MAX_TEXT_REASON_LENGTH = 300
+# 이미지가 없는 응답에서 거부 사유가 실려 오는 필드들. 제공사마다 이름이 다르다.
+_TEXT_REASON_KEYS = (
+    "text",
+    "content",
+    "message",
+    "output_text",
+    "reason",
+    "finish_reason",
+    "native_finish_reason",
+    "blockReason",
+    "block_reason",
+    "promptFeedback",
+    "prompt_feedback",
+)
+
+
+def _collect_text_fragments(value: Any, fragments: list[str]) -> None:
+    """응답에 섞여 있는 사람이 읽을 문장만 모은다."""
+
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            fragments.append(text)
+        return
+    if isinstance(value, Mapping):
+        for key in _TEXT_REASON_KEYS:
+            if key in value:
+                _collect_text_fragments(value[key], fragments)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_text_fragments(item, fragments)
+
+
+def _response_text_reason(response: Mapping[str, Any]) -> str:
+    """이미지 없는 응답에서 모델이 남긴 거부 사유를 한 줄로 만든다."""
+
+    fragments: list[str] = []
+    for key in (*_TEXT_REASON_KEYS, "choices"):
+        if key in response:
+            _collect_text_fragments(response[key], fragments)
+    if not fragments:
+        return ""
+    joined = " ".join(" ".join(fragment.split()) for fragment in fragments).strip()
+    if len(joined) <= MAX_TEXT_REASON_LENGTH:
+        return joined
+    return joined[: MAX_TEXT_REASON_LENGTH - 1] + "…"
+
+
 def extract_image_response(response: Mapping[str, Any]) -> tuple[str, bytes]:
     """``/images`` 응답에서 정확히 한 장의 이미지를 엄격히 디코딩한다."""
 
@@ -399,7 +449,11 @@ def extract_image_response(response: Mapping[str, Any]) -> tuple[str, bytes]:
 
     data = response.get("data")
     if not isinstance(data, list) or len(data) != 1:
-        raise ValueError("OpenRouter Images 응답에는 이미지가 정확히 한 장 있어야 합니다.")
+        # 안전 시스템이 막으면 이미지 없이 거부 사유만 글로 돌아온다. 그 문장이 없으면
+        # 사용자는 "이미지가 없다"는 사실만 보고 원인을 알 수 없다.
+        reason = _response_text_reason(response)
+        message = "OpenRouter Images 응답에는 이미지가 정확히 한 장 있어야 합니다."
+        raise ValueError(f"{message} 모델 응답: {reason}" if reason else message)
     image = data[0]
     if not isinstance(image, Mapping):
         raise ValueError("OpenRouter Images 이미지 항목은 JSON 객체여야 합니다.")
@@ -434,6 +488,7 @@ __all__ = (
     "IMAGE_MODEL_CAPABILITIES",
     "ImageModelCapability",
     "MAX_INPUT_REFERENCES",
+    "MAX_TEXT_REASON_LENGTH",
     "RESOLUTION_OPTIONS",
     "build_analysis_payload",
     "build_request_headers",

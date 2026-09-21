@@ -23,8 +23,8 @@ from bpy.types import Operator, OperatorFileListElement
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Vector
 
-from . import clipboard_image, native_input, texture_bake
-from .properties import get_addon_preferences
+from . import clipboard_image, native_input, texture_bake, texture_errors
+from .properties import DEFAULT_DOMINANT_VIEW_BLEND, get_addon_preferences
 from .quality import evaluate_atlas_quality
 from .openrouter_provider import (
     effective_image_size,
@@ -920,6 +920,69 @@ def _tag_texture_panels_redraw() -> None:
             area.tag_redraw()
 
 
+def _show_failure_popup(info) -> None:
+    """실패 직후 원인 팝업을 띄운다.
+
+    백그라운드 실행에서 popup_menu를 부르면 Blender가 그대로 죽는다. 타이머 콜백은
+    창이 없는 context로 들어오는 일이 잦아 그대로 두면 비동기 실패의 팝업이 사라지므로,
+    열려 있는 첫 창을 빌려 띄운다. 팝업이 안 떠도 상태 줄과 패널 버튼은 남으므로 어떤
+    예외도 삼킨다.
+    """
+
+    if bpy.app.background:
+        return
+    try:
+        window_manager = getattr(bpy.context, "window_manager", None)
+        windows = tuple(getattr(window_manager, "windows", ()) or ())
+        if window_manager is None or not windows:
+            return
+
+        def draw(self, _context):
+            for line in texture_errors.popup_lines(info):
+                self.layout.label(text=line)
+            row = self.layout.row(align=True)
+            row.operator("uvmapping.show_texture_failure", text="자세히", icon="INFO")
+            row.operator("uvmapping.copy_texture_failure", text="원문 복사", icon="COPYDOWN")
+
+        if getattr(bpy.context, "window", None) is not None:
+            window_manager.popup_menu(draw, title=info.title, icon="ERROR")
+            return
+        with bpy.context.temp_override(window=windows[0]):
+            bpy.context.window_manager.popup_menu(draw, title=info.title, icon="ERROR")
+    except Exception:  # noqa: BLE001 - 팝업 실패가 실패 기록을 덮으면 안 된다.
+        return
+
+
+def _record_failure(
+    settings,
+    status: str,
+    detail: str = "",
+    fallback: str = texture_errors.UNKNOWN,
+    notify: bool = True,
+) -> None:
+    """모든 실패 지점이 거치는 공통 기록부.
+
+    상태 줄 문구는 기존 형식 그대로 두고, 분류에 쓸 원문은 따로 보관해 팝업과 패널이
+    잘리지 않은 원인을 보여 줄 수 있게 한다. ``notify``가 거짓이면 팝업을 띄우지 않는다.
+    연산자가 ERROR를 직접 보고하는 동기 실패에서 같은 내용을 두 번 알리지 않기 위해서다.
+    """
+
+    settings.texture_status = status
+    raw = detail or status
+    info = texture_errors.classify_failure(raw, fallback)
+    settings.texture_last_error = raw
+    settings.texture_last_error_kind = info.kind
+    if notify:
+        _show_failure_popup(info)
+
+
+def _clear_failure(settings) -> None:
+    """작업을 새로 시작하거나 성공으로 끝나면 지난 실패 표시를 지운다."""
+
+    settings.texture_last_error = ""
+    settings.texture_last_error_kind = ""
+
+
 class _TextureRun:
     """작업자 프로세스를 Operator RNA 수명과 무관하게 감시하는 실행 단위."""
 
@@ -965,7 +1028,7 @@ class _TextureRun:
             if prefix:
                 message = f"{prefix}{message}"
             if scene is not None:
-                scene.uvmapping_settings.texture_status = message
+                _record_failure(scene.uvmapping_settings, message)
             _tag_texture_panels_redraw()
             return None
         if scene is None:
@@ -979,7 +1042,12 @@ class _TextureRun:
                 message = f"원본 AI 결과는 저장됐지만 후처리에 실패했습니다: {exc}"
             else:
                 message = f"AI 결과 적용 실패: {exc}"
-            scene.uvmapping_settings.texture_status = message
+            _record_failure(
+                scene.uvmapping_settings,
+                message,
+                detail=str(exc),
+                fallback=texture_errors.LOCAL,
+            )
         _tag_texture_panels_redraw()
         return None
 
@@ -1038,6 +1106,7 @@ def _start_worker(scene, job: dict, api_key: str, status: str, payload: dict, fi
 
     if _ACTIVE_RUNS:
         raise RuntimeError("이미 AI 작업이 진행 중입니다.")
+    _clear_failure(scene.uvmapping_settings)
     job_dir = Path(tempfile.gettempdir()) / "uvmapping_ai" / uuid.uuid4().hex
     job_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
     _ACTIVE_JOB_DIRS.add(job_dir)
@@ -1104,7 +1173,9 @@ def _start_worker(scene, job: dict, api_key: str, status: str, payload: dict, fi
         except OSError:
             pass
         message = f"AI 작업자 프로세스를 시작하지 못했습니다: {exc}"
-        scene.uvmapping_settings.texture_status = message
+        _record_failure(
+            scene.uvmapping_settings, message, detail=str(exc), fallback=texture_errors.LOCAL
+        )
         raise RuntimeError(message) from exc
     _ACTIVE_PROCESSES.add(process)
     run = _TextureRun(
@@ -1628,7 +1699,12 @@ def _finish_analysis(scene, value: dict, payload: dict) -> None:
         with _bake_context(scene) as context:
             _start_turnaround_generation(context, objects=objects)
     except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-        settings.texture_status = f"참조 분석은 끝났지만 생성을 시작하지 못했습니다: {exc}"
+        _record_failure(
+            settings,
+            f"참조 분석은 끝났지만 생성을 시작하지 못했습니다: {exc}",
+            detail=str(exc),
+            fallback=texture_errors.LOCAL,
+        )
 
 
 def _finish_turnaround(scene, value: dict, payload: dict) -> None:
@@ -1707,7 +1783,12 @@ def _finalize_turnaround(
             _launch_regeneration(scene, payload, failed_views, attempt + 1, max_attempts)
             return
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            settings.texture_status = f"재생성을 시작하지 못해 현재 결과로 진행합니다: {exc}"
+            _record_failure(
+                settings,
+                f"재생성을 시작하지 못해 현재 결과로 진행합니다: {exc}",
+                detail=str(exc),
+                fallback=texture_errors.LOCAL,
+            )
     warning = ""
     if failed_views:
         warning = (
@@ -1728,7 +1809,12 @@ def _finalize_turnaround(
         with _bake_context(scene) as context:
             apply_diffuse(context, tuple(targets))
     except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-        settings.texture_status = f"{label}는 생성됐지만 자동 적용 실패: {exc}"
+        _record_failure(
+            settings,
+            f"{label}는 생성됐지만 자동 적용 실패: {exc}",
+            detail=str(exc),
+            fallback=texture_errors.LOCAL,
+        )
         return
     if warning:
         settings.texture_status = f"{settings.texture_status} · {warning}"
@@ -1881,19 +1967,21 @@ def _report_round_failure(
     payload["pending_rounds"] = []
     if not _group_views_ready(composition, payload):
         _store_state(payload, _group_state(payload, composition, FAILED_GROUPS_STATUS, **extra))
-        settings.texture_status = f"{label} 그룹 생성 실패: {detail}"
+        _record_failure(settings, f"{label} 그룹 생성 실패: {detail}", detail=detail)
         return
     state = _group_state(payload, composition, "TURNAROUND_READY", **extra)
     targets = _store_state(payload, state)
     if _ACTIVE_RUNS:
         # 다음 작업이 이미 떠 있으면 그 콜백이 마무리를 맡는다.
-        settings.texture_status = f"{label} 일부 그룹 실패: {detail}"
+        _record_failure(settings, f"{label} 일부 그룹 실패: {detail}", detail=detail)
         return
     _discard_stale_group_artifacts(payload, state)
     crop_paths = {view: Path(path) for view, path in payload.get("view_paths", {}).items()}
     _finalize_turnaround(
         scene, payload, state, targets, crop_paths, label, attempt, allow_regeneration=False
     )
+    # 구성의 모든 시점이 확보된 부분 성공이라 팝업까지 띄우지 않는다. 실패한 그룹은
+    # 상태 줄과 객체 상태에 남고, 앞선 단계가 이미 원인을 기록했을 수 있다.
     settings.texture_status = f"{settings.texture_status} · 그룹 재생성 실패: {detail}"
 
 
@@ -2139,6 +2227,8 @@ def _bake_settings_from(settings, composition: TurnaroundComposition) -> dict:
     return {
         "layout": composition.name,
         "blend_exponent": float(settings.blend_exponent),
+        "dominant_view_blend": bool(settings.dominant_view_blend),
+        "transition_band_degrees": float(settings.transition_band_degrees),
         "harmonize_view_colors": bool(settings.harmonize_view_colors),
         "silhouette_warp": bool(settings.silhouette_warp),
     }
@@ -2147,6 +2237,14 @@ def _bake_settings_from(settings, composition: TurnaroundComposition) -> dict:
 def _bake_kwargs_from(bake_settings: dict) -> dict:
     return {
         "blend_exponent": float(bake_settings.get("blend_exponent", texture_bake.DEFAULT_BLEND_EXPONENT)),
+        "dominant_view_blend": bool(
+            bake_settings.get("dominant_view_blend", DEFAULT_DOMINANT_VIEW_BLEND)
+        ),
+        "transition_band_degrees": float(
+            bake_settings.get(
+                "transition_band_degrees", texture_bake.DEFAULT_TRANSITION_BAND_DEGREES
+            )
+        ),
         "harmonize_colors": bool(bake_settings.get("harmonize_view_colors", True)),
         "silhouette_warp": bool(bake_settings.get("silhouette_warp", False)),
     }
@@ -2387,7 +2485,12 @@ def _finish_sequential_step(scene, value: dict, payload: dict) -> None:
             payload,
             _sequential_state(payload, "SEQUENTIAL_FAILED", failed_step=step, error=str(exc)),
         )
-        settings.texture_status = f"순차 생성 {step + 1}/{len(views)}({view}) 결과를 읽지 못했습니다: {exc}"
+        _record_failure(
+            settings,
+            f"순차 생성 {step + 1}/{len(views)}({view}) 결과를 읽지 못했습니다: {exc}",
+            detail=str(exc),
+            fallback=texture_errors.LOCAL,
+        )
         return
     payload["completed_views"][view] = str(result_path)
     payload["completed_sha256"][view] = digest
@@ -2403,8 +2506,11 @@ def _finish_sequential_step(scene, value: dict, payload: dict) -> None:
                 payload,
                 _sequential_state(payload, "SEQUENTIAL_FAILED", failed_step=next_step, error=str(exc)),
             )
-            settings.texture_status = (
-                f"순차 생성 {next_step + 1}/{len(views)}({views[next_step]}) 단계에서 실패: {exc}"
+            _record_failure(
+                settings,
+                f"순차 생성 {next_step + 1}/{len(views)}({views[next_step]}) 단계에서 실패: {exc}",
+                detail=str(exc),
+                fallback=texture_errors.LOCAL,
             )
         return
 
@@ -2431,7 +2537,12 @@ def _finish_sequential_step(scene, value: dict, payload: dict) -> None:
         with _bake_context(scene) as context:
             apply_diffuse(context, targets, bake_settings=payload.get("bake_settings"))
     except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-        settings.texture_status = f"{label}는 생성됐지만 자동 적용 실패: {exc}"
+        _record_failure(
+            settings,
+            f"{label}는 생성됐지만 자동 적용 실패: {exc}",
+            detail=str(exc),
+            fallback=texture_errors.LOCAL,
+        )
 
 
 @contextmanager
@@ -2566,6 +2677,7 @@ def apply_diffuse(context, objects=None, *, bake_settings: dict | None = None) -
         lowest = min(item["score"] for item in updated["verification"]["views"].values())
         status = f"{status} · 검증 최저 점수 {lowest:.2f}"
     settings.texture_status = status
+    _clear_failure(settings)
     return status, warning
 
 
@@ -2699,7 +2811,9 @@ class UVMAPPING_OT_bake_diffuse(Operator):
             status, warning = apply_diffuse(context)
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
             message = f"Diffuse/Albedo 적용 실패: {exc}"
-            settings.texture_status = message
+            _record_failure(
+                settings, message, detail=str(exc), fallback=texture_errors.LOCAL, notify=False
+            )
             self.report({"ERROR"}, message)
             return {"CANCELLED"}
         self.report({"WARNING"} if warning else {"INFO"}, status)
@@ -2725,6 +2839,7 @@ class UVMAPPING_OT_reset_texture_state(Operator):
             if TEXTURE_DESIGN_STATE_PROPERTY in obj.keys():
                 del obj[TEXTURE_DESIGN_STATE_PROPERTY]
                 cleared += 1
+        _clear_failure(context.scene.uvmapping_settings)
         context.scene.uvmapping_settings.texture_status = f"{cleared}개 객체의 생성 상태를 초기화했습니다"
         _tag_texture_panels_redraw()
         return {"FINISHED"}
@@ -2801,6 +2916,60 @@ class UVMAPPING_OT_clear_target_objects(Operator):
         return {"FINISHED"}
 
 
+class UVMAPPING_OT_show_texture_failure(Operator):
+    """마지막 생성 실패의 원인과 해결 방법을 한국어로 보여 준다."""
+
+    bl_idname = "uvmapping.show_texture_failure"
+    bl_label = "실패 원인 보기"
+    bl_options = {"REGISTER", "INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = getattr(context, "scene", None)
+        return bool(scene and scene.uvmapping_settings.texture_last_error)
+
+    def _info(self, context):
+        settings = context.scene.uvmapping_settings
+        return texture_errors.describe(
+            settings.texture_last_error_kind, raw=settings.texture_last_error
+        )
+
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_props_dialog(self, width=520)
+
+    def draw(self, context):
+        info = self._info(context)
+        column = self.layout.column(align=True)
+        column.label(text=info.title, icon="ERROR")
+        for line in texture_errors.popup_lines(info):
+            column.label(text=line)
+        self.layout.operator(
+            "uvmapping.copy_texture_failure", text="원문 복사", icon="COPYDOWN"
+        )
+
+    def execute(self, _context):
+        return {"FINISHED"}
+
+
+class UVMAPPING_OT_copy_texture_failure(Operator):
+    """실패 원문 전체를 클립보드로 복사해 검색·문의에 붙일 수 있게 한다."""
+
+    bl_idname = "uvmapping.copy_texture_failure"
+    bl_label = "원문 복사"
+    bl_options = {"REGISTER", "INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = getattr(context, "scene", None)
+        return bool(scene and scene.uvmapping_settings.texture_last_error)
+
+    def execute(self, context):
+        settings = context.scene.uvmapping_settings
+        context.window_manager.clipboard = settings.texture_last_error
+        self.report({"INFO"}, "실패 원문을 클립보드에 복사했습니다.")
+        return {"FINISHED"}
+
+
 classes = (
     UVMAPPING_OT_add_target_objects,
     UVMAPPING_OT_remove_target_object,
@@ -2813,6 +2982,8 @@ classes = (
     UVMAPPING_OT_generate_turnaround,
     UVMAPPING_OT_bake_diffuse,
     UVMAPPING_OT_reset_texture_state,
+    UVMAPPING_OT_show_texture_failure,
+    UVMAPPING_OT_copy_texture_failure,
 )
 
 

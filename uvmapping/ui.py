@@ -8,6 +8,7 @@ from bpy.types import Panel, UIList
 
 from .openrouter_provider import clamp_quality, supports_resolution
 from .properties import get_addon_preferences, quality_values_from
+from . import texture_errors
 from .texture_operators import (
     can_bake_diffuse,
     can_generate_turnaround,
@@ -288,6 +289,17 @@ class UVMAPPING_PT_ai_texture(Panel):
 
         status = layout.box()
         status.label(text=settings.texture_status, icon="INFO")
+        if settings.texture_last_error:
+            # 상태 줄 한 줄에는 원인이 잘려 들어가므로 분류 제목과 팝업 통로를 함께 둔다.
+            failure = status.column(align=True)
+            failure.alert = True
+            failure.label(
+                text=texture_errors.describe(settings.texture_last_error_kind).title,
+                icon="ERROR",
+            )
+            failure.operator(
+                "uvmapping.show_texture_failure", text="실패 원인 보기", icon="QUESTION"
+            )
         if settings.texture_output_path:
             status.prop(settings, "texture_output_path", text="다면도")
         if settings.texture_diffuse_path:
@@ -371,6 +383,11 @@ class UVMAPPING_PT_ai_texture(Panel):
             return
         expert = advanced.box()
         expert.prop(settings, "blend_exponent")
+        expert.prop(settings, "dominant_view_blend")
+        band = expert.row()
+        # 지배 시점을 쓰지 않으면 전이 띠 폭은 합성에 영향을 주지 않는다.
+        band.enabled = settings.dominant_view_blend
+        band.prop(settings, "transition_band_degrees")
         expert.prop(settings, "harmonize_view_colors")
         expert.prop(settings, "silhouette_warp")
         expert.prop(settings, "texture_analysis_model")

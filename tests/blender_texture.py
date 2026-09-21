@@ -206,6 +206,8 @@ def _check_panel_draw(ui_module, settings) -> None:
         expert = _draw_panel(ui_module)
         for name in (
             "blend_exponent",
+            "dominant_view_blend",
+            "transition_band_degrees",
             "harmonize_view_colors",
             "silhouette_warp",
             "texture_analysis_model",
@@ -446,12 +448,204 @@ def _check_generation_chain(
     print("[texture] 분석→생성 체인 통과")
 
 
+# 실측: OpenAI gpt-image 계열이 캐릭터 IP 프롬프트에 돌려준 400 응답.
+_POLICY_REJECTION = (
+    "OpenRouter API 오류(400): Your request was rejected as a result of our safety "
+    "system. If you believe this is an error, contact us at help.openai.com and "
+    "include the request ID req_7c1de9f0aa2b4c31."
+)
+
+
+def _draw_operator(operator_class, record) -> None:
+    """등록된 연산자의 draw를 순수 파이썬 숙주에 붙여 예외 없이 실행한다."""
+
+    members = {
+        name: value
+        for name, value in vars(operator_class).items()
+        if name not in ("__dict__", "__weakref__")
+    }
+    probe = type("UVMappingOperatorProbe", (object,), members)()
+    probe.layout = _FakeLayout(record)
+    probe.draw(bpy.context)
+
+
+def _check_failure_popup(
+    texture_module,
+    bake_module,
+    ui_module,
+    settings,
+    cube,
+    analysis_calls,
+    analysis_fails,
+    analysis_error,
+) -> None:
+    """정책 거부 응답이 분류·저장되고 패널 버튼과 팝업 연산자가 동작하는지."""
+
+    failure_dir = Path(tempfile.mkdtemp(prefix="uvmapping-failure-"))
+    leftovers: list[Path] = []
+    try:
+        reference_path = failure_dir / "failure_reference.png"
+        reference_path.write_bytes(
+            bake_module.encode_srgb_png(bytes((120, 160, 200, 255)) * (4 * 4), 4, 4)
+        )
+        settings.reference_images.clear()
+        reference = settings.reference_images.add()
+        reference.path = str(reference_path)
+        settings.texture_analysis_json = ""
+        settings.texture_analysis_reference_hash = ""
+        settings.auto_apply_diffuse = False
+        settings.auto_regenerate_attempts = 0
+        settings.send_reference_images = False
+        settings.target_objects.clear()
+        entry = settings.target_objects.add()
+        entry.object = cube
+        analysis_calls.clear()
+
+        analysis_fails[0] = True
+        analysis_error[0] = _POLICY_REJECTION
+        assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert not texture_module._ACTIVE_RUNS
+        # 기존 상태 줄 형식은 그대로 두고, 원문과 분류를 따로 남긴다.
+        assert settings.texture_status.startswith("참조 분석 실패: "), settings.texture_status
+        assert "safety system" in settings.texture_last_error, settings.texture_last_error
+        assert settings.texture_last_error_kind == "CONTENT_POLICY", settings.texture_last_error_kind
+
+        errors = texture_module.texture_errors
+        info = errors.describe(settings.texture_last_error_kind, raw=settings.texture_last_error)
+        assert info.request_id == "req_7c1de9f0aa2b4c31", info.request_id
+        lines = errors.popup_lines(info)
+        assert any("유명 캐릭터" in line for line in lines), lines
+        assert any("req_7c1de9f0aa2b4c31" in line for line in lines), lines
+
+        # 창이 없는 백그라운드에서도 팝업 시도가 예외를 내면 안 된다.
+        texture_module._show_failure_popup(info)
+
+        panel = _draw_panel(ui_module)
+        assert "uvmapping.show_texture_failure" in panel["operators"], panel["operators"]
+        assert info.title in panel["labels"], panel["labels"]
+
+        dialog = {"labels": [], "props": [], "operators": [], "lists": []}
+        _draw_operator(texture_module.UVMAPPING_OT_show_texture_failure, dialog)
+        assert "해결 방법:" in dialog["labels"], dialog["labels"]
+        assert "uvmapping.copy_texture_failure" in dialog["operators"], dialog["operators"]
+
+        assert bpy.ops.uvmapping.show_texture_failure() == {"FINISHED"}
+        assert bpy.ops.uvmapping.copy_texture_failure() == {"FINISHED"}
+        clipboard = bpy.context.window_manager.clipboard
+        if clipboard:
+            assert clipboard == settings.texture_last_error, clipboard
+
+        # 다음 생성이 시작되면 실패 표시는 지워진다.
+        analysis_fails[0] = False
+        analysis_error[0] = "스텁 분석 강제 실패"
+        assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+        assert settings.texture_last_error == "", settings.texture_last_error
+        assert settings.texture_last_error_kind == "", settings.texture_last_error_kind
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert len(texture_module._ACTIVE_RUNS) == 1, settings.texture_status
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert not texture_module._ACTIVE_RUNS
+        state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        leftovers.append(Path(state["turnaround_path"]))
+        leftovers.append(Path(state["geometry_contact_sheet"]))
+        leftovers.extend(Path(path) for path in state["views"].values())
+        assert not settings.texture_last_error, settings.texture_last_error
+        assert not _draw_panel(ui_module)["labels"].count(info.title)
+    finally:
+        for path in leftovers:
+            path.unlink(missing_ok=True)
+        settings.reference_images.clear()
+        settings.target_objects.clear()
+        settings.texture_analysis_json = ""
+        settings.texture_analysis_reference_hash = ""
+        settings.auto_regenerate_attempts = 1
+        settings.texture_last_error = ""
+        settings.texture_last_error_kind = ""
+        cube.pop(texture_module.TEXTURE_DESIGN_STATE_PROPERTY, None)
+        shutil.rmtree(failure_dir, ignore_errors=True)
+    print("[texture] 실패 원인 분류·팝업 통과")
+
+
+def _check_blend_options(
+    texture_module,
+    bake_module,
+    settings,
+    cube,
+    bake_calls,
+) -> None:
+    """전문가 설정의 지배 시점·전이 띠 값이 상태와 베이크 호출에 그대로 실리는지."""
+
+    blend_dir = Path(tempfile.mkdtemp(prefix="uvmapping-blend-"))
+    leftovers: list[Path] = []
+    try:
+        reference_path = blend_dir / "blend_reference.png"
+        reference_path.write_bytes(
+            bake_module.encode_srgb_png(bytes((150, 120, 90, 255)) * (4 * 4), 4, 4)
+        )
+        settings.reference_images.clear()
+        reference = settings.reference_images.add()
+        reference.path = str(reference_path)
+        settings.texture_analysis_json = ""
+        settings.texture_analysis_reference_hash = ""
+        settings.auto_apply_diffuse = False
+        settings.auto_regenerate_attempts = 0
+        settings.send_reference_images = False
+        settings.target_objects.clear()
+        entry = settings.target_objects.add()
+        entry.object = cube
+        # 기본값과 다른 값을 넣어야 전달 경로가 실제로 검사된다.
+        settings.dominant_view_blend = False
+        settings.transition_band_degrees = 20.0
+        bake_calls.clear()
+
+        assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert len(texture_module._ACTIVE_RUNS) == 1, settings.texture_status
+        assert texture_module._ACTIVE_RUNS[0].poll_process() is None
+        assert not texture_module._ACTIVE_RUNS
+        assert bpy.ops.uvmapping.bake_diffuse() == {"FINISHED"}, settings.texture_status
+
+        assert len(bake_calls) == 1, bake_calls
+        assert bake_calls[0]["dominant_view_blend"] is False, bake_calls[0]
+        assert bake_calls[0]["transition_band_degrees"] == 20.0, bake_calls[0]
+        state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert state["bake_settings"]["dominant_view_blend"] is False, state["bake_settings"]
+        assert state["bake_settings"]["transition_band_degrees"] == 20.0, state["bake_settings"]
+        leftovers.append(Path(state["turnaround_path"]))
+        leftovers.append(Path(state["geometry_contact_sheet"]))
+        leftovers.append(Path(state["albedo_path"]))
+        leftovers.extend(Path(path) for path in state["views"].values())
+    finally:
+        for path in leftovers:
+            path.unlink(missing_ok=True)
+        settings.reference_images.clear()
+        settings.target_objects.clear()
+        settings.texture_analysis_json = ""
+        settings.texture_analysis_reference_hash = ""
+        settings.auto_regenerate_attempts = 1
+        settings.dominant_view_blend = True
+        settings.transition_band_degrees = (
+            texture_module.texture_bake.DEFAULT_TRANSITION_BAND_DEGREES
+        )
+        cube.pop(texture_module.TEXTURE_DESIGN_STATE_PROPERTY, None)
+        shutil.rmtree(blend_dir, ignore_errors=True)
+    print("[texture] 전문가 블렌딩 설정 전달 통과")
+
+
 def _check_full_pipeline(texture_module, bake_module, ui_module) -> None:
     """작업자를 스텁으로 바꿔 생성 -> 결과 회수 -> 베이크 -> 저장 전 구간을 검증한다."""
 
     original_popen = texture_module.subprocess.Popen
+    original_bake = texture_module.texture_bake.bake_diffuse
     original_key = os.environ.get("OPENROUTER_API_KEY")
     online = bpy.context.preferences.system.use_online_access
+    # 패널 블렌딩 설정이 실제 베이크 호출까지 도달하는지 보기 위해 인자를 기록한다.
+    bake_calls: list = []
+
+    def recording_bake(*arguments, **keywords):
+        bake_calls.append(dict(keywords))
+        return original_bake(*arguments, **keywords)
 
     cell_colors = (
         (200, 60, 60),
@@ -468,6 +662,8 @@ def _check_full_pipeline(texture_module, bake_module, ui_module) -> None:
     analysis_calls: list[dict] = []
     # True면 다음 분석 요청이 실패로 돌아온다(분석 실패와 생성 실패 구분 검사용).
     analysis_fails = [False]
+    # 실패로 돌려줄 원문. 실측 정책 거부 문구를 그대로 끼워 넣기 위해 분리한다.
+    analysis_error = ["스텁 분석 강제 실패"]
     # 이름이 여기 들어간 그룹은 작업자가 실패로 보고한다(부분 실패 경로 검사용).
     fail_groups: set = set()
     # True면 다음 격자 결과의 모든 셀 한가운데에 순백 세로 틈을 그려 가이드(틈 없는
@@ -548,7 +744,7 @@ def _check_full_pipeline(texture_module, bake_module, ui_module) -> None:
             if request.get("action") == "analyze":
                 analysis_calls.append(request)
                 response = (
-                    {"ok": False, "error": "스텁 분석 강제 실패"}
+                    {"ok": False, "error": analysis_error[0]}
                     if analysis_fails[0]
                     else {"ok": True, "text": '{"object_summary": "스텁 참조 분석"}'}
                 )
@@ -610,6 +806,7 @@ def _check_full_pipeline(texture_module, bake_module, ui_module) -> None:
             return 0
 
     texture_module.subprocess.Popen = _StubWorker
+    texture_module.texture_bake.bake_diffuse = recording_bake
     os.environ["OPENROUTER_API_KEY"] = "stub-key"
     bpy.context.preferences.system.use_online_access = True
     try:
@@ -706,6 +903,12 @@ def _check_full_pipeline(texture_module, bake_module, ui_module) -> None:
 
         applied_state = json.loads(cube[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
         assert applied_state["bake_settings"]["layout"] == "SIX"
+        default_band = texture_module.texture_bake.DEFAULT_TRANSITION_BAND_DEGREES
+        assert applied_state["bake_settings"]["dominant_view_blend"] is True
+        assert applied_state["bake_settings"]["transition_band_degrees"] == default_band
+        assert bake_calls, "베이크 호출이 기록되지 않았습니다."
+        assert bake_calls[-1]["dominant_view_blend"] is True, bake_calls[-1]
+        assert bake_calls[-1]["transition_band_degrees"] == default_band, bake_calls[-1]
         assert set(applied_state["bake_stats"]["view_names"]) == {
             "FRONT", "RIGHT", "BACK", "LEFT", "TOP", "BOTTOM"
         }, applied_state["bake_stats"].get("view_names")
@@ -1029,8 +1232,20 @@ def _check_full_pipeline(texture_module, bake_module, ui_module) -> None:
             analysis_calls,
             analysis_fails,
         )
+        _check_failure_popup(
+            texture_module,
+            bake_module,
+            ui_module,
+            settings,
+            cube,
+            analysis_calls,
+            analysis_fails,
+            analysis_error,
+        )
+        _check_blend_options(texture_module, bake_module, settings, cube, bake_calls)
     finally:
         texture_module.subprocess.Popen = original_popen
+        texture_module.texture_bake.bake_diffuse = original_bake
         bpy.context.preferences.system.use_online_access = online
         if original_key is None:
             os.environ.pop("OPENROUTER_API_KEY", None)
@@ -1065,6 +1280,8 @@ def main() -> None:
         "turnaround_layout",
         "turnaround_image_size",
         "blend_exponent",
+        "dominant_view_blend",
+        "transition_band_degrees",
         "harmonize_view_colors",
         "silhouette_warp",
         "generation_mode",
