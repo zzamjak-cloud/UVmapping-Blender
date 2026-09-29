@@ -24,6 +24,7 @@ REQUIRED_FILES = (
     "scripts/dev_run.ps1",
     "scripts/dev_run.bat",
     "scripts/dev_bootstrap.py",
+    "uvmapping/api_key_store.py",
     "uvmapping/clipboard_image.py",
     "uvmapping/contracts.py",
     "uvmapping/quality.py",
@@ -38,6 +39,7 @@ REQUIRED_FILES = (
     "uvmapping/texture_worker.py",
     "tests/blender_texture.py",
     "tests/blender_texture_live.py",
+    "tests/test_api_key_store_pure.py",
     "tests/test_quality_pure.py",
     "tests/test_clipboard_image_pure.py",
     "tests/test_extension_repository_pure.py",
@@ -88,11 +90,9 @@ def _check_manifest() -> str:
 
 
 def _check_operator_source() -> None:
-    source_files = [
-        path
-        for path in ROOT.rglob("*.py")
-        if "tests" not in path.parts and "scripts" not in path.parts and ".serena" not in path.parts
-    ]
+    # 애드온 소스만 모은다. 저장소 전체를 훑으면 개발용 포터블 Blender(.blender)와
+    # 그 안의 개발 Extension Junction을 따라 무한히 내려간다.
+    source_files = [ROOT / "__init__.py", *sorted((ROOT / "uvmapping").rglob("*.py"))]
     combined_source = "\n".join(path.read_text(encoding="utf-8") for path in source_files)
     _require(
         "uvmapping.generate_turnaround" in combined_source,

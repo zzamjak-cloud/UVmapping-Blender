@@ -44,7 +44,7 @@ Blender의 Extension 저장소를 새로 고치면 사용 가능한 업데이트
 패널은 대상 → 참조·지시 → 품질/모델 → `텍스처 생성` 버튼 순의 기본 화면 하나로 시작합니다. 세부 옵션은 `고급 설정` 접힘 안에, 그중 전문가용 값은 다시 `전문가 설정` 하위 접힘 안에 있습니다. 온라인 접근 차단, OpenRouter API 키 미입력, UV 맵 누락은 문제가 있을 때만 경고 상자로 표시됩니다.
 
 1. 텍스처를 만들 Mesh 객체를 선택하고 `3D Viewport > Sidebar(N) > UV Mapping`에서 `AI 손맵 텍스처` 패널을 엽니다.
-2. `Edit > Preferences > Add-ons > UV Mapping Blender`에서 [openrouter.ai/keys](https://openrouter.ai/keys)에서 발급한 **OpenRouter API 키 하나**를 입력합니다. 분석과 이미지 생성 모두 이 키 하나로 처리됩니다. 키는 프로젝트나 `.blend`가 아닌 Blender 개인 환경설정에 저장되고 입력창에서는 가려지지만, OS Keychain 암호화 저장소는 아닙니다. 공유 PC에서는 환경 변수 `OPENROUTER_API_KEY` 사용을 권장합니다.
+2. `Edit > Preferences > Add-ons > UV Mapping Blender`에서 [openrouter.ai/keys](https://openrouter.ai/keys)에서 발급한 **OpenRouter API 키 하나**를 입력합니다. 분석과 이미지 생성 모두 이 키 하나로 처리됩니다. 키는 프로젝트나 `.blend`가 아닌 Blender 개인 환경설정에 저장되고 입력창에서는 가려지지만, OS Keychain 암호화 저장소는 아닙니다. 공유 PC에서는 환경 변수 `OPENROUTER_API_KEY` 사용을 권장합니다. 업데이트나 재설치 중 Blender가 애드온 환경설정을 지워도 키가 사라지지 않도록, 입력한 키를 Blender 사용자 설정 폴더의 `config/uvmapping_blender/openrouter_api_key`에도 백업해 두고 키 칸이 비어 있으면 자동으로 복구합니다. 이 백업은 애드온을 제거해도 남으므로, 완전히 지우려면 키 칸을 비우세요.
 3. `대상 객체`에서 `선택 객체 등록`을 누르면 그 객체들만 대상이 됩니다. 등록이 없으면 "선택한 Mesh N개를 대상으로 합니다" 한 줄과 함께 현재 선택을 그대로 씁니다. Edit·Paint 모드에서 실행하면 Object Mode로 자동 전환합니다.
 4. `스타일 참조와 지시`에서 Pinterest 등에서 저장한 JPG, PNG, WebP 참조 이미지를 최대 5장 추가합니다(macOS·Windows는 브라우저 `이미지 복사` 후 `클립보드` 버튼으로 붙여넣기 가능). 참조 이미지는 기본적으로 **분석 단계에서만** 쓰여 3면도 생성 호출에는 모델 형상 contact sheet만 보내므로, 이미지 모델이 참조 캐릭터 형상을 그대로 복제하지 않습니다. 참조에 없는 요구는 그 아래 지시 칸에 한 문장으로 적고, 한글 조합이 불안정하면 `한글 프롬프트 입력` 버튼으로 OS 입력창을 씁니다. 참조와 지시 중 하나만 있어도 생성할 수 있습니다.
 5. `품질과 모델`에서 `품질` 프리셋 하나를 고릅니다.

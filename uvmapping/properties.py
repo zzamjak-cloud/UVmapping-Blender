@@ -12,6 +12,7 @@ from bpy.props import (
 )
 from bpy.types import AddonPreferences, PropertyGroup
 
+from . import api_key_store
 from .texture_bake import (
     DEFAULT_TRANSITION_BAND_DEGREES,
     MAX_TRANSITION_BAND_DEGREES,
@@ -56,6 +57,52 @@ def get_addon_preferences(context):
     return getattr(addon, "preferences", None) if addon is not None else None
 
 
+def api_key_backup_path():
+    """Extension 재설치와 무관하게 유지되는 Blender 사용자 설정 폴더의 키 백업 경로."""
+
+    from pathlib import Path
+
+    config_directory = bpy.utils.user_resource("CONFIG")
+    return (
+        Path(config_directory)
+        / api_key_store.BACKUP_DIRECTORY_NAME
+        / api_key_store.BACKUP_FILE_NAME
+    )
+
+
+def _backup_api_key(preferences, _context) -> None:
+    """키를 입력·수정·삭제할 때마다 백업 파일을 같은 값으로 맞춘다."""
+
+    try:
+        api_key_store.write_key(api_key_backup_path(), preferences.openrouter_api_key)
+    except OSError as error:
+        print(f"[UV Mapping] OpenRouter API 키 백업 실패: {error}")
+
+
+def restore_api_key(context=None) -> bool:
+    """환경설정 키가 비어 있으면 백업 파일에서 되살리고, 되살렸으면 True를 반환한다."""
+
+    context = context or bpy.context
+    preferences = get_addon_preferences(context)
+    if preferences is None:
+        return False
+    if preferences.openrouter_api_key.strip():
+        # 백업 기능 이전에 입력한 키도 다음 유실에 대비해 백업해 둔다.
+        _backup_api_key(preferences, context)
+        return False
+    restored = api_key_store.key_to_restore(
+        preferences.openrouter_api_key,
+        api_key_store.read_key(api_key_backup_path()),
+    )
+    if not restored:
+        return False
+    preferences.openrouter_api_key = restored
+    # 자동 저장이 켜져 있으면 종료 시 되살린 키가 사용자 환경설정에도 다시 기록된다.
+    context.preferences.is_dirty = True
+    print("[UV Mapping] 백업에서 OpenRouter API 키를 복구했습니다.")
+    return True
+
+
 class UVMAPPING_AP_preferences(AddonPreferences):
     """Blender 사용자 환경설정에만 저장되는 OpenRouter 자격 증명."""
 
@@ -66,6 +113,7 @@ class UVMAPPING_AP_preferences(AddonPreferences):
         description="참조 분석과 3면도 생성을 모두 OpenRouter 한 곳으로 호출할 개인 API 키입니다",
         default="",
         subtype="PASSWORD",
+        update=_backup_api_key,
     )
 
     def draw(self, _context):
@@ -82,6 +130,9 @@ class UVMAPPING_AP_preferences(AddonPreferences):
         save_box.label(text="저장 후 새 Blender 프로세스에서도 키가 유지됩니다.")
         warning = layout.box()
         warning.label(text="API 키는 이 컴퓨터의 Blender 사용자 환경설정에 저장됩니다.", icon="INFO")
+        warning.label(text="업데이트·재설치로 지워져도 설정 폴더의 백업에서 자동 복구됩니다.")
+        warning.label(text="백업은 애드온을 제거해도 남습니다. 완전히 지우려면 위 키 칸을 비우세요.")
+        warning.label(text=f"백업 위치: {api_key_backup_path()}")
         warning.label(text="공용 컴퓨터에서는 키를 입력하거나 저장하지 마세요.")
 
 

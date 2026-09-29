@@ -54,6 +54,44 @@ def register():
         _registered_classes = ()
         raise
     _registered_classes = tuple(registered)
+    _schedule_api_key_restore()
+
+
+def _schedule_api_key_restore():
+    """등록 직후와 다음 이벤트 루프에서 OpenRouter API 키 백업 복구를 시도합니다.
+
+    Blender 5.2는 register() 전에 환경설정 항목을 만들어 두므로 보통 즉시 복구된다.
+    항목이 없는 드문 활성화 경로에 대비해 다음 이벤트 루프에서 한 번 더 시도한다.
+    """
+
+    import bpy
+
+    from .properties import restore_api_key
+
+    def attempt():
+        try:
+            restore_api_key()
+        except Exception as error:  # 키 복구 실패가 애드온 등록을 막으면 안 된다.
+            print(f"[UV Mapping] OpenRouter API 키 복구 실패: {error}")
+        return None
+
+    if _preferences_ready():
+        attempt()
+    else:
+        bpy.app.timers.register(attempt, first_interval=0.0)
+
+
+def _preferences_ready():
+    """현재 애드온의 환경설정 인스턴스에 접근할 수 있는지 확인합니다."""
+
+    import bpy
+
+    from .properties import get_addon_preferences
+
+    try:
+        return get_addon_preferences(bpy.context) is not None
+    except Exception:
+        return False
 
 
 def unregister():

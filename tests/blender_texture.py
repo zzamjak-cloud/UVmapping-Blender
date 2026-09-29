@@ -1254,6 +1254,52 @@ def _check_full_pipeline(texture_module, bake_module, ui_module) -> None:
     print("[texture] 스텁 작업자 전 구간(생성-회수-베이크-저장) 통과")
 
 
+def _check_api_key_survives_preference_wipe(preferences_module) -> None:
+    """Blender가 애드온 환경설정 항목을 지워도 키가 백업에서 복구되는지 확인한다.
+
+    업데이트 중 등록이 실패하거나 제거 후 재설치하면 Blender는 ``addons`` 항목과
+    그 안의 키를 지운다. 같은 상황을 disable/enable(default_set=True)로 재현한다.
+    """
+
+    import addon_utils
+
+    backup_path = preferences_module.api_key_backup_path()
+    profile_root = Path(bpy.utils.resource_path("USER")).resolve()
+    assert backup_path.resolve().is_relative_to(profile_root), (
+        f"키 백업이 격리 프로필 밖을 가리킵니다: {backup_path}"
+    )
+    addon_preferences = preferences_module.get_addon_preferences(bpy.context)
+    original_key = addon_preferences.openrouter_api_key
+    original_backup = backup_path.read_bytes() if backup_path.exists() else None
+    test_key = "sk-or-backup-regression"
+    try:
+        addon_preferences.openrouter_api_key = test_key
+        assert backup_path.read_text(encoding="utf-8") == test_key
+
+        addon_utils.disable(MODULE_NAME, default_set=True)
+        assert bpy.context.preferences.addons.get(MODULE_NAME) is None
+        addon_utils.enable(MODULE_NAME, default_set=True)
+        restored = preferences_module.get_addon_preferences(bpy.context)
+        assert restored is not None, "재활성화 뒤 환경설정을 찾지 못했습니다."
+        assert restored.openrouter_api_key == test_key, "지워진 키가 백업에서 복구되지 않았습니다."
+
+        # 사용자가 직접 키를 비우면 백업도 지워 다시 살아나지 않아야 한다.
+        restored.openrouter_api_key = ""
+        assert not backup_path.exists(), "키를 지웠는데 백업이 남아 있습니다."
+        assert preferences_module.restore_api_key(bpy.context) is False
+    finally:
+        # 키를 되돌리면 update 콜백이 백업을 다시 쓰므로 키를 먼저, 백업 파일을 나중에 복원한다.
+        current = preferences_module.get_addon_preferences(bpy.context)
+        if current is not None:
+            current.openrouter_api_key = original_key
+        if original_backup is None:
+            if not original_key.strip():
+                backup_path.unlink(missing_ok=True)
+        else:
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            backup_path.write_bytes(original_backup)
+
+
 def main() -> None:
     _assert_isolated_profile()
     _clear_scene()
@@ -1410,6 +1456,10 @@ def main() -> None:
     configured_before_save = bool(addon_preferences.openrouter_api_key.strip())
     assert bpy.ops.wm.save_userpref() == {"FINISHED"}
     assert _key_configuration_from_new_process() == configured_before_save
+    _check_api_key_survives_preference_wipe(preferences_module)
+    # 재활성화로 클래스가 다시 등록되었으므로 이전 RNA 참조를 새로 가져온다.
+    settings = bpy.context.scene.uvmapping_settings
+    addon_preferences = preferences_module.get_addon_preferences(bpy.context)
 
     bpy.ops.mesh.primitive_cube_add(size=2.0)
     cube = bpy.context.object
