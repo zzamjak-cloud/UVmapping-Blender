@@ -475,8 +475,8 @@ def _check_release_lock() -> None:
     _require(lock.get("schema_version") == "1.0.0", "Release 잠금 스키마는 1.0.0이어야 합니다.")
     releases = lock.get("releases")
     _require(
-        isinstance(releases, list) and len(releases) == 7,
-        "현재 Release 잠금에는 v1.1.0, v1.2.0, v2.0.0, v2.1.0, v2.2.0, v2.3.0, v2.5.1이 있어야 합니다.",
+        isinstance(releases, list) and len(releases) == 8,
+        "현재 Release 잠금에는 v1.1.0, v1.2.0, v2.0.0, v2.1.0, v2.2.0, v2.3.0, v2.5.1, v2.6.0이 있어야 합니다.",
     )
     expected = [
         {
@@ -541,6 +541,15 @@ def _check_release_lock() -> None:
             "size": 161394,
             "sha256": "0b80681e6db427ce78992c25fff19bc5e5618b7ee5921703dc2f9c8cf3e4eef8",
             "target_commit": "dea966259b3eb2700804bea5d26b4d8d93e50a4b",
+        },
+        {
+            "tag": "v2.6.0",
+            "version": "2.6.0",
+            "asset_name": "uvmapping_blender-v2.6.0.zip",
+            "url": "https://github.com/zzamjak-cloud/UVmapping-Blender/releases/download/v2.6.0/uvmapping_blender-v2.6.0.zip",
+            "size": 191033,
+            "sha256": "3012b79c5bcd3f59c0aa3e59a11c49131f8ea780d22e0dbbef80fdad21dc97db",
+            "target_commit": "2da166f72d61370175a74dfd85a2ee598d687bc9",
         },
     ]
     _require(releases == expected, "Release 잠금 메타데이터가 승인된 값과 다릅니다.")
