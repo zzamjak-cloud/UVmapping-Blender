@@ -1172,6 +1172,108 @@ def build_turnaround_request(
     )
 
 
+# 파츠별 매핑 한 번에 보낼 수 있는 최대 파츠 수(파츠당 Provider 1회 호출).
+MAX_PART_PASSES = 12
+
+
+def part_refine_layout_name(views: Sequence[str]) -> str:
+    """파츠별 매핑 캔버스 레이아웃. 본 생성이 상·하면까지 그렸으면 6면, 아니면 3면."""
+
+    return "SIX" if "TOP" in {str(view).upper() for view in views} else "THREE"
+
+
+def compile_part_refine_prompt(
+    analysis: ReferenceAnalysis | Mapping[str, Any] | None,
+    user_prompt: str = "",
+    *,
+    part_label: str,
+    layout: TurnaroundLayout | str,
+    reference_image_count: int = 0,
+) -> str:
+    """다른 부위를 숨긴 파츠 하나를 다시 채색하도록 지시한다.
+
+    가이드는 전신 생성 결과를 그 파츠에만 입혀 파츠 단독으로 렌더한 것이다. 전신
+    시점에서 다른 부위에 가려 보이지 않던 면은 회색으로 남아 있으므로, 색이 있는
+    곳은 디자인을 유지하며 다듬고 회색 영역만 주변과 이어지게 새로 칠하게 한다.
+    """
+
+    resolved_layout = resolve_layout(layout)
+    instruction = user_prompt.strip() or "추가 지시 없음"
+    part = part_label.strip() or "part"
+    guide_description = (
+        f"같은 캐릭터의 '{part}' 부위만 남기고 나머지 부위를 숨긴 실제 3D 모델이며, "
+        "전신 채색 결과가 입혀져 있습니다."
+    )
+    guide_line = (
+        f"첫 번째 이미지는 같은 캐릭터에서 '{part}' 부위만 분리해 각 시점에서 본 모습입니다. "
+        "색이 있는 영역은 전신 채색에서 정해진 디자인이고, 회색 영역은 전신 시점에서 다른 부위에 "
+        "가려 보이지 않던 면입니다."
+    )
+    role_section, style_section = _style_sections(
+        analysis, user_prompt, reference_image_count, guide_description
+    )
+    return f"""캐주얼 게임용 스타일리시 손맵 diffuse/albedo 제작을 위해, 분리된 부위 하나의 다면도 한 장을 다시 채색하세요.
+대상 부위: {part}
+
+입력 이미지 역할:
+{role_section}
+
+{_shape_contract(guide_line)}
+
+부위 재채색 계약:
+- 색이 있는 영역의 팔레트, 각 부위의 색상과 명도, 무늬, 재질 경계는 그대로 유지하며 번짐·늘어짐·얼룩만 깔끔하게 다듬습니다.
+- 회색 영역은 비어 있는 곳이 아니라 칠해야 할 실제 표면입니다. 인접한 색·무늬·명암과 자연스럽게 이어지도록 빠짐없이 채색합니다.
+- 이 부위는 몸의 다른 부위와 이어지는 경계가 있습니다. 경계 근처의 색은 입력 이미지의 색을 그대로 따라 다른 부위와 어긋나지 않게 합니다.
+- 숨겨진 다른 부위를 새로 그려 넣지 않습니다. 보이는 부위만 채색합니다.
+
+{style_section}
+
+사용자 한 줄 지시:
+{instruction}
+
+출력 계약:
+- Provider 호출 한 번에서 최종 이미지 정확히 한 장만 생성합니다.
+{_layout_output_contract(resolved_layout)}
+{_common_output_rules()}"""
+
+
+def build_part_refine_request(
+    contact_sheet: InlineImage,
+    reference_images: Sequence[InlineImage],
+    analysis: ReferenceAnalysis | Mapping[str, Any] | None,
+    user_instruction: str = "",
+    *,
+    part_label: str,
+    model: str = DEFAULT_IMAGE_MODEL,
+    layout_name: str = DEFAULT_LAYOUT_NAME,
+    image_size: str = DEFAULT_IMAGE_SIZE,
+    quality: str | None = None,
+) -> TurnaroundImageRequest:
+    """파츠 하나를 다시 채색하는 단일 캔버스 요청. 비용 계약은 다면도 요청과 같다."""
+
+    layout = resolve_layout(layout_name)
+    if layout.name not in TURNAROUND_LAYOUTS:
+        raise ValueError("파츠별 매핑은 3면 또는 6면 단일 캔버스만 지원합니다.")
+    prompt = compile_part_refine_prompt(
+        analysis,
+        user_instruction,
+        part_label=part_label,
+        layout=layout,
+        reference_image_count=len(reference_images),
+    )
+    return TurnaroundImageRequest(
+        prompt=prompt,
+        contact_sheet=contact_sheet,
+        reference_images=tuple(reference_images),
+        model=model,
+        aspect_ratio=layout.aspect_ratio,
+        image_size=image_size,
+        quality=quality,
+        views=layout.views,
+        layout_name=layout.name,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class TurnaroundBatchRequest:
     """구성의 그룹마다 요청 하나를 담은, 비용 계약 검증을 통과한 묶음.

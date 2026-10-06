@@ -32,6 +32,8 @@ from .texture_presets import (
 
 # 투영 블렌딩 기본값. 패널 기본값과 상태에 값이 없을 때의 대체값을 한곳에서 정한다.
 DEFAULT_DOMINANT_VIEW_BLEND = True
+# 파츠별 매핑 경계에서 전신 결과와 섞는 폭(모델 크기 대비 %).
+DEFAULT_PART_BLEND_PERCENT = 4.0
 
 
 def addon_module_id() -> str:
@@ -389,6 +391,27 @@ class UVMAPPING_PG_settings(PropertyGroup):
         ),
         default=False,
     )
+    part_mapping: BoolProperty(
+        name="파츠별 매핑",
+        description=(
+            "전신 다면도를 투영한 뒤, 등록한 매핑 파츠마다 다른 부위를 숨기고 파츠만 다시 "
+            "생성해 그 면에 투영합니다. 팔에 가린 옆구리, 다리 안쪽처럼 전신 시점에서 "
+            "보이지 않던 면이 실제 그림으로 채워집니다. 파츠마다 OpenRouter 호출이 1회 늘어납니다"
+        ),
+        default=False,
+    )
+    part_blend_percent: FloatProperty(
+        name="파츠 경계 혼합 폭(%)",
+        description=(
+            "파츠 경계에서 이 거리(모델 크기 대비 %) 안쪽은 전신 결과와 섞어 이음새를 숨깁니다. "
+            "0이면 경계에서 바로 파츠 결과로 바뀝니다"
+        ),
+        default=DEFAULT_PART_BLEND_PERCENT,
+        min=0.0,
+        max=15.0,
+        step=50,
+        precision=1,
+    )
     target_objects: CollectionProperty(
         name="대상 객체",
         type=UVMAPPING_PG_target_object,
@@ -514,6 +537,7 @@ class UVMAPPING_PG_settings(PropertyGroup):
 
 __all__ = (
     "DEFAULT_DOMINANT_VIEW_BLEND",
+    "DEFAULT_PART_BLEND_PERCENT",
     "GPT_IMAGE_25_FLARE_MODELS",
     "GPT_IMAGE_25_SUNBURST_MODELS",
     "GPT_IMAGE_MODELS",

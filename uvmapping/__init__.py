@@ -16,7 +16,7 @@ def register():
     import bpy
     from bpy.props import PointerProperty
 
-    from . import texture_operators, ui
+    from . import part_operators, texture_operators, ui
     from .properties import (
         UVMAPPING_AP_preferences,
         UVMAPPING_PG_reference_image,
@@ -32,20 +32,22 @@ def register():
         UVMAPPING_PG_reference_image,
         UVMAPPING_PG_target_object,
         UVMAPPING_PG_settings,
+        *part_operators.classes,
         *texture_operators.classes,
         *ui.classes,
     )
     registered = []
-    scene_property_registered = False
     try:
         for cls in classes:
             bpy.utils.register_class(cls)
             registered.append(cls)
         bpy.types.Scene.uvmapping_settings = PointerProperty(type=UVMAPPING_PG_settings)
-        scene_property_registered = True
+        # 매핑 파츠는 메시 면 속성과 짝을 이루므로 Mesh 데이터에 둔다.
+        bpy.types.Mesh.uvmapping_parts = PointerProperty(
+            type=part_operators.UVMAPPING_PG_mesh_parts
+        )
     except Exception:
-        if scene_property_registered and hasattr(bpy.types.Scene, "uvmapping_settings"):
-            del bpy.types.Scene.uvmapping_settings
+        _remove_data_properties()
         for cls in reversed(registered):
             try:
                 bpy.utils.unregister_class(cls)
@@ -94,6 +96,17 @@ def _preferences_ready():
         return False
 
 
+def _remove_data_properties():
+    """Scene·Mesh에 붙인 애드온 속성을 뗀다."""
+
+    import bpy
+
+    if hasattr(bpy.types.Mesh, "uvmapping_parts"):
+        del bpy.types.Mesh.uvmapping_parts
+    if hasattr(bpy.types.Scene, "uvmapping_settings"):
+        del bpy.types.Scene.uvmapping_settings
+
+
 def unregister():
     """씬 설정과 애드온 클래스를 역순으로 해제합니다."""
 
@@ -105,8 +118,7 @@ def unregister():
 
     texture_operators.shutdown()
 
-    if hasattr(bpy.types.Scene, "uvmapping_settings"):
-        del bpy.types.Scene.uvmapping_settings
+    _remove_data_properties()
     for cls in reversed(_registered_classes):
         bpy.utils.unregister_class(cls)
     _registered_classes = ()

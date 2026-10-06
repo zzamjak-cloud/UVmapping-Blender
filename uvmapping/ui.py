@@ -6,6 +6,7 @@ from pathlib import Path
 import bpy
 from bpy.types import Panel, UIList
 
+from . import mapping_parts, part_operators
 from .openrouter_provider import clamp_quality, supports_resolution
 from .properties import get_addon_preferences, quality_values_from
 from . import texture_errors
@@ -18,7 +19,7 @@ from .texture_operators import (
     texture_targets,
     texture_verification_summary,
 )
-from .texture_pipeline import resolve_composition
+from .texture_pipeline import MAX_PART_PASSES, resolve_composition
 from .texture_presets import (
     matching_quality_preset,
     resolved_image_quality,
@@ -129,7 +130,7 @@ class UVMAPPING_PT_ai_texture(Panel):
         self._draw_problems(layout, context)
         self._draw_targets(layout, context, settings)
         self._draw_references(layout, settings)
-        self._draw_quality(layout, settings)
+        self._draw_quality(layout, context, settings)
         self._draw_actions(layout, context, settings)
         self._draw_status(layout, context, settings)
         self._draw_advanced(layout, settings)
@@ -231,7 +232,7 @@ class UVMAPPING_PT_ai_texture(Panel):
         )
 
     @staticmethod
-    def _draw_quality(layout, settings) -> None:
+    def _draw_quality(layout, context, settings) -> None:
         quality_box = layout.box()
         quality_box.label(text="품질과 모델", icon="PRESET")
         quality_box.prop(settings, "texture_quality_preset", expand=True)
@@ -239,7 +240,17 @@ class UVMAPPING_PT_ai_texture(Panel):
         call_count = turnaround_call_count(
             settings.turnaround_layout, settings.generation_mode
         )
-        if call_count > 1:
+        part_calls = (
+            min(MAX_PART_PASSES, part_operators.count_part_passes(texture_targets(context)))
+            if settings.part_mapping
+            else 0
+        )
+        if part_calls:
+            quality_box.label(
+                text=f"전신 {call_count}회 + 파츠 최대 {part_calls}회 · 비용 최대 약 {call_count + part_calls}배",
+                icon="ERROR",
+            )
+        elif call_count > 1:
             quality_box.label(
                 text=f"OpenRouter 호출 {call_count}회 · 비용 약 {call_count}배",
                 icon="ERROR",
@@ -431,16 +442,153 @@ class UVMAPPING_PT_ai_texture(Panel):
             box.label(text="재생성 권장", icon="ERROR")
 
 
+class UVMAPPING_UL_mapping_parts(UIList):
+    """활성 Mesh에 등록한 매핑 파츠 목록. 면 속성이 없는 보관 항목은 숨긴다."""
+
+    def filter_items(self, _context, data, property_name):
+        mesh = data.id_data
+        flags = [
+            self.bitflag_filter_item if part_operators.is_live(mesh, part) else 0
+            for part in getattr(data, property_name)
+        ]
+        return flags, []
+
+    def draw_item(
+        self,
+        _context,
+        layout,
+        data,
+        item,
+        _icon,
+        _active_data,
+        _active_property,
+        index,
+    ):
+        row = layout.row(align=True)
+        row.prop(item, "name", text="", emboss=False, icon="MESH_DATA")
+        kind = row.row(align=True)
+        kind.ui_units_x = 4.5
+        kind.prop(item, "kind", text="")
+        isolated = data.isolated == index
+        isolate = row.operator(
+            "uvmapping.isolate_mapping_part",
+            text="",
+            icon="HIDE_OFF" if isolated else "HIDE_ON",
+            depress=isolated,
+            emboss=isolated,
+        )
+        isolate.index = index
+
+
+class UVMAPPING_PT_mapping_parts(Panel):
+    """투영 매핑을 파츠별로 나눠 진행할 면 그룹을 등록하는 하위 패널."""
+
+    bl_label = "매핑 파츠"
+    bl_idname = "UVMAPPING_PT_mapping_parts"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "UV Mapping"
+    bl_parent_id = "UVMAPPING_PT_ai_texture"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return part_operators.mesh_parts(part_operators.active_mesh_object(context)) is not None
+
+    def draw(self, context):
+        layout = self.layout
+        self._draw_part_mapping(layout, context)
+        obj = part_operators.active_mesh_object(context)
+        data = part_operators.mesh_parts(obj)
+        live_count = len(part_operators.live_parts(obj.data))
+        layout.label(text=f"{obj.name} 파츠 {live_count}개", icon="OUTLINER_OB_MESH")
+        row = layout.row()
+        row.template_list(
+            "UVMAPPING_UL_mapping_parts", "", data, "parts", data, "active_index", rows=4
+        )
+        side = row.column(align=True)
+        side.operator("uvmapping.add_mapping_part", text="", icon="ADD")
+        side.operator("uvmapping.remove_mapping_part", text="", icon="REMOVE")
+
+        edit = layout.column(align=True)
+        assign = edit.row(align=True)
+        assign.operator("uvmapping.assign_mapping_part", text="교체").mode = "REPLACE"
+        assign.operator("uvmapping.assign_mapping_part", text="추가").mode = "ADD"
+        assign.operator("uvmapping.assign_mapping_part", text="제거").mode = "REMOVE"
+        tools = edit.row(align=True)
+        tools.operator("uvmapping.select_mapping_part", text="면 선택", icon="RESTRICT_SELECT_OFF")
+        tools.operator("uvmapping.show_all_mapping_parts", text="전체 표시", icon="HIDE_OFF")
+
+        if obj.mode == "EDIT":
+            layout.label(text="면을 선택하고 + 로 등록합니다", icon="INFO")
+        else:
+            layout.label(text="Edit Mode에서 면을 골라 등록합니다", icon="INFO")
+            self._draw_coverage(layout, obj.data)
+        if data.isolated >= 0:
+            layout.label(text="Isolate는 Edit·Paint 모드 뷰포트에서 보입니다", icon="HIDE_ON")
+
+    @staticmethod
+    def _draw_part_mapping(layout, context) -> None:
+        """생성 때 파츠별 매핑을 이어서 할지와 경계 혼합 폭."""
+
+        settings = context.scene.uvmapping_settings
+        box = layout.box()
+        box.prop(settings, "part_mapping")
+        if not settings.part_mapping:
+            return
+        count = part_operators.count_part_passes(texture_targets(context))
+        if not count:
+            box.label(text="등록된 파츠가 없어 전신만 생성합니다", icon="INFO")
+            return
+        calls = min(count, MAX_PART_PASSES)
+        box.label(text=f"전신 생성 뒤 파츠 최대 {calls}개를 1회씩 다시 생성합니다", icon="INFO")
+        if count > MAX_PART_PASSES:
+            box.label(text=f"파츠는 한 번에 {MAX_PART_PASSES}개까지만 진행합니다", icon="ERROR")
+        box.prop(settings, "part_blend_percent")
+
+    @staticmethod
+    def _draw_coverage(layout, mesh) -> None:
+        """Object Mode에서만 등록 상태를 검사한다(Edit Mode에서는 면 속성이 최신이 아니다)."""
+
+        if not part_operators.live_parts(mesh):
+            return
+        report = part_operators.coverage_report(mesh)
+        box = layout.box()
+        problems = False
+        if report["unassigned"]:
+            problems = True
+            box.label(
+                text=f"파츠 없는 면 {report['unassigned']}/{report['faces']}개",
+                icon="ERROR",
+            )
+        if report["overlapping"]:
+            problems = True
+            box.label(text=f"두 파츠 이상에 속한 면 {report['overlapping']}개", icon="ERROR")
+        if report["empty_parts"]:
+            problems = True
+            box.label(text=f"면이 없는 파츠: {', '.join(report['empty_parts'])}", icon="ERROR")
+        if report["duplicate_kinds"]:
+            problems = True
+            labels = ", ".join(mapping_parts.kind_label(kind) for kind in report["duplicate_kinds"])
+            box.label(text=f"같은 종류가 중복 등록됨: {labels}", icon="INFO")
+        if not problems:
+            box.label(text=f"모든 면 {report['faces']}개가 파츠에 등록됨", icon="CHECKMARK")
+
+
 classes = (
     UVMAPPING_UL_reference_images,
     UVMAPPING_UL_target_objects,
+    UVMAPPING_UL_mapping_parts,
     UVMAPPING_PT_ai_texture,
+    UVMAPPING_PT_mapping_parts,
 )
 
 
 __all__ = (
     "classes",
     "UVMAPPING_PT_ai_texture",
+    "UVMAPPING_PT_mapping_parts",
+    "UVMAPPING_UL_mapping_parts",
     "UVMAPPING_UL_reference_images",
     "UVMAPPING_UL_target_objects",
 )

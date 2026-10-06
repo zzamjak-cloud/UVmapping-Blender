@@ -140,10 +140,10 @@ class _FakeLayout:
         self.record["lists"].append(propname)
 
 
-def _draw_panel(ui_module) -> dict:
+def _draw_panel(ui_module, panel=None) -> dict:
     """등록된 Panel 클래스의 draw를 순수 파이썬 숙주에 붙여 예외 없이 실행한다."""
 
-    panel = ui_module.UVMAPPING_PT_ai_texture
+    panel = panel or ui_module.UVMAPPING_PT_ai_texture
     members = {
         name: value
         for name, value in vars(panel).items()
@@ -155,6 +155,505 @@ def _draw_panel(ui_module) -> dict:
     probe.layout = _FakeLayout(record)
     probe.draw(bpy.context)
     return record
+
+
+def _select_faces(obj, indices) -> None:
+    """Object Mode에서 면 선택을 지정한다(Edit Mode 진입 시 그대로 읽힌다)."""
+
+    selected = set(indices)
+    # Edit Mode는 정점 선택에서 면 선택을 다시 계산하므로 정점·변 선택도 맞춘다.
+    vertices = set()
+    for polygon in obj.data.polygons:
+        polygon.select = polygon.index in selected
+        if polygon.select:
+            vertices.update(polygon.vertices)
+    for vertex in obj.data.vertices:
+        vertex.select = vertex.index in vertices
+    for edge in obj.data.edges:
+        edge.select = all(index in vertices for index in edge.vertices)
+
+
+def _part_faces(part_module, obj, part) -> set[int]:
+    mask = part_module.part_face_mask(obj.data, part)
+    assert mask is not None, part.attr
+    return {index for index, value in enumerate(mask) if value}
+
+
+def _check_mapping_parts(ui_module) -> None:
+    """면 단위 매핑 파츠 등록·이동·종류 매칭·Isolate·검사·패널을 실제 메시에서 확인한다."""
+
+    part_module = importlib.import_module(f"{MODULE_NAME}.uvmapping.part_operators")
+    _clear_scene()
+    bpy.ops.mesh.primitive_cube_add(size=2.0)
+    cube = bpy.context.object
+    data = cube.data.uvmapping_parts
+    assert len(data.parts) == 0 and data.isolated == -1
+
+    # 선택이 없으면 등록하지 않는다.
+    _select_faces(cube, ())
+    assert bpy.ops.uvmapping.add_mapping_part(kind="HEAD") == {"CANCELLED"}
+
+    # 프리셋 종류는 이름을 비워도 기본 이름이 붙는다. Edit Mode에서 등록해도 모드를 유지한다.
+    _select_faces(cube, (0, 1))
+    bpy.ops.object.mode_set(mode="EDIT")
+    assert bpy.ops.uvmapping.add_mapping_part(kind="HEAD") == {"FINISHED"}
+    assert cube.mode == "EDIT"
+    bpy.ops.object.mode_set(mode="OBJECT")
+    head = data.parts[0]
+    assert (head.name, head.kind) == ("머리", "HEAD")
+    assert head.attr.startswith(part_module.ATTR_PREFIX)
+    attribute = cube.data.attributes[head.attr]
+    assert (attribute.domain, attribute.data_type) == ("FACE", "BOOLEAN")
+    assert _part_faces(part_module, cube, head) == {0, 1}
+
+    # 직접 입력한 이름은 인체 단위 매칭 단어로 종류를 정하고, 겹친 면은 다른 파츠에서 옮긴다.
+    _select_faces(cube, (1, 2))
+    assert bpy.ops.uvmapping.add_mapping_part(kind="CUSTOM", name="LeftArm") == {"FINISHED"}
+    arm = data.parts[1]
+    assert (arm.name, arm.kind) == ("LeftArm", "ARM_L")
+    assert _part_faces(part_module, cube, arm) == {1, 2}
+    assert _part_faces(part_module, cube, data.parts[0]) == {0}
+
+    # 매칭되지 않는 이름은 사용자 지정으로 남는다.
+    _select_faces(cube, (3,))
+    assert bpy.ops.uvmapping.add_mapping_part(kind="CUSTOM", name="꼬리") == {"FINISHED"}
+    tail = data.parts[2]
+    assert (tail.name, tail.kind) == ("꼬리", "CUSTOM")
+    assert data.active_index == 2
+
+    report = part_module.coverage_report(cube.data)
+    assert report["faces"] == 6
+    assert report["unassigned"] == 2 and report["overlapping"] == 0, report
+    assert report["empty_parts"] == () and report["duplicate_kinds"] == ()
+
+    # 활성 파츠 면 추가·제거·교체. exclusive를 끄면 겹침을 허용한다.
+    _select_faces(cube, (4, 0))
+    assert bpy.ops.uvmapping.assign_mapping_part(mode="ADD", exclusive=False) == {"FINISHED"}
+    assert _part_faces(part_module, cube, tail) == {0, 3, 4}
+    assert part_module.coverage_report(cube.data)["overlapping"] == 1
+    _select_faces(cube, (0,))
+    assert bpy.ops.uvmapping.assign_mapping_part(mode="REMOVE") == {"FINISHED"}
+    assert _part_faces(part_module, cube, tail) == {3, 4}
+    _select_faces(cube, (3, 4, 5))
+    assert bpy.ops.uvmapping.assign_mapping_part(mode="REPLACE") == {"FINISHED"}
+    assert _part_faces(part_module, cube, tail) == {3, 4, 5}
+    report = part_module.coverage_report(cube.data)
+    assert report["unassigned"] == 0 and report["overlapping"] == 0, report
+
+    # 이름을 바꾸면 종류가 따라오고, 종류를 바꾸면 기본 이름도 따라온다.
+    tail.name = "오른다리"
+    assert tail.kind == "LEG_R"
+    head.kind = "TORSO"
+    assert head.name == "몸통"
+    arm.kind = "ARM_R"
+    assert arm.name == "LeftArm", "사용자가 붙인 이름은 종류를 바꿔도 지킨다"
+    # 목록에서 종류를 직접 고른 파츠는 이후 이름이 매칭 단어와 맞아도 종류를 유지한다.
+    assert head.kind_locked and not tail.kind_locked
+    head.name = "Head Strap"
+    assert head.kind == "TORSO"
+    head.name = "몸통"
+
+    # Isolate: 파츠 면만 남기고, 보이는 면에 속한 정점·변만 보인다. 다시 누르면 전체 표시.
+    assert bpy.ops.uvmapping.isolate_mapping_part(index=1) == {"FINISHED"}
+    assert data.isolated == 1 and data.active_index == 1
+    hidden = {polygon.index for polygon in cube.data.polygons if polygon.hide}
+    assert hidden == {0, 3, 4, 5}, hidden
+    visible_vertices = {
+        vertex for polygon in cube.data.polygons if not polygon.hide for vertex in polygon.vertices
+    }
+    assert {vertex.index for vertex in cube.data.vertices if not vertex.hide} == visible_vertices
+    visible_edges = {
+        cube.data.loops[loop].edge_index
+        for polygon in cube.data.polygons
+        if not polygon.hide
+        for loop in polygon.loop_indices
+    }
+    assert {edge.index for edge in cube.data.edges if not edge.hide} == visible_edges
+    assert bpy.ops.uvmapping.isolate_mapping_part(index=1) == {"FINISHED"}
+    assert data.isolated == -1
+    assert not any(polygon.hide for polygon in cube.data.polygons)
+    assert not any(vertex.hide for vertex in cube.data.vertices)
+    assert part_module.PREV_HIDE_ATTR not in cube.data.attributes
+
+    # 사용자가 미리 숨긴 면은 Isolate를 풀면 다시 숨겨진다.
+    cube.data.polygons[5].hide = True
+    assert bpy.ops.uvmapping.isolate_mapping_part(index=0) == {"FINISHED"}
+    assert bpy.ops.uvmapping.isolate_mapping_part(index=1) == {"FINISHED"}, "다른 파츠로 바로 전환"
+    assert data.isolated == 1
+    assert bpy.ops.uvmapping.show_all_mapping_parts() == {"FINISHED"}
+    assert {polygon.index for polygon in cube.data.polygons if polygon.hide} == {5}
+    cube.data.polygons[5].hide = False
+
+    # undo 등으로 숨김만 풀리고 isolated 값이 남아도, 다시 누르면 꺼지지 않고 Isolate된다.
+    assert bpy.ops.uvmapping.isolate_mapping_part(index=1) == {"FINISHED"}
+    for polygon in cube.data.polygons:
+        polygon.hide = False
+    assert bpy.ops.uvmapping.isolate_mapping_part(index=1) == {"FINISHED"}
+    assert data.isolated == 1
+    assert {polygon.index for polygon in cube.data.polygons if polygon.hide} == {0, 3, 4, 5}
+    assert bpy.ops.uvmapping.show_all_mapping_parts() == {"FINISHED"}
+    assert not any(polygon.hide for polygon in cube.data.polygons)
+
+    # Edit Mode Isolate와 면 선택. 모드는 그대로 유지하고, Edit Mode에서도 파츠가 보인다.
+    bpy.ops.object.mode_set(mode="EDIT")
+    assert len(part_module.live_parts(cube.data)) == 3, "Edit Mode에서도 파츠 속성이 보여야 한다"
+    assert bpy.ops.uvmapping.isolate_mapping_part(index=0) == {"FINISHED"}
+    assert cube.mode == "EDIT"
+    data.active_index = 2
+    assert bpy.ops.uvmapping.select_mapping_part() == {"FINISHED"}
+    assert bpy.ops.uvmapping.show_all_mapping_parts() == {"FINISHED"}
+    assert bpy.ops.uvmapping.select_mapping_part() == {"FINISHED"}
+    bpy.ops.object.mode_set(mode="OBJECT")
+    assert {polygon.index for polygon in cube.data.polygons if polygon.select} == {3, 4, 5}
+    assert not any(polygon.hide for polygon in cube.data.polygons)
+
+    # 면 속성은 Modifier 평가 결과에도 따라간다(이후 파츠별 투영에서 쓴다).
+    modifier = cube.modifiers.new("파츠 검사 Subdivision", "SUBSURF")
+    modifier.levels = 1
+    evaluated = cube.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    evaluated_mesh = evaluated.to_mesh()
+    try:
+        evaluated_attribute = evaluated_mesh.attributes.get(tail.attr)
+        assert evaluated_attribute is not None and evaluated_attribute.domain == "FACE"
+        assert sum(item.value for item in evaluated_attribute.data) == 3 * 4
+    finally:
+        evaluated.to_mesh_clear()
+        cube.modifiers.remove(modifier)
+
+    # 패널: 파츠 목록과 검사 상자가 예외 없이 그려진다. 중복 종류는 안내한다.
+    tail.kind = "TORSO"
+    assert tail.name == "몸통.001", tail.name
+    record = _draw_panel(ui_module, ui_module.UVMAPPING_PT_mapping_parts)
+    assert record["lists"] == ["parts"], record["lists"]
+    for idname in (
+        "uvmapping.add_mapping_part",
+        "uvmapping.remove_mapping_part",
+        "uvmapping.assign_mapping_part",
+        "uvmapping.select_mapping_part",
+        "uvmapping.show_all_mapping_parts",
+    ):
+        assert idname in record["operators"], idname
+    assert any("중복" in label and "몸통" in label for label in record["labels"]), record["labels"]
+
+    # 제거는 면 속성만 지우고 항목은 보관한다. undo로 속성이 돌아오면 이름·종류도 돌아온다.
+    removed = data.parts[data.active_index]
+    removed_attr, removed_name = removed.attr, removed.name
+    assert bpy.ops.uvmapping.remove_mapping_part() == {"FINISHED"}
+    assert removed_attr not in cube.data.attributes
+    assert len(part_module.live_parts(cube.data)) == 2
+    assert part_module.coverage_report(cube.data)["unassigned"] == 3
+    restored = cube.data.attributes.new(removed_attr, "BOOLEAN", "FACE")
+    restored.data[3].value = True
+    live = {part.attr: part.name for _index, part in part_module.live_parts(cube.data)}
+    assert live.get(removed_attr) == removed_name, live
+
+    # Join 등으로 목록에 없는 파츠 속성이 생기면 사용자 지정 파츠로 목록에 올린다.
+    joined = cube.data.attributes.new(part_module.ATTR_PREFIX + "joined", "BOOLEAN", "FACE")
+    joined.data[4].value = True
+    part_module.sync_parts(cube.data)
+    adopted = [part for _index, part in part_module.live_parts(cube.data) if part.attr == joined.name]
+    assert len(adopted) == 1 and adopted[0].kind == "CUSTOM", adopted
+    # 속성 이름은 메시마다 1부터 매기지 않고 전역 고유 접미사를 쓴다.
+    assert len({part.attr for part in data.parts}) == len(data.parts)
+    assert all(len(part.attr) > len(part_module.ATTR_PREFIX) + 4 for part in data.parts)
+    _clear_scene()
+    print("[texture] 매핑 파츠 등록·이동·종류 매칭·Isolate·검사 통과")
+
+
+def _three_view_png(bake_module, path: Path, colors) -> None:
+    """3열 21:9 축소판 결과. 셀마다 흰 여백 위 단색 피사체를 그린다."""
+
+    width, height, columns = 336, 144, 3
+    cell_width = width // columns
+    margin = 12
+    pixels = bytearray()
+    for row in range(height):
+        for column in range(width):
+            cell = min(columns - 1, column // cell_width)
+            local = column % cell_width
+            inside = margin <= row < height - margin and margin <= local < cell_width - margin
+            pixels += bytes((colors[cell] if inside else (255, 255, 255)) + (255,))
+    path.write_bytes(bake_module.encode_srgb_png(bytes(pixels), width, height))
+
+
+def _build_body_with_arm(part_module):
+    """몸통 상자 앞(-Y)에 팔 상자를 붙인 객체. 정면에서 팔이 몸통 정면 가운데를 가린다."""
+
+    _clear_scene()
+    bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0.0, 0.0, 0.0))
+    body = bpy.context.object
+    bpy.ops.mesh.primitive_cube_add(size=0.8, location=(0.0, -1.6, 0.0))
+    arm = bpy.context.object
+    bpy.ops.object.select_all(action="DESELECT")
+    body.select_set(True)
+    arm.select_set(True)
+    bpy.context.view_layer.objects.active = body
+    bpy.ops.object.join()
+    figure = bpy.context.object
+    figure.name = "파츠 매핑 검사 인형"
+    mesh = figure.data
+    arm_faces = {polygon.index for polygon in mesh.polygons if polygon.center.y < -1.1}
+    assert len(arm_faces) == 6, arm_faces
+    # 두 상자의 기본 UV가 겹치므로 Atlas를 반씩 나눠 겹치지 않게 옮긴다.
+    uv_layer = mesh.uv_layers.active
+    for polygon in mesh.polygons:
+        offset = 0.5 if polygon.index in arm_faces else 0.0
+        for loop_index in polygon.loop_indices:
+            u, v = uv_layer.data[loop_index].uv
+            uv_layer.data[loop_index].uv = (u * 0.5 + offset, v * 0.5 + offset)
+    _select_faces(figure, set(range(len(mesh.polygons))) - arm_faces)
+    assert bpy.ops.uvmapping.add_mapping_part(kind="TORSO") == {"FINISHED"}
+    _select_faces(figure, arm_faces)
+    assert bpy.ops.uvmapping.add_mapping_part(kind="ARM_L") == {"FINISHED"}
+    assert len(part_module.live_parts(mesh)) == 2
+    return figure, arm_faces
+
+
+def _face_color(pixels, width: int, height: int, mesh, uv_layer_name: str, face_index: int):
+    """면 UV 중심의 Atlas 색(선형)."""
+
+    uv_layer = mesh.uv_layers[uv_layer_name]
+    polygon = mesh.polygons[face_index]
+    us = [uv_layer.data[index].uv[0] for index in polygon.loop_indices]
+    vs = [uv_layer.data[index].uv[1] for index in polygon.loop_indices]
+    x = min(width - 1, int(sum(us) / len(us) * width))
+    y = min(height - 1, int(sum(vs) / len(vs) * height))
+    offset = (y * width + x) * 4
+    return tuple(pixels[offset : offset + 3])
+
+
+def _check_part_boundary_weights(bake_module) -> None:
+    """연결된 메시에서 파츠 경계 정점은 가중치 0, 멀어질수록 1에 가까워진다."""
+
+    _clear_scene()
+    bpy.ops.mesh.primitive_grid_add(x_subdivisions=8, y_subdivisions=1, size=2.0)
+    strip = bpy.context.object
+    mesh = strip.data
+    attribute = mesh.attributes.new("uvmapping_part_boundary", "BOOLEAN", "FACE")
+    for polygon in mesh.polygons:
+        attribute.data[polygon.index].value = polygon.center.x > 0.0
+    triangles, _center, _scale = bake_module._collect_blender_triangles(
+        bpy.context,
+        (strip,),
+        None,
+        part_members={strip.name: ["uvmapping_part_boundary"]},
+        feather_distance=1.0,
+    )
+    assert triangles and all(triangle.blend_weights is not None for triangle in triangles)
+    weights = [
+        (position[0], weight)
+        for triangle in triangles
+        for position, weight in zip(triangle.positions, triangle.blend_weights)
+    ]
+    # 파츠(+X 절반) 면만 모았는지
+    assert min(position[0] for triangle in triangles for position in triangle.positions) >= -1e-6
+    at_boundary = [weight for x, weight in weights if abs(x) < 1e-6]
+    far = [weight for x, weight in weights if x > 0.99]
+    assert at_boundary and max(at_boundary) == 0.0, at_boundary
+    assert far and min(far) == 1.0, far
+    # 혼합 폭 0이면 경계에서도 파츠 결과만 쓴다.
+    flat, _c, _s = bake_module._collect_blender_triangles(
+        bpy.context, (strip,), None, part_members={strip.name: ["uvmapping_part_boundary"]}
+    )
+    assert all(triangle.blend_weights is None for triangle in flat)
+    _clear_scene()
+
+
+def _check_part_mapping_pipeline(texture_module, bake_module, ui_module) -> None:
+    """파츠별 매핑: 전신 생성 → 파츠 가이드(다른 부위 숨김) → 배치 요청 → 합성 베이크."""
+
+    part_module = importlib.import_module(f"{MODULE_NAME}.uvmapping.part_operators")
+    _check_part_boundary_weights(bake_module)
+    original_popen = texture_module.subprocess.Popen
+    original_key = os.environ.get("OPENROUTER_API_KEY")
+    online = bpy.context.preferences.system.use_online_access
+    grid_calls: list = []
+    batch_calls: list = []
+    part_colors = {"PART_00": (40, 60, 230), "PART_01": (40, 220, 60)}
+    batch_fails = [False]
+
+    class _PartStubWorker:
+        def __init__(self, arguments, **_kwargs):
+            self.stdin = io.BytesIO()
+            request = json.loads(Path(arguments[-2]).read_text(encoding="utf-8"))
+            if request.get("action") == "turnaround_batch" and batch_fails[0]:
+                batch_calls.append(request["groups"])
+                response = {"ok": False, "error": "스텁 배치 작업자 실패"}
+            elif request.get("action") == "turnaround_batch":
+                batch_calls.append(request["groups"])
+                results = []
+                for group in request["groups"]:
+                    output = Path(group["output_path"])
+                    _three_view_png(bake_module, output, [part_colors[group["name"]]] * 3)
+                    results.append({"name": group["name"], "ok": True, "output_path": str(output)})
+                response = {"ok": True, "groups": results}
+            else:
+                grid_calls.append(request)
+                output = Path(request["output_path"])
+                _three_view_png(bake_module, output, [(230, 50, 40)] * 3)
+                response = {"ok": True, "output_path": str(output)}
+            Path(arguments[-1]).write_text(json.dumps(response), encoding="utf-8")
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    settings = bpy.context.scene.uvmapping_settings
+    saved = {
+        name: getattr(settings, name)
+        for name in (
+            "turnaround_layout",
+            "generation_mode",
+            "texture_resolution",
+            "padding_pixels",
+            "auto_apply_diffuse",
+            "verify_after_bake",
+            "auto_regenerate_attempts",
+            "part_mapping",
+            "texture_user_prompt",
+        )
+    }
+    texture_module.subprocess.Popen = _PartStubWorker
+    os.environ["OPENROUTER_API_KEY"] = "stub-key"
+    bpy.context.preferences.system.use_online_access = True
+    created_paths: list[Path] = []
+    try:
+        figure, arm_faces = _build_body_with_arm(part_module)
+        settings.target_objects.clear()
+        settings.reference_images.clear()
+        settings.turnaround_layout = "THREE"
+        settings.generation_mode = "SINGLE"
+        settings.texture_resolution = "256"
+        settings.padding_pixels = 2
+        settings.auto_apply_diffuse = True
+        settings.verify_after_bake = False
+        settings.auto_regenerate_attempts = 0
+        settings.texture_user_prompt = "파츠별 매핑 검사"
+        settings.part_mapping = True
+        bpy.ops.object.select_all(action="DESELECT")
+        figure.select_set(True)
+        bpy.context.view_layer.objects.active = figure
+
+        # 패널: 파츠별 매핑 설정과 추가 호출 수가 보인다.
+        record = _draw_panel(ui_module, ui_module.UVMAPPING_PT_mapping_parts)
+        assert "part_mapping" in record["props"] and "part_blend_percent" in record["props"], record["props"]
+        assert any("파츠 최대 2개" in label for label in record["labels"]), record["labels"]
+        main_record = _draw_panel(ui_module)
+        assert any("파츠 최대 2회" in label for label in main_record["labels"]), main_record["labels"]
+
+        assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+        for _attempt in range(6):
+            if not texture_module._ACTIVE_RUNS:
+                break
+            texture_module._ACTIVE_RUNS[0].poll_process()
+        assert not texture_module._ACTIVE_RUNS, settings.texture_status
+        assert len(grid_calls) == 1, len(grid_calls)
+        assert len(batch_calls) == 1, "파츠는 한 배치로 동시에 요청한다"
+        groups = batch_calls[0]
+        assert [group["name"] for group in groups] == ["PART_00", "PART_01"]
+        assert "대상 부위: torso" in groups[0]["prompt"], groups[0]["prompt"][:200]
+        assert "대상 부위: left arm" in groups[1]["prompt"]
+        assert all(group["aspect_ratio"] == "21:9" for group in groups)
+
+        state = json.loads(figure[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert state["status"] == "ALBEDO_APPLIED", (state["status"], settings.texture_status)
+        passes = state["part_passes"]
+        assert [item["key"] for item in passes] == ["TORSO", "ARM_L"], passes
+        assert state["part_pass_failures"] == []
+        for item in passes:
+            assert set(item["views"]) == {"front", "right", "back"}, item["views"]
+            assert all(Path(path).is_file() for path in item["views"].values())
+            created_paths.extend(Path(path) for path in item["views"].values())
+            created_paths.extend((Path(item["image_path"]), Path(item["guide_path"])))
+        stats = state["bake_stats"]["part_passes"]
+        assert [item["applied"] for item in stats] == [True, True], stats
+        assert all(item["composited_pixels"] > 0 for item in stats), stats
+        assert "파츠별 매핑 2개 완료" in settings.texture_status, settings.texture_status
+
+        # 몸통 가이드: 팔을 숨기고 몸통만 렌더한다. 정면 가운데는 팔이 있던 자리인데,
+        # 팔이 보이면(빨강) 실패고, 전신 정면에서 가려졌던 면이므로 회색이어야 한다.
+        layout = texture_module.resolve_layout("THREE")
+        guide_pixels, guide_width, guide_height = bake_module.load_image_pixels(
+            passes[0]["guide_path"], linearize=False
+        )
+        left, bottom, right, top = layout.grid_cell_bounds(guide_width, guide_height, 0)
+        center = (((bottom + top) // 2) * guide_width + (left + right) // 2) * 4
+        red, green, blue = guide_pixels[center : center + 3]
+        assert abs(red - green) < 0.05 and abs(green - blue) < 0.05, (red, green, blue)
+        assert 0.3 < red < 0.8, "회색(미채색) 표시가 보여야 한다"
+        # 팔 가이드: 팔 정면은 전신 정면에서 보였으므로 빨강으로 칠해져 있다.
+        arm_pixels, arm_width, arm_height = bake_module.load_image_pixels(passes[1]["guide_path"], linearize=False)
+        left, bottom, right, top = layout.grid_cell_bounds(arm_width, arm_height, 0)
+        center = (((bottom + top) // 2) * arm_width + (left + right) // 2) * 4
+        assert arm_pixels[center] > arm_pixels[center + 1] + 0.3, tuple(arm_pixels[center : center + 3])
+
+        # 최종 Atlas: 몸통 면은 몸통 파츠 색(파랑), 팔 면은 팔 파츠 색(초록).
+        diffuse = Path(state["albedo_path"])
+        created_paths.extend((diffuse, Path(state["turnaround_path"]), Path(state["geometry_contact_sheet"])))
+        created_paths.extend(Path(path) for path in state["views"].values())
+        pixels, width, height = bake_module.load_image_pixels(diffuse)
+        uv_name = figure.data.uv_layers.active.name
+        body_front = next(
+            polygon.index
+            for polygon in figure.data.polygons
+            if polygon.index not in arm_faces and polygon.normal.y < -0.9
+        )
+        arm_front = next(
+            polygon.index for polygon in figure.data.polygons if polygon.index in arm_faces and polygon.normal.y < -0.9
+        )
+        body_color = _face_color(pixels, width, height, figure.data, uv_name, body_front)
+        arm_color = _face_color(pixels, width, height, figure.data, uv_name, arm_front)
+        assert body_color[2] > body_color[0] and body_color[2] > body_color[1], body_color
+        assert arm_color[1] > arm_color[0] and arm_color[1] > arm_color[2], arm_color
+
+        # 생성 뒤 파츠 면을 바꾸면 그 파츠는 전신 결과로 두고 경고한다(적용은 막지 않는다).
+        figure.data.uvmapping_parts.active_index = 1
+        _select_faces(figure, set(arm_faces) - {arm_front})
+        assert bpy.ops.uvmapping.assign_mapping_part(mode="REPLACE", exclusive=False) == {"FINISHED"}
+        assert bpy.ops.uvmapping.bake_diffuse() == {"FINISHED"}, settings.texture_status
+        assert "생성 뒤 파츠 면이 바뀌어" in settings.texture_status, settings.texture_status
+        reapplied = json.loads(figure[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert [item["label"] for item in reapplied["bake_stats"]["part_passes"]] == ["몸통"]
+        pixels, width, height = bake_module.load_image_pixels(diffuse)
+        arm_color = _face_color(pixels, width, height, figure.data, uv_name, arm_front)
+        assert arm_color[0] > arm_color[1] and arm_color[0] > arm_color[2], arm_color
+
+        # 파츠 배치 작업자가 통째로 실패해도 전신 결과는 자동 적용되고 임시 파일이 남지 않는다.
+        batch_fails[0] = True
+        assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
+        for _attempt in range(6):
+            if not texture_module._ACTIVE_RUNS:
+                break
+            texture_module._ACTIVE_RUNS[0].poll_process()
+        assert not texture_module._ACTIVE_RUNS
+        assert len(batch_calls) == 2
+        failed_state = json.loads(figure[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert failed_state["status"] == "ALBEDO_APPLIED", failed_state["status"]
+        assert not failed_state.get("part_passes"), failed_state.get("part_passes")
+        assert "전신 결과만 적용" in settings.texture_status, settings.texture_status
+        assert "스텁 배치 작업자 실패" in settings.texture_last_error
+        stem = Path(failed_state["turnaround_path"])
+        assert not stem.with_name(f"{stem.stem}_parts_base.png").exists()
+        created_paths.extend(stem.parent.glob(f"{stem.stem}*"))
+        created_paths.append(Path(failed_state["albedo_path"]))
+    finally:
+        texture_module.subprocess.Popen = original_popen
+        if original_key is None:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        else:
+            os.environ["OPENROUTER_API_KEY"] = original_key
+        bpy.context.preferences.system.use_online_access = online
+        for name, value in saved.items():
+            setattr(settings, name, value)
+        for path in created_paths:
+            path.unlink(missing_ok=True)
+        _clear_scene()
+    print("[texture] 파츠별 매핑(파츠 가이드·배치 요청·합성 베이크·변경 감지) 통과")
 
 
 def _check_panel_draw(ui_module, settings) -> None:
@@ -1968,12 +2467,15 @@ def main() -> None:
 
     ui_module = importlib.import_module(f"{MODULE_NAME}.uvmapping.ui")
     _check_panel_draw(ui_module, settings)
+    _check_mapping_parts(ui_module)
 
     _check_full_pipeline(texture_module, bake_module, ui_module)
+    _check_part_mapping_pipeline(texture_module, bake_module, ui_module)
 
     _clear_scene()
     addon.unregister()
     assert not _operator_registered(), "등록 해제 뒤 AI 연산자가 남아 있습니다."
+    assert not hasattr(bpy.types.Mesh, "uvmapping_parts"), "등록 해제 뒤 Mesh 파츠 속성이 남아 있습니다."
     print("[texture] 등록, 모델 3면 캡처, contact sheet, 로컬 3분할, 별도 작업자 검사 통과")
 
 

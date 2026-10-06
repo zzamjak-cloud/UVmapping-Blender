@@ -135,6 +135,9 @@ class BakeTriangle:
     uvs: tuple[Vec2, Vec2, Vec2]
     normal: Vec3
     vertex_normals: tuple[Vec3, Vec3, Vec3] | None = None
+    # 파츠별 매핑에서 코너마다의 합성 가중치(0~1). 파츠 경계에서 0, 경계에서 혼합 폭
+    # 이상 떨어지면 1이다. None이면 삼각형 전체를 1로 본다.
+    blend_weights: tuple[float, float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -2304,6 +2307,63 @@ def _estimate_view_gains(
     return gains, pair_counts
 
 
+def boundary_blend_weight(distance: float, feather: float) -> float:
+    """파츠 경계에서의 거리로 파츠 결과의 합성 가중치(0~1)를 정한다.
+
+    경계(거리 0)에서는 전신 결과를 그대로 쓰고, 혼합 폭 이상 떨어지면 파츠 결과만
+    쓴다. 그 사이는 smoothstep으로 이어 경계에 띠가 보이지 않게 한다.
+    """
+
+    if feather <= 0.0:
+        return 1.0
+    t = min(1.0, max(0.0, distance / feather))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def composite_part_layer(base: bytearray, layer: bytes | bytearray, coverage: Sequence[int]) -> int:
+    """파츠 결과를 전신 Atlas 위에 가중치대로 합성하고 바뀐 픽셀 수를 돌려준다.
+
+    ``coverage``가 0인 픽셀은 건드리지 않는다. 두 버퍼는 같은 크기의 sRGB RGBA 바이트다.
+    """
+
+    pixel_count = len(coverage)
+    if len(base) != pixel_count * 4 or len(layer) != pixel_count * 4:
+        raise ValueError("합성할 Atlas 버퍼 크기가 서로 다릅니다.")
+    try:
+        import numpy as np  # type: ignore
+    except ImportError:  # Blender에는 numpy가 포함된다. 순수 테스트 환경만 이 경로를 쓴다.
+        np = None
+    if np is not None:
+        # 4096² Atlas에서 파츠마다 1,600만 번 도는 파이썬 루프를 피한다.
+        weights = np.frombuffer(bytes(coverage), dtype=np.uint8).astype(np.float32) / 255.0
+        target = np.frombuffer(base, dtype=np.uint8).reshape(-1, 4)
+        source = np.frombuffer(bytes(layer), dtype=np.uint8).reshape(-1, 4)
+        selected = weights > 0.0
+        alpha = weights[selected][:, None]
+        mixed = target[selected, :3].astype(np.float32) * (1.0 - alpha) + source[selected, :3].astype(np.float32) * alpha
+        blended = target.copy()
+        blended[selected, :3] = np.rint(mixed).astype(np.uint8)
+        blended[selected, 3] = 255
+        base[:] = blended.tobytes()
+        return int(selected.sum())
+    changed = 0
+    for index, weight in enumerate(coverage):
+        if not weight:
+            continue
+        offset = index * 4
+        if weight >= 255:
+            base[offset : offset + 3] = layer[offset : offset + 3]
+        else:
+            alpha = weight / 255.0
+            for channel in range(3):
+                base[offset + channel] = int(
+                    round(base[offset + channel] * (1.0 - alpha) + layer[offset + channel] * alpha)
+                )
+        base[offset + 3] = 255
+        changed += 1
+    return changed
+
+
 def rasterize_atlas(
     triangles: Sequence[BakeTriangle],
     sources: Mapping[str, RasterSource],
@@ -2320,6 +2380,8 @@ def rasterize_atlas(
     unpainted_color: tuple[float, float, float] | None = None,
     require_all_sources: bool = True,
     allow_view_substitution: bool = True,
+    occlusion_fallback: bool = True,
+    coverage: bytearray | None = None,
 ) -> tuple[bytearray, dict]:
     """삼각형을 UV 공간에 래스터화하고 생성 뷰 색을 투영한다.
 
@@ -2334,10 +2396,17 @@ def rasterize_atlas(
     입사각 차가 ``transition_band_degrees`` 밖인 시점은 합성에서 빼 이중상을 막는다.
     끄면 이 전이 띠 필터만 사라진다. 실루엣 밖 확장 표본의 신뢰도 감쇠는 끄고
     켤 수 없고 언제나 적용되므로, 끈 결과가 이 기능 도입 전과 같지는 않다.
+    ``occlusion_fallback``을 끄면 모든 시점에서 가려진 면을 가린 표본으로 메우지
+    않고 ``unpainted_color``(없으면 평균색)로 남긴다. 파츠별 매핑 가이드가 "다른
+    부위에 가려 보이지 않던 곳"을 회색으로 드러내야 하기 때문이다.
+    ``coverage``를 주면 칠한 픽셀마다 합성 가중치(0~255, 삼각형의 ``blend_weights``
+    보간값, 없으면 255)를 기록한다. 칠하지 않은 픽셀은 그대로 둔다.
     """
 
     if not triangles:
         raise ValueError("Atlas에 투영할 삼각형이 없습니다.")
+    if coverage is not None and len(coverage) != resolution * resolution:
+        raise ValueError("coverage 버퍼 크기가 Atlas 해상도와 다릅니다.")
     if resolution < 16 or resolution > MAX_ATLAS_RESOLUTION:
         raise ValueError(
             f"텍스처 해상도는 16~{MAX_ATLAS_RESOLUTION}px만 지원합니다. "
@@ -2543,7 +2612,7 @@ def rasterize_atlas(
                         unpainted_pixels += 1
                     colors.append((unpainted_rgba, marker_weight, 1.0))
                     total_weight += marker_weight
-                if total_weight < 1.0e-4 and occluded_views:
+                if total_weight < 1.0e-4 and occluded_views and occlusion_fallback:
                     # 다리 안쪽처럼 모든 시점에서 가려진 면은 전체 평균색을 칠하면
                     # 텍스처가 빠진 것처럼 보인다. 가림을 무시하고 같은 시점의 같은
                     # 좌표를 다시 읽어 주변과 이어지는 색을 쓴다. 가중치가 사실상 0인
@@ -2613,6 +2682,13 @@ def rasterize_atlas(
                 rgba[offset + 3] = 255
                 occupied[pixel_index] = 1
                 filled_pixels += 1
+                if coverage is not None:
+                    blend = triangle.blend_weights
+                    if blend is None:
+                        coverage[pixel_index] = 255
+                    else:
+                        mixed = w0 * blend[0] + w1 * blend[1] + w2 * blend[2]
+                        coverage[pixel_index] = int(round(255.0 * min(1.0, max(0.0, mixed))))
 
     if filled_pixels == 0:
         raise ValueError("UV가 0~1 Atlas 영역에 없어 텍스처를 만들 수 없습니다.")
@@ -2748,7 +2824,73 @@ def _generated_topology(original, evaluated) -> bool:
     )
 
 
-def _collect_blender_triangles(context, objects: Sequence, uv_layer_names) -> tuple[list[BakeTriangle], Vec3, float]:
+def _evaluated_face_mask(mesh, attribute_names: Sequence[str]) -> list[bool]:
+    """평가 Mesh에서 면 BOOLEAN 속성들의 합집합. 없는 속성은 무시한다."""
+
+    count = len(mesh.polygons)
+    mask = [False] * count
+    for name in attribute_names:
+        attribute = mesh.attributes.get(name)
+        if attribute is None or attribute.domain != "FACE" or attribute.data_type != "BOOLEAN":
+            continue
+        if len(attribute.data) != count:
+            continue
+        values = [False] * count
+        attribute.data.foreach_get("value", values)
+        mask = [left or right for left, right in zip(mask, values)]
+    return mask
+
+
+def _boundary_vertex_weights(mesh, matrix, face_mask: Sequence[bool], feather: float) -> dict[int, float]:
+    """파츠 면에 속한 정점마다 파츠 경계까지의 거리로 합성 가중치를 정한다.
+
+    경계 정점은 파츠 면과 파츠 밖 면이 함께 쓰는 정점이다. 파츠가 객체 전체이거나
+    다른 객체로 분리돼 있으면 경계가 없어 모든 가중치가 1이다.
+
+    혼합 폭은 모델 크기 기준이라 눈·벨트처럼 좁은 파츠에서는 내부가 전부 혼합 띠에
+    들어가 파츠 결과가 버려진다. 그래서 파츠 안에서 경계까지 가장 먼 거리의 절반을
+    상한으로 두고, 면 한 줄 링처럼 내부가 없는 파츠는 혼합 없이 파츠 결과를 쓴다.
+    """
+
+    inside: set[int] = set()
+    outside: set[int] = set()
+    for polygon, selected in zip(mesh.polygons, face_mask):
+        (inside if selected else outside).update(polygon.vertices)
+    boundary = inside & outside
+    if feather <= 0.0 or not boundary:
+        return {index: 1.0 for index in inside}
+    from mathutils.kdtree import KDTree  # type: ignore
+
+    tree = KDTree(len(boundary))
+    for order, index in enumerate(boundary):
+        tree.insert(matrix @ mesh.vertices[index].co, order)
+    tree.balance()
+    distances = {}
+    for index in inside:
+        _co, _order, distance = tree.find(matrix @ mesh.vertices[index].co)
+        distances[index] = float(distance)
+    effective = min(feather, 0.5 * max(distances.values(), default=0.0))
+    if effective <= 1.0e-9:
+        return {index: 1.0 for index in inside}
+    return {index: boundary_blend_weight(distance, effective) for index, distance in distances.items()}
+
+
+def _collect_blender_triangles(
+    context,
+    objects: Sequence,
+    uv_layer_names,
+    *,
+    part_members: Mapping[str, Sequence[str]] | None = None,
+    feather_distance: float = 0.0,
+) -> tuple[list[BakeTriangle], Vec3, float]:
+    """평가 Mesh 삼각형과 투영 중심·축척을 모은다.
+
+    ``part_members``(객체 이름 → 면 속성 이름 목록)를 주면 그 속성이 켜진 면만 모으고,
+    중심·축척도 그 면들의 범위로 정한다. 파츠별 매핑이 다른 부위를 숨긴 채 파츠만
+    화면에 꽉 차게 투영하기 위해서다. ``feather_distance``가 양수면 파츠 경계에서의
+    거리로 코너별 ``blend_weights``를 채운다.
+    """
+
     depsgraph = context.evaluated_depsgraph_get()
     selected = set(objects)
     selected_mesh_owners = {}
@@ -2777,11 +2919,17 @@ def _collect_blender_triangles(context, objects: Sequence, uv_layer_names) -> tu
     for object_index, obj in enumerate(objects):
         if obj.mode != "OBJECT":
             raise ValueError(f"{obj.name}: Object Mode에서 텍스처를 적용해 주세요.")
+        part_attributes = None
+        if part_members is not None:
+            part_attributes = tuple(part_members.get(obj.name, ()))
+            if not part_attributes:
+                continue
         evaluated_object = obj.evaluated_get(depsgraph)
-        bounds_points.extend(
-            tuple(evaluated_object.matrix_world @ Vector(corner))
-            for corner in evaluated_object.bound_box
-        )
+        if part_attributes is None:
+            bounds_points.extend(
+                tuple(evaluated_object.matrix_world @ Vector(corner))
+                for corner in evaluated_object.bound_box
+            )
         evaluated_mesh = evaluated_object.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
         try:
             # Subsurf, Mirror, Bevel처럼 topology를 바꾸는 Modifier도 평가 Mesh의
@@ -2801,10 +2949,20 @@ def _collect_blender_triangles(context, objects: Sequence, uv_layer_names) -> tu
             evaluated_mesh.calc_loop_triangles()
             matrix = evaluated_object.matrix_world
             normal_matrix = matrix.to_3x3().inverted_safe().transposed()
+            face_mask = None
+            vertex_weights = None
+            if part_attributes is not None:
+                face_mask = _evaluated_face_mask(evaluated_mesh, part_attributes)
+                if feather_distance > 0.0:
+                    vertex_weights = _boundary_vertex_weights(
+                        evaluated_mesh, matrix, face_mask, feather_distance
+                    )
             # 코너 법선은 Smooth/Auto Smooth 결과를 담고 있어, 픽셀 단위로
             # 보간하면 로우폴리에서도 뷰 전이가 면 경계에서 끊기지 않는다.
             corner_normals = getattr(evaluated_mesh, "corner_normals", None)
             for loop_triangle in evaluated_mesh.loop_triangles:
+                if face_mask is not None and not face_mask[loop_triangle.polygon_index]:
+                    continue
                 polygon = evaluated_mesh.polygons[loop_triangle.polygon_index]
                 normal_vector = (normal_matrix @ polygon.normal).normalized()
                 positions = tuple(
@@ -2818,12 +2976,20 @@ def _collect_blender_triangles(context, objects: Sequence, uv_layer_names) -> tu
                         tuple((normal_matrix @ corner_normals[loop_index].vector).normalized())
                         for loop_index in loop_triangle.loops
                     )
+                blend_weights = None
+                if vertex_weights is not None:
+                    blend_weights = tuple(
+                        vertex_weights.get(vertex_index, 1.0) for vertex_index in loop_triangle.vertices
+                    )
+                if part_attributes is not None:
+                    bounds_points.extend(positions)
                 triangles.append(
                     BakeTriangle(
                         positions=positions,  # type: ignore[arg-type]
                         uvs=uvs,  # type: ignore[arg-type]
                         normal=tuple(normal_vector),
                         vertex_normals=vertex_normals,  # type: ignore[arg-type]
+                        blend_weights=blend_weights,  # type: ignore[arg-type]
                     )
                 )
         finally:
@@ -2837,6 +3003,31 @@ def _collect_blender_triangles(context, objects: Sequence, uv_layer_names) -> tu
     extent = tuple(maximum[axis] - minimum[axis] for axis in range(3))
     scale = max(extent[0], extent[1], extent[2], 0.01) * 1.2
     return triangles, center, scale  # type: ignore[return-value]
+
+
+def part_projection(context, objects: Sequence, uv_layer_names, part_members: Mapping[str, Sequence[str]]) -> dict:
+    """파츠 면만으로 정한 직교 카메라 계약. 파츠 가이드 렌더와 베이크가 같은 값을 쓴다.
+
+    중심·축척은 :func:`_collect_blender_triangles`의 규칙을 그대로 따른다.
+    """
+
+    if bpy is None:
+        raise RuntimeError("파츠 투영 계약은 Blender 안에서만 계산할 수 있습니다.")
+    triangles, center, scale = _collect_blender_triangles(
+        context, tuple(objects), uv_layer_names, part_members=part_members
+    )
+    points = [point for triangle in triangles for point in triangle.positions]
+    minimum = tuple(min(point[axis] for point in points) for axis in range(3))
+    maximum = tuple(max(point[axis] for point in points) for axis in range(3))
+    extent = tuple(maximum[axis] - minimum[axis] for axis in range(3))
+    length = math.sqrt(sum(value * value for value in extent))
+    return {
+        "center": tuple(float(value) for value in center),
+        "extent": tuple(float(value) for value in extent),
+        "ortho_scale": float(scale),
+        "camera_distance": float(max(length, 1.0) * 2.0),
+        "triangle_count": len(triangles),
+    }
 
 
 def _load_raster_sources(paths: Mapping[str, Path]) -> tuple[dict[str, RasterSource], list]:
@@ -3141,15 +3332,29 @@ def _bake_atlas_png(
     padding: int,
     uv_layer_names,
     raster_kwargs: Mapping[str, object],
+    part_passes: Sequence[Mapping] = (),
+    part_blend_ratio: float = 0.0,
 ) -> tuple[bytes, dict]:
-    """평가 Mesh를 모아 래스터화하고 PNG 바이트와 통계를 돌려준다. Blender 데이터는 바꾸지 않는다."""
+    """평가 Mesh를 모아 래스터화하고 PNG 바이트와 통계를 돌려준다. Blender 데이터는 바꾸지 않는다.
+
+    ``part_passes``가 있으면 전신 결과 위에 파츠별 결과를 차례로 합성한다. 각 항목은
+    ``members``(객체 이름 → 면 속성 이름 목록), ``views``(시점 → 경로), ``label``을
+    담는다. 파츠마다 그 파츠 면만으로 깊이 버퍼를 만들어 다른 부위의 가림 없이
+    투영하고, 파츠 경계에서 ``part_blend_ratio``×모델 축척 거리 안쪽은 전신 결과와 섞는다.
+    """
 
     triangles, center, scale = _collect_blender_triangles(context, targets, uv_layer_names)
     outside_atlas = sum(1 for triangle in triangles if _outside_atlas(triangle))
     sources, loaded_images = _load_raster_sources(paths)
     try:
         rgba, metrics = rasterize_atlas(
-            triangles, sources, resolution, padding, center, scale, **raster_kwargs
+            triangles,
+            sources,
+            resolution,
+            0 if part_passes else padding,
+            center,
+            scale,
+            **raster_kwargs,
         )
     finally:
         for loaded_image in loaded_images:
@@ -3163,7 +3368,96 @@ def _bake_atlas_png(
         "triangle_count": len(triangles),
         **metrics,
     }
+    if part_passes:
+        metrics["part_passes"] = _composite_part_passes(
+            context,
+            targets,
+            uv_layer_names,
+            rgba,
+            resolution,
+            part_passes,
+            feather_distance=max(0.0, float(part_blend_ratio)) * scale,
+            raster_kwargs=raster_kwargs,
+        )
+        # 전신 결과는 패딩 없이 구웠으므로 합성을 마친 뒤 한 번만 경계색을 확장한다.
+        occupied = bytearray(rgba[3::4])
+        metrics["dilated_pixels"] = dilate_rgba(rgba, occupied, resolution, resolution, padding)
     return encode_srgb_png(rgba, resolution, resolution), metrics
+
+
+def _composite_part_passes(
+    context,
+    targets: tuple,
+    uv_layer_names,
+    rgba: bytearray,
+    resolution: int,
+    part_passes: Sequence[Mapping],
+    *,
+    feather_distance: float,
+    raster_kwargs: Mapping[str, object],
+) -> list[dict]:
+    """파츠별 결과를 ``rgba`` 위에 합성하고 파츠마다의 통계를 돌려준다.
+
+    파츠 하나가 실패해도(면이 사라졌거나 그림을 읽지 못함) 나머지 파츠와 전신 결과는
+    지킨다. 실패한 파츠는 통계에 사유를 남긴다.
+    """
+
+    part_kwargs = dict(raster_kwargs)
+    # 파츠 그림은 모든 면을 실제로 칠했으므로 미채색 표시나 부분 소스 허용이 필요 없다.
+    part_kwargs.update(unpainted_color=None, require_all_sources=True, allow_view_substitution=True)
+    results: list[dict] = []
+    for part in part_passes:
+        label = str(part.get("label", ""))
+        members = {str(name): tuple(attrs) for name, attrs in dict(part.get("members", {})).items()}
+        try:
+            part_paths = _resolve_view_paths(dict(part.get("views", {})), require_all=True)
+            part_triangles, part_center, part_scale = _collect_blender_triangles(
+                context,
+                targets,
+                uv_layer_names,
+                part_members=members,
+                feather_distance=feather_distance,
+            )
+        except ValueError as exc:
+            results.append({"label": label, "applied": False, "error": str(exc)})
+            continue
+        try:
+            part_sources, part_images = _load_raster_sources(part_paths)
+        except (OSError, RuntimeError, ValueError) as exc:
+            results.append({"label": label, "applied": False, "error": str(exc)})
+            continue
+        coverage = bytearray(resolution * resolution)
+        try:
+            layer, layer_metrics = rasterize_atlas(
+                part_triangles,
+                part_sources,
+                resolution,
+                0,
+                part_center,
+                part_scale,
+                coverage=coverage,
+                **part_kwargs,
+            )
+        except ValueError as exc:
+            results.append({"label": label, "applied": False, "error": str(exc)})
+            continue
+        finally:
+            for loaded_image in part_images:
+                if loaded_image.name in bpy.data.images:
+                    bpy.data.images.remove(loaded_image)
+        changed = composite_part_layer(rgba, layer, coverage)
+        results.append(
+            {
+                "label": label,
+                "applied": True,
+                "triangle_count": len(part_triangles),
+                "composited_pixels": changed,
+                "full_weight_pixels": coverage.count(255),
+                "filled_pixels": layer_metrics.get("filled_pixels", 0),
+                "occluded_fallback_pixels": layer_metrics.get("occluded_fallback_pixels", 0),
+            }
+        )
+    return results
 
 
 def _write_atomically(destination: Path, data: bytes) -> None:
@@ -3192,6 +3486,9 @@ def rasterize_to_png(
     unpainted_color: tuple[float, float, float] | None = None,
     require_all_sources: bool = True,
     allow_view_substitution: bool = True,
+    occlusion_fallback: bool = True,
+    part_passes: Sequence[Mapping] = (),
+    part_blend_ratio: float = 0.0,
 ) -> dict:
     """Atlas를 PNG 파일로만 굽는다. 이미지·머티리얼 데이터블록은 만들지도 바꾸지도 않는다.
 
@@ -3218,7 +3515,10 @@ def rasterize_to_png(
             "unpainted_color": unpainted_color,
             "require_all_sources": require_all_sources,
             "allow_view_substitution": allow_view_substitution,
+            "occlusion_fallback": occlusion_fallback,
         },
+        part_passes=part_passes,
+        part_blend_ratio=part_blend_ratio,
     )
     _write_atomically(destination, png)
     return {"status": "ATLAS_WRITTEN", "output_path": str(destination), **metrics}
@@ -3274,6 +3574,9 @@ def bake_diffuse(
     unpainted_color: tuple[float, float, float] | None = None,
     require_all_sources: bool = True,
     allow_view_substitution: bool = True,
+    occlusion_fallback: bool = True,
+    part_passes: Sequence[Mapping] = (),
+    part_blend_ratio: float = 0.0,
 ) -> dict:
     """생성 뷰(FRONT/RIGHT/BACK 필수, LEFT/TOP/BOTTOM 선택)를 공유 UV Atlas에 굽고 재질에 연결한다.
 
@@ -3301,7 +3604,10 @@ def bake_diffuse(
             "unpainted_color": unpainted_color,
             "require_all_sources": require_all_sources,
             "allow_view_substitution": allow_view_substitution,
+            "occlusion_fallback": occlusion_fallback,
         },
+        part_passes=part_passes,
+        part_blend_ratio=part_blend_ratio,
     )
     backup_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.bak")
     image = None
@@ -3408,6 +3714,9 @@ __all__ = (
     "align_silhouette",
     "bake_diffuse",
     "barycentric_weights",
+    "boundary_blend_weight",
+    "composite_part_layer",
+    "part_projection",
     "bilinear_sample",
     "build_depth_buffer",
     "build_model_mask",
