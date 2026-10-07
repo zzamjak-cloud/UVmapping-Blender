@@ -60,6 +60,7 @@ VIEW_SPECS: dict[str, ViewSpec] = {
     "BOTTOM": ViewSpec("BOTTOM", (1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0)),
 }
 VIEW_NAMES = tuple(VIEW_SPECS)
+_VIEW_INDEX = {name: index for index, name in enumerate(VIEW_NAMES)}
 # 생성 이미지가 반드시 있어야 하는 뷰. 나머지는 있으면 쓰고 없으면 대체한다.
 REQUIRED_SOURCE_VIEW_NAMES = ("FRONT", "RIGHT", "BACK")
 SOURCE_VIEW_NAMES = REQUIRED_SOURCE_VIEW_NAMES
@@ -135,9 +136,11 @@ class BakeTriangle:
     uvs: tuple[Vec2, Vec2, Vec2]
     normal: Vec3
     vertex_normals: tuple[Vec3, Vec3, Vec3] | None = None
-    # 파츠별 매핑에서 코너마다의 합성 가중치(0~1). 파츠 경계에서 0, 경계에서 혼합 폭
-    # 이상 떨어지면 1이다. None이면 삼각형 전체를 1로 본다.
-    blend_weights: tuple[float, float, float] | None = None
+    # 분해도 생성에서 시점별 화면 평면 이동량(월드 단위, (right, up)). VIEW_NAMES 순서다.
+    # 가이드 렌더가 파츠를 시점마다 옮겨 그린 만큼 투영도 같이 옮긴다. None이면 이동 없음.
+    view_shifts: tuple[tuple[float, float], ...] | None = None
+    # 시점 간 높이 맞춤에 쓰는 파츠 묶음 번호. -1이면 맞추지 않는다.
+    group: int = -1
 
 
 @dataclass(frozen=True)
@@ -308,6 +311,11 @@ def bilinear_sample(
         top = channel(x0, y1, channel_index) * (1.0 - tx) + channel(x1, y1, channel_index) * tx
         result.append(bottom * (1.0 - ty) + top * ty)
     return tuple(result)  # type: ignore[return-value]
+
+
+# 본체에서 멀리 떨어져 있어도 피사체로 합칠 조각의 최소 면적(본체 대비). 글자 라벨은
+# 이보다 훨씬 작고, 분해도의 팔·다리 조각은 이보다 크다.
+_DISTANT_COMPONENT_MIN_RATIO = 0.05
 
 
 def detect_foreground_bbox(
@@ -535,7 +543,13 @@ def detect_foreground_bbox(
         area_ratio = area / max(1, main_area)
         # 작은 손·장식은 본체 바로 곁에 있을 때 유지하고, 검·방패처럼 큰
         # 분리 부품은 조금 더 떨어져 있어도 포함한다. 멀리 놓인 글자는 제외된다.
-        if (area_ratio >= 0.001 and gap <= close_gap) or (area_ratio >= 0.02 and gap <= accessory_gap):
+        # 분해도·부위 단독 가이드의 양팔처럼 본체 못지않게 큰 조각은 멀리 있어도
+        # 피사체다. 이를 빼면 실루엣 정합이 한쪽 팔에만 맞춰져 다른 팔이 깨진다.
+        if (
+            (area_ratio >= 0.001 and gap <= close_gap)
+            or (area_ratio >= 0.02 and gap <= accessory_gap)
+            or area_ratio >= _DISTANT_COMPONENT_MIN_RATIO
+        ):
             left = min(left, candidate_left)
             bottom = min(bottom, candidate_bottom)
             right = max(right, candidate_right)
@@ -645,8 +659,31 @@ def _srgb_to_linear(value: float) -> float:
 srgb_to_linear = _srgb_to_linear
 
 
+def _view_shift(triangle: BakeTriangle, view: str) -> tuple[float, float]:
+    """삼각형이 그 시점에서 화면 평면으로 옮겨진 양(월드 단위)."""
+
+    shifts = triangle.view_shifts
+    if shifts is None:
+        return 0.0, 0.0
+    return shifts[_VIEW_INDEX[view]]
+
+
+def _project_on_view(
+    point: Vec3, triangle: BakeTriangle, view: str, center: Vec3, scale: float
+) -> tuple[float, float, float]:
+    """삼각형의 분해도 이동을 반영한 투영. 이동은 화면 평면 안이라 depth는 그대로다."""
+
+    u, v, depth = project_point(point, view, center, scale)
+    shift_right, shift_up = _view_shift(triangle, view)
+    return u + shift_right / scale, v + shift_up / scale, depth
+
+
 def _projected_bbox(triangles: Sequence[BakeTriangle], view: str, center: Vec3, scale: float) -> tuple[float, float, float, float]:
-    projected = [project_point(point, view, center, scale) for triangle in triangles for point in triangle.positions]
+    projected = [
+        _project_on_view(point, triangle, view, center, scale)
+        for triangle in triangles
+        for point in triangle.positions
+    ]
     minimum_u = min(point[0] for point in projected)
     maximum_u = max(point[0] for point in projected)
     minimum_v = min(point[1] for point in projected)
@@ -676,7 +713,7 @@ def build_depth_buffer(
         raise ValueError("depth buffer 해상도는 0보다 커야 합니다.")
     buffer = array("f", [-math.inf]) * (resolution * resolution)
     for triangle in triangles:
-        projected = tuple(project_point(point, view, center, scale) for point in triangle.positions)
+        projected = tuple(_project_on_view(point, triangle, view, center, scale) for point in triangle.positions)
         screen = tuple((point[0], point[1]) for point in projected)
         bounds = _screen_raster_bounds(screen, resolution, resolution)
         if bounds[0] > bounds[2] or bounds[1] > bounds[3]:
@@ -2276,10 +2313,12 @@ def _estimate_view_gains(
                 if normal[0] * toward[0] + normal[1] * toward[1] + normal[2] * toward[2] < 0.3:
                     continue
                 if front_luminance is None:
-                    front_luminance = interior_sample("FRONT", project_point(position, "FRONT", center, scale))
+                    front_luminance = interior_sample(
+                        "FRONT", _project_on_view(position, triangle, "FRONT", center, scale)
+                    )
                     if front_luminance is None:
                         break
-                other_luminance = interior_sample(view, project_point(position, view, center, scale))
+                other_luminance = interior_sample(view, _project_on_view(position, triangle, view, center, scale))
                 if other_luminance is None:
                     continue
                 pair_counts[("FRONT", view)] = pair_counts.get(("FRONT", view), 0) + 1
@@ -2307,61 +2346,103 @@ def _estimate_view_gains(
     return gains, pair_counts
 
 
-def boundary_blend_weight(distance: float, feather: float) -> float:
-    """파츠 경계에서의 거리로 파츠 결과의 합성 가중치(0~1)를 정한다.
+# 높이 맞춤 표본: 삼각형 안 7점(중심, 꼭짓점 쪽 3점, 변 중점 3점)
+_BAND_SAMPLE_WEIGHTS = (
+    (1 / 3, 1 / 3, 1 / 3),
+    (2 / 3, 1 / 6, 1 / 6),
+    (1 / 6, 2 / 3, 1 / 6),
+    (1 / 6, 1 / 6, 2 / 3),
+    (0.5, 0.5, 0.0),
+    (0.0, 0.5, 0.5),
+    (0.5, 0.0, 0.5),
+)
+# 두 시점이 함께 보는 면으로 칠 최소 코사인(약 70도 이내). 모서리를 도는 45도 면이 들어온다.
+_BAND_SHARED_COSINE = 0.35
 
-    경계(거리 0)에서는 전신 결과를 그대로 쓰고, 혼합 폭 이상 떨어지면 파츠 결과만
-    쓴다. 그 사이는 smoothstep으로 이어 경계에 띠가 보이지 않게 한다.
+
+def _plan_band_shifts(
+    triangles: Sequence[BakeTriangle],
+    sources: Mapping[str, RasterSource],
+    view_sources: Mapping[str, tuple[str, bool]],
+    center: Vec3,
+    scale: float,
+    depth_buffers: Mapping[str, Sequence[float]],
+    depth_resolution: int,
+    depth_tolerance: float,
+    projected_bboxes: Mapping[str, tuple[float, float, float, float]],
+) -> dict[tuple[int, str], float]:
+    """(파츠, 시점)마다 표본을 읽을 높이 보정량(월드 단위).
+
+    이웃한 두 시점이 함께 보는 표면 점에서, 한쪽 그림의 색과 다른 쪽 그림을 위아래로
+    옮겨 읽은 색이 가장 잘 맞는 어긋남을 찾는다. :mod:`band_align` 참고.
     """
 
-    if feather <= 0.0:
-        return 1.0
-    t = min(1.0, max(0.0, distance / feather))
-    return t * t * (3.0 - 2.0 * t)
+    from .band_align import VIEW_PAIRS, best_shift_index, shift_candidates, solve_view_shifts
 
-
-def composite_part_layer(base: bytearray, layer: bytes | bytearray, coverage: Sequence[int]) -> int:
-    """파츠 결과를 전신 Atlas 위에 가중치대로 합성하고 바뀐 픽셀 수를 돌려준다.
-
-    ``coverage``가 0인 픽셀은 건드리지 않는다. 두 버퍼는 같은 크기의 sRGB RGBA 바이트다.
-    """
-
-    pixel_count = len(coverage)
-    if len(base) != pixel_count * 4 or len(layer) != pixel_count * 4:
-        raise ValueError("합성할 Atlas 버퍼 크기가 서로 다릅니다.")
-    try:
-        import numpy as np  # type: ignore
-    except ImportError:  # Blender에는 numpy가 포함된다. 순수 테스트 환경만 이 경로를 쓴다.
-        np = None
-    if np is not None:
-        # 4096² Atlas에서 파츠마다 1,600만 번 도는 파이썬 루프를 피한다.
-        weights = np.frombuffer(bytes(coverage), dtype=np.uint8).astype(np.float32) / 255.0
-        target = np.frombuffer(base, dtype=np.uint8).reshape(-1, 4)
-        source = np.frombuffer(bytes(layer), dtype=np.uint8).reshape(-1, 4)
-        selected = weights > 0.0
-        alpha = weights[selected][:, None]
-        mixed = target[selected, :3].astype(np.float32) * (1.0 - alpha) + source[selected, :3].astype(np.float32) * alpha
-        blended = target.copy()
-        blended[selected, :3] = np.rint(mixed).astype(np.uint8)
-        blended[selected, 3] = 255
-        base[:] = blended.tobytes()
-        return int(selected.sum())
-    changed = 0
-    for index, weight in enumerate(coverage):
-        if not weight:
+    if not any(triangle.group >= 0 for triangle in triangles):
+        return {}
+    heights = [point[2] for triangle in triangles for point in triangle.positions]
+    candidates = shift_candidates(max(heights) - min(heights))
+    offsets = tuple(value / scale for value in candidates)
+    groups = sorted({triangle.group for triangle in triangles if triangle.group >= 0})
+    pair_shifts: dict[int, dict[tuple[str, str], float]] = {group: {} for group in groups}
+    for first, second in VIEW_PAIRS:
+        if first not in view_sources or second not in view_sources:
             continue
-        offset = index * 4
-        if weight >= 255:
-            base[offset : offset + 3] = layer[offset : offset + 3]
-        else:
-            alpha = weight / 255.0
-            for channel in range(3):
-                base[offset + channel] = int(
-                    round(base[offset + channel] * (1.0 - alpha) + layer[offset + channel] * alpha)
+        first_toward = VIEW_SPECS[first].toward_camera
+        second_toward = VIEW_SPECS[second].toward_camera
+        first_source = sources[view_sources[first][0]]
+        second_source = sources[view_sources[second][0]]
+        reference: dict[int, list] = {group: [] for group in groups}
+        shifted: dict[int, list[list]] = {group: [[] for _ in offsets] for group in groups}
+        for triangle in triangles:
+            if triangle.group < 0:
+                continue
+            normal = triangle.normal
+            if (
+                sum(normal[axis] * first_toward[axis] for axis in range(3)) < _BAND_SHARED_COSINE
+                or sum(normal[axis] * second_toward[axis] for axis in range(3)) < _BAND_SHARED_COSINE
+            ):
+                continue
+            for weights in _BAND_SAMPLE_WEIGHTS:
+                point = tuple(
+                    weights[0] * triangle.positions[0][axis]
+                    + weights[1] * triangle.positions[1][axis]
+                    + weights[2] * triangle.positions[2][axis]
+                    for axis in range(3)
                 )
-        base[offset + 3] = 255
-        changed += 1
-    return changed
+                first_projected = _project_on_view(point, triangle, first, center, scale)
+                second_projected = _project_on_view(point, triangle, second, center, scale)
+                if (
+                    _visibility_weight(first_projected, depth_buffers[first], depth_resolution, depth_tolerance) < 0.99
+                    or _visibility_weight(second_projected, depth_buffers[second], depth_resolution, depth_tolerance)
+                    < 0.99
+                ):
+                    continue
+                expected = _aligned_source_sample(
+                    first_source, first_projected, projected_bboxes[first], mirror_x=view_sources[first][1]
+                )
+                if expected is None or expected[1] < 0.999:
+                    continue
+                reference[triangle.group].append(expected[0])
+                for index, offset in enumerate(offsets):
+                    actual = _aligned_source_sample(
+                        second_source,
+                        (second_projected[0], second_projected[1] + offset, second_projected[2]),
+                        projected_bboxes[second],
+                        mirror_x=view_sources[second][1],
+                    )
+                    shifted[triangle.group][index].append(
+                        actual[0] if actual is not None and actual[1] >= 0.999 else None
+                    )
+        for group in groups:
+            index = best_shift_index(reference[group], shifted[group])
+            pair_shifts[group][(first, second)] = candidates[index]
+    result: dict[tuple[int, str], float] = {}
+    for group, pairs in pair_shifts.items():
+        for view, value in solve_view_shifts(pairs).items():
+            result[(group, view)] = value
+    return result
 
 
 def rasterize_atlas(
@@ -2381,7 +2462,7 @@ def rasterize_atlas(
     require_all_sources: bool = True,
     allow_view_substitution: bool = True,
     occlusion_fallback: bool = True,
-    coverage: bytearray | None = None,
+    align_bands: bool = False,
 ) -> tuple[bytearray, dict]:
     """삼각형을 UV 공간에 래스터화하고 생성 뷰 색을 투영한다.
 
@@ -2397,16 +2478,15 @@ def rasterize_atlas(
     끄면 이 전이 띠 필터만 사라진다. 실루엣 밖 확장 표본의 신뢰도 감쇠는 끄고
     켤 수 없고 언제나 적용되므로, 끈 결과가 이 기능 도입 전과 같지는 않다.
     ``occlusion_fallback``을 끄면 모든 시점에서 가려진 면을 가린 표본으로 메우지
-    않고 ``unpainted_color``(없으면 평균색)로 남긴다. 파츠별 매핑 가이드가 "다른
-    부위에 가려 보이지 않던 곳"을 회색으로 드러내야 하기 때문이다.
-    ``coverage``를 주면 칠한 픽셀마다 합성 가중치(0~255, 삼각형의 ``blend_weights``
-    보간값, 없으면 255)를 기록한다. 칠하지 않은 픽셀은 그대로 둔다.
+    않고 ``unpainted_color``(없으면 평균색)로 남긴다.
+    삼각형에 ``view_shifts``가 있으면 시점마다 그만큼 옮긴 위치로 투영한다(분해도 생성).
+    ``align_bands``가 켜지면 삼각형 ``group``(파츠)마다 측면·뒷면 그림의 높이별 색 분포를
+    정면에 맞춰, 시점마다 다른 높이에 그려진 벨트·띠를 같은 높이에서 읽는다.
+    가림 판정은 실제 형상 그대로 두고 색을 읽는 위치만 옮긴다.
     """
 
     if not triangles:
         raise ValueError("Atlas에 투영할 삼각형이 없습니다.")
-    if coverage is not None and len(coverage) != resolution * resolution:
-        raise ValueError("coverage 버퍼 크기가 Atlas 해상도와 다릅니다.")
     if resolution < 16 or resolution > MAX_ATLAS_RESOLUTION:
         raise ValueError(
             f"텍스처 해상도는 16~{MAX_ATLAS_RESOLUTION}px만 지원합니다. "
@@ -2475,6 +2555,11 @@ def rasterize_atlas(
         )
     else:
         gains = {name: (1.0, 1.0, 1.0) for name in VIEW_NAMES}
+    band_shifts: dict[tuple[int, str], float] = {}
+    if align_bands:
+        band_shifts = _plan_band_shifts(
+            triangles, sources, view_sources, center, scale, depth_buffers, depth_resolution, depth_tolerance, projected_bboxes
+        )
     # 픽셀 루프에서 딕셔너리 조회를 줄이기 위해 뷰별 정보를 튜플로 푼다.
     view_table = tuple(
         (
@@ -2522,6 +2607,15 @@ def rasterize_atlas(
         if bounds[0] > bounds[2] or bounds[1] > bounds[3]:
             continue
         positions = triangle.positions
+        # 분해도 생성이면 시점마다 파츠를 옮긴 만큼 화면 좌표를 민다(정규화 좌표).
+        view_offsets = tuple(
+            (shift[0] * inverse_scale, shift[1] * inverse_scale)
+            for shift in (_view_shift(triangle, entry[0]) for entry in view_table)
+        )
+        # 높이 맞춤: 그 시점 그림에서 이 파츠의 띠가 그려진 높이만큼 위아래로 옮겨 읽는다.
+        band_offsets = tuple(
+            band_shifts.get((triangle.group, entry[0]), 0.0) * inverse_scale for entry in view_table
+        )
         uniform_normal = _uniform_normal(triangle)
         if uniform_normal:
             view_weights, vertical_fallback, view_cosines = _pixel_view_weights(
@@ -2553,14 +2647,16 @@ def rasterize_atlas(
                 occluded_views: list[tuple] = []
                 dominant_weight = 0.0
                 dominant_cosine = 0.0
-                for name, right, up, toward, source, mirror_x, depth_buffer, bbox, gain in view_table:
+                for (name, right, up, toward, source, mirror_x, depth_buffer, bbox, gain), (offset_u, offset_v), band_v in zip(
+                    view_table, view_offsets, band_offsets
+                ):
                     view_weight = view_weights.get(name, 0.0)
                     if view_weight <= 1.0e-8:
                         continue
                     view_cosine = view_cosines.get(name, 0.0)
                     projected = (
-                        0.5 + (px * right[0] + py * right[1] + pz * right[2]) * inverse_scale,
-                        0.5 + (px * up[0] + py * up[1] + pz * up[2]) * inverse_scale,
+                        0.5 + offset_u + (px * right[0] + py * right[1] + pz * right[2]) * inverse_scale,
+                        0.5 + offset_v + (px * up[0] + py * up[1] + pz * up[2]) * inverse_scale,
                         px * toward[0] + py * toward[1] + pz * toward[2],
                     )
                     # 상·하단 대체 표본도 가림을 같은 방식으로 따진다. 여기서만 가림을
@@ -2568,15 +2664,16 @@ def rasterize_atlas(
                     visibility = _visibility_weight(
                         projected, depth_buffer, depth_resolution, depth_tolerance
                     )
+                    sample_point = projected if not band_v else (projected[0], projected[1] + band_v, projected[2])
                     if visibility <= 0.0:
                         occluded_samples += 1
                         occluded_views.append(
-                            (source, projected, bbox, mirror_x, view_weight, gain, vertical_fallback, view_cosine)
+                            (source, sample_point, bbox, mirror_x, view_weight, gain, vertical_fallback, view_cosine)
                         )
                         continue
                     sample = _aligned_source_sample(
                         source,
-                        projected,
+                        sample_point,
                         bbox,
                         mirror_x=mirror_x,
                         vertical_fallback=vertical_fallback,
@@ -2682,13 +2779,6 @@ def rasterize_atlas(
                 rgba[offset + 3] = 255
                 occupied[pixel_index] = 1
                 filled_pixels += 1
-                if coverage is not None:
-                    blend = triangle.blend_weights
-                    if blend is None:
-                        coverage[pixel_index] = 255
-                    else:
-                        mixed = w0 * blend[0] + w1 * blend[1] + w2 * blend[2]
-                        coverage[pixel_index] = int(round(255.0 * min(1.0, max(0.0, mixed))))
 
     if filled_pixels == 0:
         raise ValueError("UV가 0~1 Atlas 영역에 없어 텍스처를 만들 수 없습니다.")
@@ -2704,6 +2794,7 @@ def rasterize_atlas(
         "unpainted_pixels": unpainted_pixels,
         "depth_resolution": depth_resolution,
         "view_gains": {name: [round(value, 4) for value in gains[name]] for name in active_views},
+        "band_alignment": {f"{group}:{view}": round(value, 5) for (group, view), value in sorted(band_shifts.items())},
         "view_alignment": alignment_report,
     }
 
@@ -2824,12 +2915,19 @@ def _generated_topology(original, evaluated) -> bool:
     )
 
 
-def _evaluated_face_mask(mesh, attribute_names: Sequence[str]) -> list[bool]:
-    """평가 Mesh에서 면 BOOLEAN 속성들의 합집합. 없는 속성은 무시한다."""
+def explode_face_groups(mesh, attribute_names: Sequence[str]) -> tuple[list[int], int]:
+    """면마다의 분해도 묶음 번호와 묶음 수.
+
+    파츠 속성 순서대로 먼저 속한 파츠를 따르고, 어느 파츠에도 없는 면(발바닥처럼
+    등록을 빠뜨린 면)은 정점으로 이어진 파츠에 붙인다. 가이드 렌더·배치 계산·베이크가
+    모두 이 함수로 묶어야 같은 면이 같은 만큼 옮겨진다.
+    """
+
+    from .explode_layout import assign_unregistered_faces
 
     count = len(mesh.polygons)
-    mask = [False] * count
-    for name in attribute_names:
+    assignment = [-1] * count
+    for index, name in enumerate(attribute_names):
         attribute = mesh.attributes.get(name)
         if attribute is None or attribute.domain != "FACE" or attribute.data_type != "BOOLEAN":
             continue
@@ -2837,42 +2935,123 @@ def _evaluated_face_mask(mesh, attribute_names: Sequence[str]) -> list[bool]:
             continue
         values = [False] * count
         attribute.data.foreach_get("value", values)
-        mask = [left or right for left, right in zip(mask, values)]
-    return mask
+        for face, selected in enumerate(values):
+            if selected and assignment[face] < 0:
+                assignment[face] = index
+    face_vertices = [tuple(polygon.vertices) for polygon in mesh.polygons]
+    return assign_unregistered_faces(face_vertices, assignment, len(attribute_names))
 
 
-def _boundary_vertex_weights(mesh, matrix, face_mask: Sequence[bool], feather: float) -> dict[int, float]:
-    """파츠 면에 속한 정점마다 파츠 경계까지의 거리로 합성 가중치를 정한다.
+def _assignment_digest(assignment: Sequence[int]) -> str:
+    """면 묶음 배정의 지문. 생성 뒤 파츠 면이 바뀌었는지 비교한다."""
 
-    경계 정점은 파츠 면과 파츠 밖 면이 함께 쓰는 정점이다. 파츠가 객체 전체이거나
-    다른 객체로 분리돼 있으면 경계가 없어 모든 가중치가 1이다.
+    import hashlib
 
-    혼합 폭은 모델 크기 기준이라 눈·벨트처럼 좁은 파츠에서는 내부가 전부 혼합 띠에
-    들어가 파츠 결과가 버려진다. 그래서 파츠 안에서 경계까지 가장 먼 거리의 절반을
-    상한으로 두고, 면 한 줄 링처럼 내부가 없는 파츠는 혼합 없이 파츠 결과를 쓴다.
+    return hashlib.sha256(",".join(str(group) for group in assignment).encode("ascii")).hexdigest()
+
+
+def explode_member_groups(mesh, member: Sequence) -> list[int]:
+    """분해도 계약의 객체 항목(이름, 속성 목록, 묶음 수, 지문)대로 면 묶음을 다시 만든다.
+
+    생성 뒤 파츠 면이나 Mesh가 바뀌어 묶음이 달라지면 옮길 양이 맞지 않으므로 멈춘다.
     """
 
-    inside: set[int] = set()
-    outside: set[int] = set()
-    for polygon, selected in zip(mesh.polygons, face_mask):
-        (inside if selected else outside).update(polygon.vertices)
-    boundary = inside & outside
-    if feather <= 0.0 or not boundary:
-        return {index: 1.0 for index in inside}
-    from mathutils.kdtree import KDTree  # type: ignore
+    name, attributes, count, digest = member
+    assignment, actual = explode_face_groups(mesh, tuple(attributes))
+    if actual != int(count) or _assignment_digest(assignment) != str(digest):
+        raise ValueError(
+            f"{name}: 생성 뒤 매핑 파츠 구성이 바뀌어 분해도 투영을 맞출 수 없습니다. 다시 생성해 주세요."
+        )
+    return assignment
 
-    tree = KDTree(len(boundary))
-    for order, index in enumerate(boundary):
-        tree.insert(matrix @ mesh.vertices[index].co, order)
-    tree.balance()
-    distances = {}
-    for index in inside:
-        _co, _order, distance = tree.find(matrix @ mesh.vertices[index].co)
-        distances[index] = float(distance)
-    effective = min(feather, 0.5 * max(distances.values(), default=0.0))
-    if effective <= 1.0e-9:
-        return {index: 1.0 for index in inside}
-    return {index: boundary_blend_weight(distance, effective) for index, distance in distances.items()}
+
+# 분해도로 벌리는 시점. 위·아래는 높이 축이 없어 벌리면 팔다리 단면 고리만 늘어서고,
+# AI가 그 고리를 머리 등으로 오인해 엉뚱하게 칠한다(실측). 위·아래는 원래 자세로 둔다.
+EXPLODE_VIEW_NAMES = ("FRONT", "RIGHT", "BACK", "LEFT")
+
+
+def plan_explode_for_objects(context, objects: Sequence, part_attributes: Mapping[str, Sequence[str]]) -> dict | None:
+    """등록 파츠가 있는 객체를 시점마다 서로 가리지 않게 벌리는 분해도 계약.
+
+    Args:
+        part_attributes: 객체 이름 → 파츠 면 속성 이름 목록(패널 순서). 없는 객체는
+            나누지 않고 제자리에 둔다.
+
+    Returns:
+        ``{"members": [[객체 이름, 속성 목록, 묶음 수, 배정 지문], ...], "shifts": {시점: [[right, up], ...]}}``.
+        나눌 파츠가 없거나 어느 시점에서도 옮길 것이 없으면 ``None``.
+    """
+
+    if bpy is None:
+        raise RuntimeError("분해도 계약은 Blender 안에서만 계산할 수 있습니다.")
+    from .explode_layout import plan_explode
+
+    depsgraph = context.evaluated_depsgraph_get()
+    members: list[list] = []
+    groups: list[list] = []
+    adjacency: set[tuple[int, int]] = set()
+    for obj in objects:
+        attributes = tuple(part_attributes.get(obj.name, ()))
+        if not attributes:
+            continue
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+        try:
+            assignment, count = explode_face_groups(mesh, attributes)
+            offset = len(groups)
+            groups.extend([] for _ in range(count))
+            matrix = evaluated.matrix_world
+            mesh.calc_loop_triangles()
+            for loop_triangle in mesh.loop_triangles:
+                groups[offset + assignment[loop_triangle.polygon_index]].append(
+                    tuple(tuple(matrix @ mesh.vertices[index].co) for index in loop_triangle.vertices)
+                )
+            owners_by_vertex: dict[int, set[int]] = {}
+            for polygon in mesh.polygons:
+                for vertex in polygon.vertices:
+                    owners_by_vertex.setdefault(vertex, set()).add(offset + assignment[polygon.index])
+            for owners in owners_by_vertex.values():
+                if len(owners) > 1:
+                    adjacency.update((first, second) for first in owners for second in owners if first < second)
+            members.append([obj.name, list(attributes), count, _assignment_digest(assignment)])
+        finally:
+            evaluated.to_mesh_clear()
+    if len(groups) < 2:
+        return None
+    shifts = plan_explode(groups, adjacency, EXPLODE_VIEW_NAMES)
+    if not any(value for view_shifts in shifts.values() for shift in view_shifts for value in shift):
+        return None
+    return {
+        "members": members,
+        "shifts": {
+            view: [[float(right), float(up)] for right, up in view_shifts] for view, view_shifts in shifts.items()
+        },
+    }
+
+
+def explode_object_face_shifts(explode: Mapping, obj_name: str, mesh) -> list[tuple] | None:
+    """객체 면마다의 시점별 이동량(VIEW_NAMES 순서). 분해 대상 객체가 아니면 None."""
+
+    offset = 0
+    for member in explode.get("members", ()):
+        name, _attributes, count, _digest = member
+        if str(name) != obj_name:
+            offset += int(count)
+            continue
+        assignment = explode_member_groups(mesh, member)
+        actual = int(count)
+        shifts_by_view = explode.get("shifts") or {}
+        per_group = [
+            tuple(
+                tuple(float(value) for value in shifts_by_view[view][offset + group])
+                if view in shifts_by_view
+                else (0.0, 0.0)
+                for view in VIEW_NAMES
+            )
+            for group in range(actual)
+        ]
+        return [per_group[group] for group in assignment]
+    return None
 
 
 def _collect_blender_triangles(
@@ -2880,15 +3059,15 @@ def _collect_blender_triangles(
     objects: Sequence,
     uv_layer_names,
     *,
-    part_members: Mapping[str, Sequence[str]] | None = None,
-    feather_distance: float = 0.0,
+    explode: Mapping | None = None,
+    band_groups: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[list[BakeTriangle], Vec3, float]:
     """평가 Mesh 삼각형과 투영 중심·축척을 모은다.
 
-    ``part_members``(객체 이름 → 면 속성 이름 목록)를 주면 그 속성이 켜진 면만 모으고,
-    중심·축척도 그 면들의 범위로 정한다. 파츠별 매핑이 다른 부위를 숨긴 채 파츠만
-    화면에 꽉 차게 투영하기 위해서다. ``feather_distance``가 양수면 파츠 경계에서의
-    거리로 코너별 ``blend_weights``를 채운다.
+    ``explode``(:func:`plan_explode_for_objects` 결과)를 주면 삼각형마다 시점별
+    이동량을 붙이고, 벌린 배치가 화면에 다 들어오도록 축척을 넓힌다.
+    ``band_groups``(객체 이름 → 파츠 면 속성 목록)를 주면 삼각형마다 높이 맞춤용 파츠
+    묶음 번호를 붙인다. 파츠가 없는 객체는 객체 전체를 한 묶음으로 둔다.
     """
 
     depsgraph = context.evaluated_depsgraph_get()
@@ -2916,20 +3095,15 @@ def _collect_blender_triangles(
 
     bounds_points = []
     triangles: list[BakeTriangle] = []
+    group_offset = 0
     for object_index, obj in enumerate(objects):
         if obj.mode != "OBJECT":
             raise ValueError(f"{obj.name}: Object Mode에서 텍스처를 적용해 주세요.")
-        part_attributes = None
-        if part_members is not None:
-            part_attributes = tuple(part_members.get(obj.name, ()))
-            if not part_attributes:
-                continue
         evaluated_object = obj.evaluated_get(depsgraph)
-        if part_attributes is None:
-            bounds_points.extend(
-                tuple(evaluated_object.matrix_world @ Vector(corner))
-                for corner in evaluated_object.bound_box
-            )
+        bounds_points.extend(
+            tuple(evaluated_object.matrix_world @ Vector(corner))
+            for corner in evaluated_object.bound_box
+        )
         evaluated_mesh = evaluated_object.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
         try:
             # Subsurf, Mirror, Bevel처럼 topology를 바꾸는 Modifier도 평가 Mesh의
@@ -2949,20 +3123,20 @@ def _collect_blender_triangles(
             evaluated_mesh.calc_loop_triangles()
             matrix = evaluated_object.matrix_world
             normal_matrix = matrix.to_3x3().inverted_safe().transposed()
-            face_mask = None
-            vertex_weights = None
-            if part_attributes is not None:
-                face_mask = _evaluated_face_mask(evaluated_mesh, part_attributes)
-                if feather_distance > 0.0:
-                    vertex_weights = _boundary_vertex_weights(
-                        evaluated_mesh, matrix, face_mask, feather_distance
-                    )
+            face_shifts = explode_object_face_shifts(explode, obj.name, evaluated_mesh) if explode else None
+            face_groups = None
+            if band_groups is not None:
+                attributes = tuple(band_groups.get(obj.name, ()))
+                if attributes:
+                    local_groups, group_count = explode_face_groups(evaluated_mesh, attributes)
+                else:
+                    local_groups, group_count = [0] * len(evaluated_mesh.polygons), 1
+                face_groups = [group_offset + group for group in local_groups]
+                group_offset += group_count
             # 코너 법선은 Smooth/Auto Smooth 결과를 담고 있어, 픽셀 단위로
             # 보간하면 로우폴리에서도 뷰 전이가 면 경계에서 끊기지 않는다.
             corner_normals = getattr(evaluated_mesh, "corner_normals", None)
             for loop_triangle in evaluated_mesh.loop_triangles:
-                if face_mask is not None and not face_mask[loop_triangle.polygon_index]:
-                    continue
                 polygon = evaluated_mesh.polygons[loop_triangle.polygon_index]
                 normal_vector = (normal_matrix @ polygon.normal).normalized()
                 positions = tuple(
@@ -2976,20 +3150,16 @@ def _collect_blender_triangles(
                         tuple((normal_matrix @ corner_normals[loop_index].vector).normalized())
                         for loop_index in loop_triangle.loops
                     )
-                blend_weights = None
-                if vertex_weights is not None:
-                    blend_weights = tuple(
-                        vertex_weights.get(vertex_index, 1.0) for vertex_index in loop_triangle.vertices
-                    )
-                if part_attributes is not None:
-                    bounds_points.extend(positions)
                 triangles.append(
                     BakeTriangle(
                         positions=positions,  # type: ignore[arg-type]
                         uvs=uvs,  # type: ignore[arg-type]
                         normal=tuple(normal_vector),
                         vertex_normals=vertex_normals,  # type: ignore[arg-type]
-                        blend_weights=blend_weights,  # type: ignore[arg-type]
+                        view_shifts=(
+                            face_shifts[loop_triangle.polygon_index] if face_shifts is not None else None
+                        ),
+                        group=face_groups[loop_triangle.polygon_index] if face_groups is not None else -1,
                     )
                 )
         finally:
@@ -3002,32 +3172,106 @@ def _collect_blender_triangles(
     center = tuple((minimum[axis] + maximum[axis]) * 0.5 for axis in range(3))
     extent = tuple(maximum[axis] - minimum[axis] for axis in range(3))
     scale = max(extent[0], extent[1], extent[2], 0.01) * 1.2
+    if explode:
+        # 옮긴 파츠가 화면 밖으로 나가면 깊이 버퍼에서 잘려 가림으로 오판된다.
+        reach = 0.0
+        for triangle in triangles:
+            if triangle.view_shifts is None:
+                continue
+            for view, (shift_right, shift_up) in zip(VIEW_NAMES, triangle.view_shifts):
+                spec = VIEW_SPECS[view]
+                for point in triangle.positions:
+                    offset = (point[0] - center[0], point[1] - center[1], point[2] - center[2])
+                    reach = max(
+                        reach,
+                        abs(sum(offset[axis] * spec.right[axis] for axis in range(3)) + shift_right),
+                        abs(sum(offset[axis] * spec.up[axis] for axis in range(3)) + shift_up),
+                    )
+        scale = max(scale, reach * 2.0 * 1.2)
     return triangles, center, scale  # type: ignore[return-value]
 
 
-def part_projection(context, objects: Sequence, uv_layer_names, part_members: Mapping[str, Sequence[str]]) -> dict:
-    """파츠 면만으로 정한 직교 카메라 계약. 파츠 가이드 렌더와 베이크가 같은 값을 쓴다.
+def projection_scale(context, objects: Sequence, *, explode: Mapping | None = None) -> float:
+    """베이크가 쓰는 직교 축척. 분해도면 벌린 배치가 모든 시점에서 화면에 들어오는 값이다."""
 
-    중심·축척은 :func:`_collect_blender_triangles`의 규칙을 그대로 따른다.
+    _triangles, _center, scale = _collect_blender_triangles(context, tuple(objects), None, explode=explode)
+    return scale
+
+
+# 체크무늬 배경 판정: 테두리에서 두 번째로 많은 밝은 무채색이 이 비율 이상이면 체크무늬로 본다.
+_CHECKER_MIN_SHARE = 0.2
+# 체크무늬 두 톤으로 칠 색 거리(채널 최대 차, 선형). 두 톤 사이 차이는 이보다 커야 한다.
+_CHECKER_TOLERANCE = 0.03
+
+
+def _propagate_runs(seed, candidate, axis: int):
+    """``candidate`` 연속 구간 안에 씨앗이 하나라도 있으면 그 구간 전체를 채운다."""
+
+    import numpy as np
+
+    if axis == 0:
+        return _propagate_runs(seed.T, candidate.T, 1).T
+    height, width = candidate.shape
+    breaks = np.cumsum(~candidate, axis=1)
+    keys = (np.arange(height)[:, None] * (width + 1) + breaks).ravel()
+    marked = np.zeros(height * (width + 1), bool)
+    marked[keys[seed.ravel()]] = True
+    return candidate & marked[keys].reshape(height, width)
+
+
+def flatten_checker_background(pixels, width: int, height: int) -> int:
+    """이미지 모델이 투명 배경 대신 그린 회색 체크무늬를 흰 배경으로 바꾼다.
+
+    테두리에 밝은 무채색 두 톤이 고르게 섞여 있으면 체크무늬로 보고, 테두리에서
+    그 두 톤만 따라 이어진 영역을 흰색으로 칠한다. 캐릭터는 외곽선으로 막혀 있어
+    몸 안의 같은 회색(벨트 등)은 건드리지 않는다. ``pixels``(선형 RGBA)를 직접 고치고
+    바꾼 픽셀 수를 돌려준다. 체크무늬가 아니면 아무것도 하지 않는다.
     """
 
-    if bpy is None:
-        raise RuntimeError("파츠 투영 계약은 Blender 안에서만 계산할 수 있습니다.")
-    triangles, center, scale = _collect_blender_triangles(
-        context, tuple(objects), uv_layer_names, part_members=part_members
+    import numpy as np
+
+    image = np.frombuffer(pixels, dtype=np.float32).reshape(height, width, 4)
+    rgb = image[..., :3]
+    frame = np.zeros((height, width), bool)
+    margin = max(2, min(width, height) // 128)
+    frame[:margin] = frame[-margin:] = True
+    frame[:, :margin] = frame[:, -margin:] = True
+    border = rgb[frame]
+    neutral = (border.max(1) - border.min(1) < 0.04) & (border.mean(1) > 0.4)
+    if neutral.mean() < 0.9:
+        return 0
+    quantized = np.round(border[neutral].mean(1) / _CHECKER_TOLERANCE).astype(int)
+    values, counts = np.unique(quantized, return_counts=True)
+    if len(values) < 2:
+        return 0
+    order = np.argsort(counts)[::-1]
+    first, second = values[order[0]], values[order[1]]
+    if counts[order[1]] < _CHECKER_MIN_SHARE * neutral.sum() or abs(int(first) - int(second)) < 2:
+        return 0
+    tones = (first * _CHECKER_TOLERANCE, second * _CHECKER_TOLERANCE)
+    luminance = rgb.mean(2)
+    spread = rgb.max(2) - rgb.min(2)
+    candidate = (spread < 0.04) & (
+        (np.abs(luminance - tones[0]) <= _CHECKER_TOLERANCE) | (np.abs(luminance - tones[1]) <= _CHECKER_TOLERANCE)
     )
-    points = [point for triangle in triangles for point in triangle.positions]
-    minimum = tuple(min(point[axis] for point in points) for axis in range(3))
-    maximum = tuple(max(point[axis] for point in points) for axis in range(3))
-    extent = tuple(maximum[axis] - minimum[axis] for axis in range(3))
-    length = math.sqrt(sum(value * value for value in extent))
-    return {
-        "center": tuple(float(value) for value in center),
-        "extent": tuple(float(value) for value in extent),
-        "ortho_scale": float(scale),
-        "camera_distance": float(max(length, 1.0) * 2.0),
-        "triangle_count": len(triangles),
-    }
+    filled = candidate & frame
+    for _ in range(64):
+        grown = _propagate_runs(_propagate_runs(filled, candidate, 1), candidate, 0)
+        if (grown == filled).all():
+            break
+        filled = grown
+    # 체크 칸 경계의 중간 톤(안티앨리어싱·압축 흔적)이 점으로 남지 않게, 채운 영역에 맞닿은
+    # 밝은 무채색 픽셀을 몇 번 더 흡수한다. 외곽선(어두운 색)은 넘지 않는다.
+    soft = (spread < 0.08) & (luminance > 0.3)
+    for _ in range(3):
+        neighbors = filled.copy()
+        neighbors[1:] |= filled[:-1]
+        neighbors[:-1] |= filled[1:]
+        neighbors[:, 1:] |= filled[:, :-1]
+        neighbors[:, :-1] |= filled[:, 1:]
+        filled |= neighbors & soft
+    rgb[filled] = 1.0
+    return int(filled.sum())
 
 
 def _load_raster_sources(paths: Mapping[str, Path]) -> tuple[dict[str, RasterSource], list]:
@@ -3050,6 +3294,8 @@ def _load_raster_sources(paths: Mapping[str, Path]) -> tuple[dict[str, RasterSou
                 pixels[offset] = _srgb_to_linear(pixels[offset])
                 pixels[offset + 1] = _srgb_to_linear(pixels[offset + 1])
                 pixels[offset + 2] = _srgb_to_linear(pixels[offset + 2])
+            # 체크무늬 "투명" 배경은 배경 판정을 깨뜨려 실루엣 정합과 색 표본이 모두 틀어진다.
+            flatten_checker_background(pixels, width, height)
             bbox = detect_foreground_bbox(pixels, width, height)
             background, threshold, fallback = _source_statistics(pixels, width, height, bbox)
             if bbox == (0, 0, width, height):
@@ -3118,13 +3364,16 @@ def analyze_view_sources(
     depth_resolution: int = 512,
     *,
     silhouette_warp: bool = False,
+    explode: Mapping | None = None,
 ) -> ViewAnalysis:
     """베이크 없이 생성 뷰를 모델 실루엣에 정합하고 뷰별 불일치 지표를 만든다."""
 
     if bpy is None:
         raise RuntimeError("뷰 분석은 Blender 안에서만 실행할 수 있습니다.")
     paths = _resolve_view_paths(view_paths, require_all=False)
-    triangles, center, scale = _collect_blender_triangles(context, tuple(objects), uv_layer_names)
+    triangles, center, scale = _collect_blender_triangles(
+        context, tuple(objects), uv_layer_names, explode=explode
+    )
     sources, loaded_images = _load_raster_sources(paths)
     try:
         resolution = min(1024, max(256, int(depth_resolution)))
@@ -3156,10 +3405,16 @@ def evaluate_view_sources(
     view_paths: Mapping[str, str | os.PathLike[str]] | Sequence[str | os.PathLike[str]],
     uv_layer_names=None,
     depth_resolution: int = 512,
+    *,
+    explode: Mapping | None = None,
 ) -> dict[str, dict]:
     """뷰별 실루엣 불일치 리포트만 돌려주는 사전 검증 진입점."""
 
-    return dict(analyze_view_sources(context, objects, view_paths, uv_layer_names, depth_resolution).report)
+    return dict(
+        analyze_view_sources(
+            context, objects, view_paths, uv_layer_names, depth_resolution, explode=explode
+        ).report
+    )
 
 
 def verify_rendered_views(
@@ -3332,18 +3587,18 @@ def _bake_atlas_png(
     padding: int,
     uv_layer_names,
     raster_kwargs: Mapping[str, object],
-    part_passes: Sequence[Mapping] = (),
-    part_blend_ratio: float = 0.0,
+    explode: Mapping | None = None,
+    band_groups: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[bytes, dict]:
     """평가 Mesh를 모아 래스터화하고 PNG 바이트와 통계를 돌려준다. Blender 데이터는 바꾸지 않는다.
 
-    ``part_passes``가 있으면 전신 결과 위에 파츠별 결과를 차례로 합성한다. 각 항목은
-    ``members``(객체 이름 → 면 속성 이름 목록), ``views``(시점 → 경로), ``label``을
-    담는다. 파츠마다 그 파츠 면만으로 깊이 버퍼를 만들어 다른 부위의 가림 없이
-    투영하고, 파츠 경계에서 ``part_blend_ratio``×모델 축척 거리 안쪽은 전신 결과와 섞는다.
+    ``explode``가 있으면 생성 그림이 분해도로 그려졌다고 보고 파츠마다 옮긴 위치로 투영한다.
+    ``band_groups``가 있으면(파츠가 없으면 빈 매핑) 시점 간 벨트·띠 높이를 파츠마다 맞춘다.
     """
 
-    triangles, center, scale = _collect_blender_triangles(context, targets, uv_layer_names)
+    triangles, center, scale = _collect_blender_triangles(
+        context, targets, uv_layer_names, explode=explode, band_groups=band_groups
+    )
     outside_atlas = sum(1 for triangle in triangles if _outside_atlas(triangle))
     sources, loaded_images = _load_raster_sources(paths)
     try:
@@ -3351,9 +3606,10 @@ def _bake_atlas_png(
             triangles,
             sources,
             resolution,
-            0 if part_passes else padding,
+            padding,
             center,
             scale,
+            align_bands=band_groups is not None,
             **raster_kwargs,
         )
     finally:
@@ -3366,98 +3622,10 @@ def _bake_atlas_png(
         "view_names": tuple(sources),
         "outside_atlas_triangles": outside_atlas,
         "triangle_count": len(triangles),
+        "exploded": bool(explode),
         **metrics,
     }
-    if part_passes:
-        metrics["part_passes"] = _composite_part_passes(
-            context,
-            targets,
-            uv_layer_names,
-            rgba,
-            resolution,
-            part_passes,
-            feather_distance=max(0.0, float(part_blend_ratio)) * scale,
-            raster_kwargs=raster_kwargs,
-        )
-        # 전신 결과는 패딩 없이 구웠으므로 합성을 마친 뒤 한 번만 경계색을 확장한다.
-        occupied = bytearray(rgba[3::4])
-        metrics["dilated_pixels"] = dilate_rgba(rgba, occupied, resolution, resolution, padding)
     return encode_srgb_png(rgba, resolution, resolution), metrics
-
-
-def _composite_part_passes(
-    context,
-    targets: tuple,
-    uv_layer_names,
-    rgba: bytearray,
-    resolution: int,
-    part_passes: Sequence[Mapping],
-    *,
-    feather_distance: float,
-    raster_kwargs: Mapping[str, object],
-) -> list[dict]:
-    """파츠별 결과를 ``rgba`` 위에 합성하고 파츠마다의 통계를 돌려준다.
-
-    파츠 하나가 실패해도(면이 사라졌거나 그림을 읽지 못함) 나머지 파츠와 전신 결과는
-    지킨다. 실패한 파츠는 통계에 사유를 남긴다.
-    """
-
-    part_kwargs = dict(raster_kwargs)
-    # 파츠 그림은 모든 면을 실제로 칠했으므로 미채색 표시나 부분 소스 허용이 필요 없다.
-    part_kwargs.update(unpainted_color=None, require_all_sources=True, allow_view_substitution=True)
-    results: list[dict] = []
-    for part in part_passes:
-        label = str(part.get("label", ""))
-        members = {str(name): tuple(attrs) for name, attrs in dict(part.get("members", {})).items()}
-        try:
-            part_paths = _resolve_view_paths(dict(part.get("views", {})), require_all=True)
-            part_triangles, part_center, part_scale = _collect_blender_triangles(
-                context,
-                targets,
-                uv_layer_names,
-                part_members=members,
-                feather_distance=feather_distance,
-            )
-        except ValueError as exc:
-            results.append({"label": label, "applied": False, "error": str(exc)})
-            continue
-        try:
-            part_sources, part_images = _load_raster_sources(part_paths)
-        except (OSError, RuntimeError, ValueError) as exc:
-            results.append({"label": label, "applied": False, "error": str(exc)})
-            continue
-        coverage = bytearray(resolution * resolution)
-        try:
-            layer, layer_metrics = rasterize_atlas(
-                part_triangles,
-                part_sources,
-                resolution,
-                0,
-                part_center,
-                part_scale,
-                coverage=coverage,
-                **part_kwargs,
-            )
-        except ValueError as exc:
-            results.append({"label": label, "applied": False, "error": str(exc)})
-            continue
-        finally:
-            for loaded_image in part_images:
-                if loaded_image.name in bpy.data.images:
-                    bpy.data.images.remove(loaded_image)
-        changed = composite_part_layer(rgba, layer, coverage)
-        results.append(
-            {
-                "label": label,
-                "applied": True,
-                "triangle_count": len(part_triangles),
-                "composited_pixels": changed,
-                "full_weight_pixels": coverage.count(255),
-                "filled_pixels": layer_metrics.get("filled_pixels", 0),
-                "occluded_fallback_pixels": layer_metrics.get("occluded_fallback_pixels", 0),
-            }
-        )
-    return results
 
 
 def _write_atomically(destination: Path, data: bytes) -> None:
@@ -3487,8 +3655,8 @@ def rasterize_to_png(
     require_all_sources: bool = True,
     allow_view_substitution: bool = True,
     occlusion_fallback: bool = True,
-    part_passes: Sequence[Mapping] = (),
-    part_blend_ratio: float = 0.0,
+    explode: Mapping | None = None,
+    band_groups: Mapping[str, Sequence[str]] | None = None,
 ) -> dict:
     """Atlas를 PNG 파일로만 굽는다. 이미지·머티리얼 데이터블록은 만들지도 바꾸지도 않는다.
 
@@ -3517,8 +3685,8 @@ def rasterize_to_png(
             "allow_view_substitution": allow_view_substitution,
             "occlusion_fallback": occlusion_fallback,
         },
-        part_passes=part_passes,
-        part_blend_ratio=part_blend_ratio,
+        explode=explode,
+        band_groups=band_groups,
     )
     _write_atomically(destination, png)
     return {"status": "ATLAS_WRITTEN", "output_path": str(destination), **metrics}
@@ -3575,14 +3743,15 @@ def bake_diffuse(
     require_all_sources: bool = True,
     allow_view_substitution: bool = True,
     occlusion_fallback: bool = True,
-    part_passes: Sequence[Mapping] = (),
-    part_blend_ratio: float = 0.0,
+    explode: Mapping | None = None,
+    band_groups: Mapping[str, Sequence[str]] | None = None,
 ) -> dict:
     """생성 뷰(FRONT/RIGHT/BACK 필수, LEFT/TOP/BOTTOM 선택)를 공유 UV Atlas에 굽고 재질에 연결한다.
 
     Atlas 파일이 완전히 만들어지기 전에는 Blender 재질/이미지 상태를 바꾸지
     않는다. 파일 교체와 재질 적용 중 실패하면 가능한 범위에서 이전 상태를
-    복원한다. 키워드 인자는 :func:`rasterize_atlas`와 같은 뜻이다.
+    복원한다. 키워드 인자는 :func:`rasterize_atlas`와 같은 뜻이고, ``explode``는
+    생성에 쓴 분해도 계약(:func:`plan_explode_for_objects`)이다.
     """
 
     targets, paths, destination, resolution, padding = _validated_bake_targets_and_paths(
@@ -3606,9 +3775,15 @@ def bake_diffuse(
             "allow_view_substitution": allow_view_substitution,
             "occlusion_fallback": occlusion_fallback,
         },
-        part_passes=part_passes,
-        part_blend_ratio=part_blend_ratio,
+        explode=explode,
+        band_groups=band_groups,
     )
+    return _commit_albedo(targets, destination, png, metrics)
+
+
+def _commit_albedo(targets: tuple, destination: Path, png: bytes, metrics: Mapping) -> dict:
+    """구운 Atlas PNG를 파일로 쓰고 재질에 연결한다. 실패하면 파일·재질을 이전 상태로 되돌린다."""
+
     backup_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.bak")
     image = None
     material = None
@@ -3677,6 +3852,102 @@ def bake_diffuse(
         backup_path.unlink(missing_ok=True)
 
 
+def bake_layered_diffuse(
+    context,
+    objects: Sequence,
+    layers: Sequence[Mapping],
+    output_path: str | os.PathLike[str],
+    resolution: int,
+    padding: int,
+    *,
+    blend_exponent: float = DEFAULT_BLEND_EXPONENT,
+    dominant_view_blend: bool = True,
+    transition_band_degrees: float = DEFAULT_TRANSITION_BAND_DEGREES,
+    harmonize_colors: bool = True,
+    silhouette_warp: bool = False,
+) -> dict:
+    """부위 그룹마다 따로 생성한 다면도를 그 그룹 면에만 투영해 한 Atlas로 합치고 적용한다.
+
+    Args:
+        objects: 재질을 적용할 원본 객체
+        layers: 그룹마다 ``objects``(그 그룹 면만 남긴 임시 객체), ``uv_layer_names``,
+            ``views``(시점 → 그림 경로), ``explode``(분해도 계약 또는 None),
+            ``band_groups``(띠 높이 맞춤용 파츠 속성 또는 None), ``label``
+        나머지: :func:`bake_diffuse`와 같다.
+
+    그룹 면은 서로 겹치지 않으므로 각 그룹이 칠한 픽셀만 Atlas에 옮긴다. 미러 UV처럼 같은
+    UV를 공유하는 면은 나중 그룹이 덮는다.
+    """
+
+    import numpy as np
+
+    if not layers:
+        raise ValueError("베이크할 부위 다면도가 없습니다.")
+    # 대상·해상도·출력 경로 검증만 공유한다. 그룹마다의 그림 경로는 아래에서 따로 확인한다.
+    targets, _paths, destination, resolution, padding = _validated_bake_targets_and_paths(
+        objects, dict(layers[0]["views"]), output_path, resolution, padding, require_all_sources=True
+    )
+    atlas = np.zeros((resolution * resolution, 4), np.uint8)
+    layer_metrics = []
+    raster_kwargs = {
+        "blend_exponent": blend_exponent,
+        "dominant_view_blend": dominant_view_blend,
+        "transition_band_degrees": transition_band_degrees,
+        "harmonize_colors": harmonize_colors,
+        "silhouette_warp": silhouette_warp,
+    }
+    for layer in layers:
+        band_groups = layer.get("band_groups")
+        triangles, center, scale = _collect_blender_triangles(
+            context,
+            tuple(layer["objects"]),
+            layer.get("uv_layer_names"),
+            explode=layer.get("explode"),
+            band_groups=band_groups,
+        )
+        sources, loaded_images = _load_raster_sources(_resolve_view_paths(dict(layer["views"]), require_all=True))
+        try:
+            rgba, metrics = rasterize_atlas(
+                triangles,
+                sources,
+                resolution,
+                0,
+                center,
+                scale,
+                align_bands=band_groups is not None,
+                **raster_kwargs,
+            )
+        finally:
+            for loaded_image in loaded_images:
+                if loaded_image.name in bpy.data.images:
+                    bpy.data.images.remove(loaded_image)
+        pixels = np.frombuffer(bytes(rgba), np.uint8).reshape(-1, 4)
+        painted = pixels[:, 3] > 0
+        atlas[painted] = pixels[painted]
+        layer_metrics.append(
+            {
+                "label": str(layer.get("label", "")),
+                "triangle_count": len(triangles),
+                "filled_pixels": metrics.get("filled_pixels", 0),
+                "occluded_fallback_pixels": metrics.get("occluded_fallback_pixels", 0),
+                "band_alignment": metrics.get("band_alignment", {}),
+                "view_alignment": metrics.get("view_alignment", {}),
+            }
+        )
+    combined = bytearray(atlas.tobytes())
+    occupied = bytearray((atlas[:, 3] > 0).astype(np.uint8).tobytes())
+    dilated = dilate_rgba(combined, occupied, resolution, resolution, padding)
+    metrics = {
+        "resolution": resolution,
+        "padding": padding,
+        "filled_pixels": int(sum(item["filled_pixels"] for item in layer_metrics)),
+        "occluded_fallback_pixels": int(sum(item["occluded_fallback_pixels"] for item in layer_metrics)),
+        "dilated_pixels": dilated,
+        "layers": layer_metrics,
+    }
+    return _commit_albedo(targets, destination, encode_srgb_png(combined, resolution, resolution), metrics)
+
+
 __all__ = (
     "ALIGNMENT_MIN_IOU",
     "WARP_MAX_CENTER_SHIFT_RATIO",
@@ -3713,10 +3984,14 @@ __all__ = (
     "ViewSpec",
     "align_silhouette",
     "bake_diffuse",
+    "bake_layered_diffuse",
     "barycentric_weights",
-    "boundary_blend_weight",
-    "composite_part_layer",
-    "part_projection",
+    "EXPLODE_VIEW_NAMES",
+    "explode_face_groups",
+    "explode_member_groups",
+    "explode_object_face_shifts",
+    "plan_explode_for_objects",
+    "projection_scale",
     "bilinear_sample",
     "build_depth_buffer",
     "build_model_mask",

@@ -307,7 +307,7 @@ def _check_mapping_parts(ui_module) -> None:
     assert {polygon.index for polygon in cube.data.polygons if polygon.select} == {3, 4, 5}
     assert not any(polygon.hide for polygon in cube.data.polygons)
 
-    # 면 속성은 Modifier 평가 결과에도 따라간다(이후 파츠별 투영에서 쓴다).
+    # 면 속성은 Modifier 평가 결과에도 따라간다(분해도 투영에서 쓴다).
     modifier = cube.modifiers.new("파츠 검사 Subdivision", "SUBSURF")
     modifier.levels = 1
     evaluated = cube.evaluated_get(bpy.context.evaluated_depsgraph_get())
@@ -409,89 +409,23 @@ def _build_body_with_arm(part_module):
     return figure, arm_faces
 
 
-def _face_color(pixels, width: int, height: int, mesh, uv_layer_name: str, face_index: int):
-    """면 UV 중심의 Atlas 색(선형)."""
-
-    uv_layer = mesh.uv_layers[uv_layer_name]
-    polygon = mesh.polygons[face_index]
-    us = [uv_layer.data[index].uv[0] for index in polygon.loop_indices]
-    vs = [uv_layer.data[index].uv[1] for index in polygon.loop_indices]
-    x = min(width - 1, int(sum(us) / len(us) * width))
-    y = min(height - 1, int(sum(vs) / len(vs) * height))
-    offset = (y * width + x) * 4
-    return tuple(pixels[offset : offset + 3])
-
-
-def _check_part_boundary_weights(bake_module) -> None:
-    """연결된 메시에서 파츠 경계 정점은 가중치 0, 멀어질수록 1에 가까워진다."""
-
-    _clear_scene()
-    bpy.ops.mesh.primitive_grid_add(x_subdivisions=8, y_subdivisions=1, size=2.0)
-    strip = bpy.context.object
-    mesh = strip.data
-    attribute = mesh.attributes.new("uvmapping_part_boundary", "BOOLEAN", "FACE")
-    for polygon in mesh.polygons:
-        attribute.data[polygon.index].value = polygon.center.x > 0.0
-    triangles, _center, _scale = bake_module._collect_blender_triangles(
-        bpy.context,
-        (strip,),
-        None,
-        part_members={strip.name: ["uvmapping_part_boundary"]},
-        feather_distance=1.0,
-    )
-    assert triangles and all(triangle.blend_weights is not None for triangle in triangles)
-    weights = [
-        (position[0], weight)
-        for triangle in triangles
-        for position, weight in zip(triangle.positions, triangle.blend_weights)
-    ]
-    # 파츠(+X 절반) 면만 모았는지
-    assert min(position[0] for triangle in triangles for position in triangle.positions) >= -1e-6
-    at_boundary = [weight for x, weight in weights if abs(x) < 1e-6]
-    far = [weight for x, weight in weights if x > 0.99]
-    assert at_boundary and max(at_boundary) == 0.0, at_boundary
-    assert far and min(far) == 1.0, far
-    # 혼합 폭 0이면 경계에서도 파츠 결과만 쓴다.
-    flat, _c, _s = bake_module._collect_blender_triangles(
-        bpy.context, (strip,), None, part_members={strip.name: ["uvmapping_part_boundary"]}
-    )
-    assert all(triangle.blend_weights is None for triangle in flat)
-    _clear_scene()
-
-
-def _check_part_mapping_pipeline(texture_module, bake_module, ui_module) -> None:
-    """파츠별 매핑: 전신 생성 → 파츠 가이드(다른 부위 숨김) → 배치 요청 → 합성 베이크."""
+def _check_exploded_generation(texture_module, bake_module, ui_module) -> None:
+    """파츠 분해도: 파츠를 벌린 가이드 1회 요청 → 같은 배치로 베이크·검증 → 파츠 변경 감지."""
 
     part_module = importlib.import_module(f"{MODULE_NAME}.uvmapping.part_operators")
-    _check_part_boundary_weights(bake_module)
     original_popen = texture_module.subprocess.Popen
     original_key = os.environ.get("OPENROUTER_API_KEY")
     online = bpy.context.preferences.system.use_online_access
-    grid_calls: list = []
-    batch_calls: list = []
-    part_colors = {"PART_00": (40, 60, 230), "PART_01": (40, 220, 60)}
-    batch_fails = [False]
+    calls: list = []
 
-    class _PartStubWorker:
+    class _ExplodeStubWorker:
         def __init__(self, arguments, **_kwargs):
             self.stdin = io.BytesIO()
             request = json.loads(Path(arguments[-2]).read_text(encoding="utf-8"))
-            if request.get("action") == "turnaround_batch" and batch_fails[0]:
-                batch_calls.append(request["groups"])
-                response = {"ok": False, "error": "스텁 배치 작업자 실패"}
-            elif request.get("action") == "turnaround_batch":
-                batch_calls.append(request["groups"])
-                results = []
-                for group in request["groups"]:
-                    output = Path(group["output_path"])
-                    _three_view_png(bake_module, output, [part_colors[group["name"]]] * 3)
-                    results.append({"name": group["name"], "ok": True, "output_path": str(output)})
-                response = {"ok": True, "groups": results}
-            else:
-                grid_calls.append(request)
-                output = Path(request["output_path"])
-                _three_view_png(bake_module, output, [(230, 50, 40)] * 3)
-                response = {"ok": True, "output_path": str(output)}
+            calls.append(request)
+            output = Path(request["output_path"])
+            _three_view_png(bake_module, output, [(230, 50, 40)] * 3)
+            response = {"ok": True, "output_path": str(output)}
             Path(arguments[-1]).write_text(json.dumps(response), encoding="utf-8")
 
         def poll(self):
@@ -518,7 +452,7 @@ def _check_part_mapping_pipeline(texture_module, bake_module, ui_module) -> None
             "texture_user_prompt",
         )
     }
-    texture_module.subprocess.Popen = _PartStubWorker
+    texture_module.subprocess.Popen = _ExplodeStubWorker
     os.environ["OPENROUTER_API_KEY"] = "stub-key"
     bpy.context.preferences.system.use_online_access = True
     created_paths: list[Path] = []
@@ -531,20 +465,22 @@ def _check_part_mapping_pipeline(texture_module, bake_module, ui_module) -> None
         settings.texture_resolution = "256"
         settings.padding_pixels = 2
         settings.auto_apply_diffuse = True
-        settings.verify_after_bake = False
+        settings.verify_after_bake = True
         settings.auto_regenerate_attempts = 0
-        settings.texture_user_prompt = "파츠별 매핑 검사"
+        settings.texture_user_prompt = "파츠 분해도 검사"
         settings.part_mapping = True
         bpy.ops.object.select_all(action="DESELECT")
         figure.select_set(True)
         bpy.context.view_layer.objects.active = figure
 
-        # 패널: 파츠별 매핑 설정과 추가 호출 수가 보인다.
+        # 패널: 분해도는 추가 호출이 없다고 알리고, 비용 경고를 늘리지 않는다.
         record = _draw_panel(ui_module, ui_module.UVMAPPING_PT_mapping_parts)
-        assert "part_mapping" in record["props"] and "part_blend_percent" in record["props"], record["props"]
-        assert any("파츠 최대 2개" in label for label in record["labels"]), record["labels"]
+        assert "part_mapping" in record["props"], record["props"]
+        assert "part_blend_percent" not in record["props"], record["props"]
+        assert any("파츠 2개를 시점마다 벌려" in label for label in record["labels"]), record["labels"]
         main_record = _draw_panel(ui_module)
-        assert any("파츠 최대 2회" in label for label in main_record["labels"]), main_record["labels"]
+        assert not any("파츠 최대" in label for label in main_record["labels"]), main_record["labels"]
+        assert any("OpenRouter 호출 1회" in label for label in main_record["labels"]), main_record["labels"]
 
         assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
         for _attempt in range(6):
@@ -552,95 +488,80 @@ def _check_part_mapping_pipeline(texture_module, bake_module, ui_module) -> None
                 break
             texture_module._ACTIVE_RUNS[0].poll_process()
         assert not texture_module._ACTIVE_RUNS, settings.texture_status
-        assert len(grid_calls) == 1, len(grid_calls)
-        assert len(batch_calls) == 1, "파츠는 한 배치로 동시에 요청한다"
-        groups = batch_calls[0]
-        assert [group["name"] for group in groups] == ["PART_00", "PART_01"]
-        assert "대상 부위: torso" in groups[0]["prompt"], groups[0]["prompt"][:200]
-        assert "대상 부위: left arm" in groups[1]["prompt"]
-        assert all(group["aspect_ratio"] == "21:9" for group in groups)
+        assert len(calls) == 1, "분해도는 전신 1회 호출로 끝난다"
+        assert "분해도(exploded view)" in calls[0]["prompt"], calls[0]["prompt"][:300]
+        assert not any(obj.name.startswith("UVMapping 분해도") for obj in bpy.data.objects), "임시 객체가 남았다"
 
         state = json.loads(figure[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
         assert state["status"] == "ALBEDO_APPLIED", (state["status"], settings.texture_status)
-        passes = state["part_passes"]
-        assert [item["key"] for item in passes] == ["TORSO", "ARM_L"], passes
-        assert state["part_pass_failures"] == []
-        for item in passes:
-            assert set(item["views"]) == {"front", "right", "back"}, item["views"]
-            assert all(Path(path).is_file() for path in item["views"].values())
-            created_paths.extend(Path(path) for path in item["views"].values())
-            created_paths.extend((Path(item["image_path"]), Path(item["guide_path"])))
-        stats = state["bake_stats"]["part_passes"]
-        assert [item["applied"] for item in stats] == [True, True], stats
-        assert all(item["composited_pixels"] > 0 for item in stats), stats
-        assert "파츠별 매핑 2개 완료" in settings.texture_status, settings.texture_status
+        explode = state["projection"]["explode"]
+        assert [member[0] for member in explode["members"]] == [figure.name], explode["members"]
+        torso_shift, arm_shift = explode["shifts"]["FRONT"]
+        # 정면에서 팔이 몸통 가운데를 가리므로 팔만 옆으로 옮겨진다. 측면·위아래는 원래 떨어져 있다.
+        assert abs(arm_shift[0] - torso_shift[0]) > 0.5, explode["shifts"]["FRONT"]
+        assert all(shift == [0.0, 0.0] for shift in explode["shifts"]["RIGHT"]), explode["shifts"]["RIGHT"]
+        # 카메라는 벌린 배치까지 담아야 한다(이 모형은 팔이 앞으로 길게 나와 원래 축척으로도 충분하다).
+        assert state["projection"]["capture_scale"] >= state["projection"]["ortho_scale"]
+        assert state["bake_stats"]["exploded"] is True
+        verification = state["verification"]
+        assert not verification.get("error"), verification
+        assert set(verification["views"]) == {"FRONT", "RIGHT", "BACK"}, verification["views"]
 
-        # 몸통 가이드: 팔을 숨기고 몸통만 렌더한다. 정면 가운데는 팔이 있던 자리인데,
-        # 팔이 보이면(빨강) 실패고, 전신 정면에서 가려졌던 면이므로 회색이어야 한다.
-        layout = texture_module.resolve_layout("THREE")
-        guide_pixels, guide_width, guide_height = bake_module.load_image_pixels(
-            passes[0]["guide_path"], linearize=False
+        # 같은 생성 그림을 원래 자세로 투영하면 팔에 가린 몸통 정면이 가림 폴백으로 칠해지고,
+        # 분해도 배치로 투영하면 가림 없이 직접 칠해진다.
+        view_paths = {view.upper(): Path(path) for view, path in state["views"].items()}
+        uv_names = (figure.data.uv_layers.active.name,)
+        scratch = Path(state["albedo_path"]).with_name("explode_compare.png")
+        created_paths.append(scratch)
+        plain = bake_module.rasterize_to_png(
+            bpy.context, (figure,), view_paths, scratch, 128, 0, uv_layer_names=uv_names
         )
-        left, bottom, right, top = layout.grid_cell_bounds(guide_width, guide_height, 0)
-        center = (((bottom + top) // 2) * guide_width + (left + right) // 2) * 4
-        red, green, blue = guide_pixels[center : center + 3]
-        assert abs(red - green) < 0.05 and abs(green - blue) < 0.05, (red, green, blue)
-        assert 0.3 < red < 0.8, "회색(미채색) 표시가 보여야 한다"
-        # 팔 가이드: 팔 정면은 전신 정면에서 보였으므로 빨강으로 칠해져 있다.
-        arm_pixels, arm_width, arm_height = bake_module.load_image_pixels(passes[1]["guide_path"], linearize=False)
-        left, bottom, right, top = layout.grid_cell_bounds(arm_width, arm_height, 0)
-        center = (((bottom + top) // 2) * arm_width + (left + right) // 2) * 4
-        assert arm_pixels[center] > arm_pixels[center + 1] + 0.3, tuple(arm_pixels[center : center + 3])
+        exploded = bake_module.rasterize_to_png(
+            bpy.context, (figure,), view_paths, scratch, 128, 0, uv_layer_names=uv_names, explode=explode
+        )
+        # 3면도에는 위·아래 그림이 없어 윗면·밑면은 두 경우 모두 측면에서 빌려 온다. 팔에 가렸던
+        # 몸통 정면(128px Atlas에서 면 하나 약 300px)만큼 가림 폴백이 줄어야 한다.
+        counts = (plain["occluded_fallback_pixels"], exploded["occluded_fallback_pixels"])
+        assert counts[0] - counts[1] > 256, counts
 
-        # 최종 Atlas: 몸통 면은 몸통 파츠 색(파랑), 팔 면은 팔 파츠 색(초록).
         diffuse = Path(state["albedo_path"])
         created_paths.extend((diffuse, Path(state["turnaround_path"]), Path(state["geometry_contact_sheet"])))
         created_paths.extend(Path(path) for path in state["views"].values())
-        pixels, width, height = bake_module.load_image_pixels(diffuse)
-        uv_name = figure.data.uv_layers.active.name
-        body_front = next(
-            polygon.index
-            for polygon in figure.data.polygons
-            if polygon.index not in arm_faces and polygon.normal.y < -0.9
-        )
+        created_paths.append(Path(verification["sheet"]))
+
+        # 생성 뒤 면을 다른 파츠로 옮기면 옮길 양이 맞지 않으므로 적용을 멈추고 다시 생성하라고 알린다.
+        # (파츠에서 빼기만 한 면은 이어진 파츠에 다시 붙어 배치가 그대로라 막지 않는다.)
+        figure.data.uvmapping_parts.active_index = 0
         arm_front = next(
             polygon.index for polygon in figure.data.polygons if polygon.index in arm_faces and polygon.normal.y < -0.9
         )
-        body_color = _face_color(pixels, width, height, figure.data, uv_name, body_front)
-        arm_color = _face_color(pixels, width, height, figure.data, uv_name, arm_front)
-        assert body_color[2] > body_color[0] and body_color[2] > body_color[1], body_color
-        assert arm_color[1] > arm_color[0] and arm_color[1] > arm_color[2], arm_color
+        _select_faces(figure, {arm_front})
+        assert bpy.ops.uvmapping.assign_mapping_part(mode="ADD", exclusive=True) == {"FINISHED"}
+        try:
+            texture_module.apply_diffuse(bpy.context, (figure,))
+        except ValueError as exc:
+            assert "매핑 파츠 구성이 바뀌어" in str(exc), str(exc)
+        else:
+            raise AssertionError("파츠 면이 바뀐 분해도 상태는 적용을 거부해야 한다")
 
-        # 생성 뒤 파츠 면을 바꾸면 그 파츠는 전신 결과로 두고 경고한다(적용은 막지 않는다).
-        figure.data.uvmapping_parts.active_index = 1
-        _select_faces(figure, set(arm_faces) - {arm_front})
-        assert bpy.ops.uvmapping.assign_mapping_part(mode="REPLACE", exclusive=False) == {"FINISHED"}
-        assert bpy.ops.uvmapping.bake_diffuse() == {"FINISHED"}, settings.texture_status
-        assert "생성 뒤 파츠 면이 바뀌어" in settings.texture_status, settings.texture_status
-        reapplied = json.loads(figure[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
-        assert [item["label"] for item in reapplied["bake_stats"]["part_passes"]] == ["몸통"]
-        pixels, width, height = bake_module.load_image_pixels(diffuse)
-        arm_color = _face_color(pixels, width, height, figure.data, uv_name, arm_front)
-        assert arm_color[0] > arm_color[1] and arm_color[0] > arm_color[2], arm_color
-
-        # 파츠 배치 작업자가 통째로 실패해도 전신 결과는 자동 적용되고 임시 파일이 남지 않는다.
-        batch_fails[0] = True
+        # 파츠 분해도를 끄면 등록 파츠가 있어도 원래 자세로 생성하고, 패널이 경고한다.
+        settings.part_mapping = False
+        record = _draw_panel(ui_module, ui_module.UVMAPPING_PT_mapping_parts)
+        assert any("분해도 생성이 꺼져" in label for label in record["labels"]), record["labels"]
         assert bpy.ops.uvmapping.generate_turnaround() == {"FINISHED"}, settings.texture_status
         for _attempt in range(6):
             if not texture_module._ACTIVE_RUNS:
                 break
             texture_module._ACTIVE_RUNS[0].poll_process()
-        assert not texture_module._ACTIVE_RUNS
-        assert len(batch_calls) == 2
-        failed_state = json.loads(figure[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
-        assert failed_state["status"] == "ALBEDO_APPLIED", failed_state["status"]
-        assert not failed_state.get("part_passes"), failed_state.get("part_passes")
-        assert "전신 결과만 적용" in settings.texture_status, settings.texture_status
-        assert "스텁 배치 작업자 실패" in settings.texture_last_error
-        stem = Path(failed_state["turnaround_path"])
-        assert not stem.with_name(f"{stem.stem}_parts_base.png").exists()
+        assert len(calls) == 2
+        assert "분해도(exploded view)" not in calls[1]["prompt"]
+        plain_state = json.loads(figure[texture_module.TEXTURE_DESIGN_STATE_PROPERTY])
+        assert "explode" not in plain_state["projection"], plain_state["projection"].keys()
+        stem = Path(plain_state["turnaround_path"])
         created_paths.extend(stem.parent.glob(f"{stem.stem}*"))
-        created_paths.append(Path(failed_state["albedo_path"]))
+        if plain_state.get("albedo_path"):
+            created_paths.append(Path(plain_state["albedo_path"]))
+            created_paths.append(Path(plain_state["albedo_path"]).with_name(f"{Path(plain_state['albedo_path']).stem}_verify.png"))
     finally:
         texture_module.subprocess.Popen = original_popen
         if original_key is None:
@@ -653,7 +574,7 @@ def _check_part_mapping_pipeline(texture_module, bake_module, ui_module) -> None
         for path in created_paths:
             path.unlink(missing_ok=True)
         _clear_scene()
-    print("[texture] 파츠별 매핑(파츠 가이드·배치 요청·합성 베이크·변경 감지) 통과")
+    print("[texture] 파츠 분해도(벌린 가이드·1회 요청·분해도 베이크·검증·변경 감지) 통과")
 
 
 def _check_panel_draw(ui_module, settings) -> None:
@@ -2470,7 +2391,7 @@ def main() -> None:
     _check_mapping_parts(ui_module)
 
     _check_full_pipeline(texture_module, bake_module, ui_module)
-    _check_part_mapping_pipeline(texture_module, bake_module, ui_module)
+    _check_exploded_generation(texture_module, bake_module, ui_module)
 
     _clear_scene()
     addon.unregister()

@@ -102,7 +102,7 @@ class UVMAPPING_PG_mapping_part(PropertyGroup):
     name: StringProperty(name="이름", default="파츠", update=_on_part_name_update)
     kind: EnumProperty(
         name="종류",
-        description="인체 단위 프리셋. 생성 프롬프트와 처리 순서에 쓰입니다",
+        description="인체 단위 프리셋. 이름 매칭과 기본 파츠 이름에 쓰입니다",
         items=_KIND_ITEMS,
         default=CUSTOM_KIND,
         update=_on_part_kind_update,
@@ -395,67 +395,28 @@ def show_all_parts(obj) -> None:
     data.isolated = -1
 
 
-def plan_part_passes(objects) -> tuple[mapping_parts.PartPass, ...]:
-    """대상 객체들의 등록 파츠를 파츠별 매핑 패스로 묶는다(면이 있는 파츠만).
+def part_attribute_map(objects) -> dict[str, list[str]]:
+    """객체 이름 → 면이 있는 파츠의 면 속성 이름 목록(패널 순서). 분해도 생성이 쓴다.
 
     Object Mode에서 불러야 면 속성이 최신이다.
     """
 
-    entries = []
+    result: dict[str, list[str]] = {}
     for obj in objects:
         if obj is None or obj.type != "MESH":
             continue
-        mesh = obj.data
-        for part, mask in part_face_masks(mesh):
-            if mask.any():
-                entries.append((obj.name, part.kind, part.name, part.attr))
-    return mapping_parts.plan_part_passes(entries)
+        attributes = [part.attr for part, mask in part_face_masks(obj.data) if mask.any()]
+        if attributes:
+            result[obj.name] = attributes
+    return result
 
 
-def count_part_passes(objects) -> int:
-    """패널 표시용 패스 수. 면 마스크를 읽지 않고 살아 있는 파츠 종류만 센다."""
+def count_parts(objects) -> int:
+    """패널 표시용 등록 파츠 수. 면 마스크를 읽지 않고 살아 있는 파츠만 센다."""
 
-    keys = {
-        mapping_parts.part_key(part.kind, part.name)
-        for obj in objects
-        if obj is not None and obj.type == "MESH"
-        for _index, part in live_parts(obj.data)
-    }
-    return len(keys)
-
-
-def members_signature(objects, members) -> str:
-    """파츠 패스의 면 구성 지문. 생성 뒤 파츠 면이 바뀌었는지 베이크 때 비교한다.
-
-    Args:
-        objects: 대상 객체들
-        members: 객체 이름 → 면 속성 이름 목록
-    """
-
-    import hashlib
-
-    digest = hashlib.sha256()
-    by_name = {obj.name: obj for obj in objects}
-    for name in sorted(members):
-        obj = by_name.get(name)
-        digest.update(name.encode("utf-8"))
-        digest.update(b"\0")
-        if obj is None:
-            digest.update(b"missing\0")
-            continue
-        mesh = obj.data
-        combined = np.zeros(len(mesh.polygons), dtype=bool)
-        for attr_name in sorted(members[name]):
-            attr = mesh.attributes.get(attr_name)
-            if not _is_part_attribute(attr) or len(attr.data) != len(combined):
-                digest.update(f"missing:{attr_name}\0".encode("utf-8"))
-                continue
-            values = np.zeros(len(combined), dtype=bool)
-            attr.data.foreach_get("value", values)
-            combined |= values
-        digest.update(np.packbits(combined).tobytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
+    return sum(
+        len(live_parts(obj.data)) for obj in objects if obj is not None and obj.type == "MESH"
+    )
 
 
 def _redraw(context) -> None:
@@ -728,16 +689,15 @@ __all__ = (
     "PREV_HIDE_ATTR",
     "active_mesh_object",
     "classes",
-    "count_part_passes",
+    "count_parts",
     "coverage_report",
     "is_live",
     "isolate_part",
     "live_parts",
-    "members_signature",
     "mesh_parts",
     "part_face_mask",
     "part_face_masks",
-    "plan_part_passes",
+    "part_attribute_map",
     "show_all_parts",
     "sync_parts",
 )

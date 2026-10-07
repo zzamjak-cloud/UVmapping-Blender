@@ -18,7 +18,6 @@ from uvmapping.mapping_parts import (
     kind_label,
     match_body_part,
     next_unregistered_kind,
-    prompt_label,
 )
 
 
@@ -138,10 +137,7 @@ def test_default_part_name_avoids_collisions() -> None:
     assert default_part_name(CUSTOM_KIND, ["머리"], 2) == "파츠 2"
 
 
-def test_prompt_label_and_duplicates() -> None:
-    assert prompt_label("ARM_R", "아무 이름") == "right arm"
-    assert prompt_label(CUSTOM_KIND, " 꼬리 ") == "꼬리"
-    assert prompt_label(CUSTOM_KIND, "") == "part"
+def test_duplicates() -> None:
     assert duplicate_kinds(["HEAD", "TORSO", "HEAD", CUSTOM_KIND, CUSTOM_KIND, "HEAD"]) == ("HEAD",)
 
 

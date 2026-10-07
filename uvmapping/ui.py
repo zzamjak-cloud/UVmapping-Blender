@@ -19,7 +19,7 @@ from .texture_operators import (
     texture_targets,
     texture_verification_summary,
 )
-from .texture_pipeline import MAX_PART_PASSES, resolve_composition
+from .texture_pipeline import resolve_composition
 from .texture_presets import (
     matching_quality_preset,
     resolved_image_quality,
@@ -240,17 +240,7 @@ class UVMAPPING_PT_ai_texture(Panel):
         call_count = turnaround_call_count(
             settings.turnaround_layout, settings.generation_mode
         )
-        part_calls = (
-            min(MAX_PART_PASSES, part_operators.count_part_passes(texture_targets(context)))
-            if settings.part_mapping
-            else 0
-        )
-        if part_calls:
-            quality_box.label(
-                text=f"전신 {call_count}회 + 파츠 최대 {part_calls}회 · 비용 최대 약 {call_count + part_calls}배",
-                icon="ERROR",
-            )
-        elif call_count > 1:
+        if call_count > 1:
             quality_box.label(
                 text=f"OpenRouter 호출 {call_count}회 · 비용 약 {call_count}배",
                 icon="ERROR",
@@ -400,6 +390,7 @@ class UVMAPPING_PT_ai_texture(Panel):
         band.enabled = settings.dominant_view_blend
         band.prop(settings, "transition_band_degrees")
         expert.prop(settings, "harmonize_view_colors")
+        expert.prop(settings, "band_align")
         expert.prop(settings, "silhouette_warp")
         expert.prop(settings, "texture_analysis_model")
         expert.prop(settings, "texture_image_model")
@@ -529,22 +520,22 @@ class UVMAPPING_PT_mapping_parts(Panel):
 
     @staticmethod
     def _draw_part_mapping(layout, context) -> None:
-        """생성 때 파츠별 매핑을 이어서 할지와 경계 혼합 폭."""
+        """생성 때 등록 파츠를 벌린 분해도로 그릴지."""
 
         settings = context.scene.uvmapping_settings
         box = layout.box()
         box.prop(settings, "part_mapping")
+        count = part_operators.count_parts(texture_targets(context))
         if not settings.part_mapping:
+            if count:
+                # 파츠를 등록해 두고 끈 채 생성하면 가려진 면이 그대로 비어 결과가 나아지지 않는다.
+                box.label(text=f"등록 파츠 {count}개가 있지만 분해도 생성이 꺼져 있습니다", icon="ERROR")
+                box.label(text="켜지 않으면 팔에 가린 옆구리·다리 안쪽이 비어 보일 수 있습니다")
             return
-        count = part_operators.count_part_passes(texture_targets(context))
         if not count:
-            box.label(text="등록된 파츠가 없어 전신만 생성합니다", icon="INFO")
+            box.label(text="등록된 파츠가 없어 원래 자세 그대로 생성합니다", icon="INFO")
             return
-        calls = min(count, MAX_PART_PASSES)
-        box.label(text=f"전신 생성 뒤 파츠 최대 {calls}개를 1회씩 다시 생성합니다", icon="INFO")
-        if count > MAX_PART_PASSES:
-            box.label(text=f"파츠는 한 번에 {MAX_PART_PASSES}개까지만 진행합니다", icon="ERROR")
-        box.prop(settings, "part_blend_percent")
+        box.label(text=f"파츠 {count}개를 시점마다 벌려 한 번에 생성합니다(추가 호출 없음)", icon="INFO")
 
     @staticmethod
     def _draw_coverage(layout, mesh) -> None:

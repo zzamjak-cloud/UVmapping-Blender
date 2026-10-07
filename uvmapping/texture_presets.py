@@ -157,6 +157,9 @@ def turnaround_call_count(layout: str, generation_mode: str) -> int:
     composition = resolve_composition(layout)
     if str(generation_mode).upper() == "SEQUENTIAL":
         return len(composition.views)
+    if str(generation_mode).upper() == "PART_SEQUENCE":
+        # 머리·몸통, 팔·다리. 파츠가 없는 그룹은 건너뛰므로 최대값이다.
+        return 2
     return len(composition.groups)
 
 

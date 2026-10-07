@@ -21,10 +21,10 @@ import bpy
 from bpy.props import CollectionProperty, StringProperty
 from bpy.types import Operator, OperatorFileListElement
 from bpy_extras.io_utils import ImportHelper
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
-from . import clipboard_image, native_input, part_operators, texture_bake, texture_errors
-from .properties import DEFAULT_DOMINANT_VIEW_BLEND, DEFAULT_PART_BLEND_PERCENT, get_addon_preferences
+from . import clipboard_image, native_input, part_operators, part_sequence, texture_bake, texture_errors
+from .properties import DEFAULT_DOMINANT_VIEW_BLEND, get_addon_preferences
 from .quality import evaluate_atlas_quality
 from .openrouter_provider import (
     effective_image_size,
@@ -38,7 +38,6 @@ from .texture_pipeline import (
     CONTACT_SHEET_ROLE,
     DEFAULT_IMAGE_SIZE,
     FRONT_COLOR_REFERENCE_ROLE,
-    MAX_PART_PASSES,
     USER_REFERENCE_ROLE,
     resolve_image_size,
     REFERENCE_IMAGE_MIME_TYPES,
@@ -47,12 +46,10 @@ from .texture_pipeline import (
     TurnaroundComposition,
     TurnaroundImageRequest,
     TurnaroundLayout,
-    build_part_refine_request,
     build_reference_analysis_prompt,
     build_turnaround_batch_request,
     build_turnaround_request,
     parse_reference_analysis,
-    part_refine_layout_name,
     resolve_composition,
     resolve_layout,
     single_view_layout,
@@ -473,15 +470,23 @@ def _evaluated_geometry_sha256(context, objects: tuple) -> str:
     return digest.hexdigest()
 
 
-def _projection_contract(context, objects: tuple) -> dict:
-    """모델 캡처와 UV 투영이 공유하는 직교 카메라 계약을 만든다."""
+def _projection_contract(
+    context, objects: tuple, *, explode: bool = False, part_attributes: Mapping[str, Sequence[str]] | None = None
+) -> dict:
+    """모델 캡처와 UV 투영이 공유하는 직교 카메라 계약을 만든다.
+
+    ``explode``가 참이면 등록 파츠를 시점마다 서로 가리지 않게 벌린 분해도 배치를
+    ``explode``에, 그 배치가 화면에 다 들어오는 카메라 축척을 ``capture_scale``에 담는다.
+    ``ortho_scale``은 원래 모델 기준 그대로 두어 생성 뒤 형상 변경 검사가 같은 값을 비교한다.
+    ``part_attributes``를 주면 패널의 파츠 목록 대신 그 면 속성으로 나눈다(부위별 임시 객체용).
+    """
 
     minimum, maximum = _world_bounds(context, objects)
     center = (minimum + maximum) * 0.5
     extent = maximum - minimum
     scale = max(extent.x, extent.y, extent.z, 0.01) * 1.2
     distance = max(extent.length, 1.0) * 2.0
-    return {
+    contract = {
         "bounds_min": tuple(minimum),
         "bounds_max": tuple(maximum),
         "center": tuple(center),
@@ -494,6 +499,15 @@ def _projection_contract(context, objects: tuple) -> dict:
             for obj in objects
         },
     }
+    if explode:
+        attributes = part_attributes if part_attributes is not None else part_operators.part_attribute_map(objects)
+        plan = texture_bake.plan_explode_for_objects(context, objects, attributes)
+        if plan is not None:
+            contract["explode"] = plan
+            contract["capture_scale"] = float(
+                max(scale, texture_bake.projection_scale(context, objects, explode=plan))
+            )
+    return contract
 
 
 # 시점별 카메라 위치(단위 방향). 축 배치는 texture_bake.VIEW_SPECS와 일치해야 한다.
@@ -547,6 +561,85 @@ def _render_model_views(
     )
 
 
+def _explode_pieces(projection: Mapping) -> dict[str, int] | None:
+    """투영 계약의 분해도에서 시점별 떨어진 조각 수. 분해도가 아니면 None."""
+
+    from .explode_layout import explode_piece_counts
+
+    explode = projection.get("explode")
+    return explode_piece_counts(explode.get("shifts") or {}) if explode else None
+
+
+def _explode_render_objects(context, objects: tuple, explode: Mapping) -> tuple[list, set]:
+    """분해도 묶음마다 면을 떼어 낸 임시 객체를 만든다.
+
+    Returns:
+        ([(임시 객체, 원래 월드 행렬, 시점 → (right, up) 이동량)], 대신 숨길 원본 객체 집합).
+        파츠가 없는 객체는 나누지 않고 원본을 그대로 렌더한다.
+    """
+
+    import bmesh
+
+    depsgraph = context.evaluated_depsgraph_get()
+    members = {str(member[0]): member for member in explode.get("members", ())}
+    offsets: dict[str, int] = {}
+    offset = 0
+    for member in explode.get("members", ()):
+        offsets[str(member[0])] = offset
+        offset += int(member[2])
+    shifts_by_view = explode.get("shifts") or {}
+    created: list = []
+    replaced: set = set()
+    try:
+        for obj in objects:
+            if obj.name not in members:
+                continue
+            evaluated = obj.evaluated_get(depsgraph)
+            source = bpy.data.meshes.new_from_object(evaluated, preserve_all_data_layers=True, depsgraph=depsgraph)
+            try:
+                assignment = texture_bake.explode_member_groups(source, members[obj.name])
+                for group in range(int(members[obj.name][2])):
+                    mesh = source.copy()
+                    work = bmesh.new()
+                    try:
+                        work.from_mesh(mesh)
+                        work.faces.ensure_lookup_table()
+                        outside = [face for face in work.faces if assignment[face.index] != group]
+                        if outside:
+                            bmesh.ops.delete(work, geom=outside, context="FACES")
+                        work.to_mesh(mesh)
+                    finally:
+                        work.free()
+                    temporary = bpy.data.objects.new(f"UVMapping 분해도 · {obj.name} · {group}", mesh)
+                    temporary.matrix_world = obj.matrix_world.copy()
+                    # 객체에 연결된 머티리얼 슬롯은 Mesh 복사로 따라오지 않는다.
+                    for index, slot in enumerate(obj.material_slots):
+                        if slot.link == "OBJECT" and index < len(temporary.material_slots):
+                            temporary.material_slots[index].link = "OBJECT"
+                            temporary.material_slots[index].material = slot.material
+                    context.scene.collection.objects.link(temporary)
+                    view_shifts = {
+                        view: tuple(float(value) for value in values[offsets[obj.name] + group])
+                        for view, values in shifts_by_view.items()
+                    }
+                    created.append((temporary, obj.matrix_world.copy(), view_shifts))
+            finally:
+                bpy.data.meshes.remove(source)
+            replaced.add(obj)
+    except Exception:
+        _remove_explode_render_objects(created)
+        raise
+    return created, replaced
+
+
+def _remove_explode_render_objects(created: Sequence) -> None:
+    for temporary, _matrix, _shifts in tuple(created):
+        mesh = temporary.data
+        bpy.data.objects.remove(temporary, do_unlink=True)
+        if mesh is not None and mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+
+
 def _render_model_views_impl(
     context,
     objects: tuple,
@@ -564,8 +657,10 @@ def _render_model_views_impl(
         raise ValueError(f"지원하지 않는 캡처 시점입니다: {', '.join(unknown)}")
     center = Vector(projection["center"])
     extent = Vector(projection["extent"])
-    scale = float(projection["ortho_scale"])
+    # 분해도는 파츠를 옆으로 벌려 원래 모델보다 넓으므로 그만큼 넓게 찍는다.
+    scale = float(projection.get("capture_scale") or projection["ortho_scale"])
     distance = float(projection["camera_distance"])
+    explode = projection.get("explode")
     output_dir = Path(tempfile.gettempdir()) / "uvmapping_ai" / uuid.uuid4().hex
     output_dir.mkdir(parents=True, exist_ok=False)
 
@@ -598,11 +693,19 @@ def _render_model_views_impl(
         "shading_single_color": tuple(shading.single_color),
         "shading_background_type": shading.background_type,
         "shading_background_color": tuple(shading.background_color),
+        "shading_backface_culling": shading.show_backface_culling,
     }
-    hidden = {obj: obj.hide_render for obj in scene.objects if obj != camera}
-    selected = set(objects)
+    exploded_parts: list = []
+    hidden: dict = {}
     paths: dict[str, Path] = {}
     try:
+        selected = set(objects)
+        if explode:
+            exploded_parts, replaced = _explode_render_objects(context, objects, explode)
+            selected = (selected - replaced) | {temporary for temporary, _matrix, _shifts in exploded_parts}
+            # 떼어 낸 파츠의 잘린 단면 안쪽(몸통의 팔 구멍 등)이 보이지 않게 한다.
+            shading.show_backface_culling = True
+        hidden = {obj: obj.hide_render for obj in scene.objects if obj != camera}
         for obj in hidden:
             obj.hide_render = obj not in selected
         try:
@@ -636,6 +739,11 @@ def _render_model_views_impl(
         render.image_settings.file_format = "PNG"
 
         for view in view_names:
+            spec = texture_bake.VIEW_SPECS[view]
+            for temporary, matrix, view_shifts in exploded_parts:
+                shift_right, shift_up = view_shifts.get(view, (0.0, 0.0))
+                offset = Vector(spec.right) * shift_right + Vector(spec.up) * shift_up
+                temporary.matrix_world = Matrix.Translation(offset) @ matrix
             camera.location = center + _CAMERA_DIRECTIONS[view] * distance
             if view == "TOP":
                 # 위에서 내려다볼 때 up 벡터가 시선과 평행해 track 방식이 불안정하다.
@@ -672,6 +780,8 @@ def _render_model_views_impl(
         shading.single_color = saved["shading_single_color"]
         shading.background_type = saved["shading_background_type"]
         shading.background_color = saved["shading_background_color"]
+        shading.show_backface_culling = saved["shading_backface_culling"]
+        _remove_explode_render_objects(exploded_parts)
         bpy.data.objects.remove(camera, do_unlink=True)
         bpy.data.cameras.remove(camera_data)
     return paths
@@ -1238,7 +1348,6 @@ def shutdown() -> None:
         if (
             isinstance(payload, dict)
             and payload.get("generation_mode") == "SEQUENTIAL"
-            and not payload.get("part_phase_started")
         ):
             # 진행 중 표시가 영구히 남으면 베이크도 재생성 안내도 막힌다.
             try:
@@ -1570,12 +1679,24 @@ def _start_turnaround_generation(context, *, objects: Sequence = ()) -> None:
     quality = provider_quality(
         model, settings.texture_image_quality, settings.texture_quality_preset
     )
-    projection = _projection_contract(context, objects)
+    part_sequence_mode = settings.generation_mode == PART_SEQUENCE_MODE
+    if part_sequence_mode and not part_operators.count_parts(objects):
+        raise ValueError("부위별 순차 생성은 매핑 파츠를 먼저 등록해야 합니다.")
+    # 등록 파츠가 있으면 시점마다 파츠를 벌린 분해도로 생성해 가려진 면이 없게 한다.
+    # 부위별 순차는 그룹마다 따로 벌리므로 전체 계약은 원래 자세로 둔다(형상 변경 검사용).
+    projection = _projection_contract(
+        context,
+        objects,
+        explode=not part_sequence_mode
+        and bool(settings.part_mapping)
+        and part_operators.count_parts(objects) > 0,
+    )
+    exploded = bool(projection.get("explode"))
     output_path = _output_path(context, objects)
     contact_sheet = None
     group_sheets: dict[str, Path] = {}
-    if sequential:
-        # 순차 모드는 시점마다 가이드를 따로 그리므로 여기서 합성하지 않는다.
+    if sequential or part_sequence_mode:
+        # 순차 모드는 시점마다, 부위별 순차는 그룹마다 가이드를 따로 그린다.
         pass
     elif single_canvas:
         model_paths = _render_model_views(context, objects, projection, layout_spec.views)
@@ -1641,10 +1762,11 @@ def _start_turnaround_generation(context, *, objects: Sequence = ()) -> None:
         "output_stem_path": str(output_path),
         "attempt": 0,
         "feedback_views": (),
-        # 파츠별 매핑은 전신 결과가 확정된 뒤(재생성까지 끝난 뒤) 한 번만 이어진다.
-        "part_mapping": bool(settings.part_mapping),
         "turnaround_image_size_setting": str(settings.turnaround_image_size),
     }
+    if part_sequence_mode:
+        _start_part_sequence(context, objects, payload, output_path)
+        return
     if sequential:
         payload.update(
             {
@@ -1693,13 +1815,14 @@ def _start_turnaround_generation(context, *, objects: Sequence = ()) -> None:
         layout_name=layout_spec.name,
         image_size=image_size,
         quality=quality,
+        exploded_pieces=_explode_pieces(projection),
     )
     job = _turnaround_job(request, (contact_sheet, *generation_references), output_path)
     _start_worker(
         context.scene,
         job,
         api_key,
-        f"한 번의 요청으로 {_layout_label(layout_spec)} 생성 중…",
+        f"한 번의 요청으로 {_layout_label(layout_spec)}{'(파츠 분해도)' if exploded else ''} 생성 중…",
         payload,
         _finish_turnaround,
     )
@@ -1817,14 +1940,6 @@ def _finalize_turnaround(
             f"실루엣 불일치 잔존: {', '.join(failed_views)}. "
             "결과를 확인하고 필요하면 재생성해 주세요"
         )
-        settings.texture_status = f"{label} 생성 완료 · {warning}"
-    if _part_mapping_pending(payload) and _launch_part_passes(
-        scene, payload, state, targets, label, carry=warning
-    ):
-        # 파츠 결과를 회수한 콜백이 자동 적용까지 이어 간다.
-        return
-    if _part_phase_note(payload):
-        warning = f"{warning} · {_part_phase_note(payload)}" if warning else _part_phase_note(payload)
         settings.texture_status = f"{label} 생성 완료 · {warning}"
     if not settings.auto_apply_diffuse:
         return
@@ -1963,6 +2078,7 @@ def _start_turnaround_round(
         regeneration_feedback={
             str(name): tuple(views) for name, views in payload.get("group_feedback", {}).items()
         },
+        exploded_pieces=_explode_pieces(payload["projection"]),
     )
     output_paths: dict[str, Path] = {}
     image_paths: dict[str, tuple[Path, ...]] = {}
@@ -2155,6 +2271,7 @@ def _precheck_silhouettes(scene, payload: dict, targets: tuple, crop_paths: dict
                 targets,
                 view_paths,
                 _uv_layer_names_from_jobs(payload.get("source_jobs", ()), targets),
+                explode=payload["projection"].get("explode"),
             )
     except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         return {"error": str(exc)}, []
@@ -2181,6 +2298,7 @@ def _launch_regeneration(scene, payload: dict, failed_views: Sequence[str], atte
         image_size=payload.get("image_size") or DEFAULT_IMAGE_SIZE,
         quality=payload.get("quality") or None,
         regeneration_feedback=tuple(failed_views),
+        exploded_pieces=_explode_pieces(payload["projection"]),
     )
     stem_path = Path(payload.get("output_stem_path") or contact_sheet)
     output_path = stem_path.with_name(f"{stem_path.stem}_retry{attempt:02d}.png")
@@ -2261,7 +2379,7 @@ def _bake_settings_from(settings, composition: TurnaroundComposition) -> dict:
         "transition_band_degrees": float(settings.transition_band_degrees),
         "harmonize_view_colors": bool(settings.harmonize_view_colors),
         "silhouette_warp": bool(settings.silhouette_warp),
-        "part_blend_ratio": float(settings.part_blend_percent) / 100.0,
+        "band_align": bool(settings.band_align),
     }
 
 
@@ -2412,6 +2530,7 @@ def _bake_partial(context, objects: tuple, payload: dict) -> Path:
         unpainted_color=unpainted,
         require_all_sources=False,
         allow_view_substitution=False,
+        explode=payload["projection"].get("explode"),
         **_bake_kwargs_from(payload.get("bake_settings", {})),
     )
     payload["partial_bake_stats"] = {
@@ -2481,6 +2600,7 @@ def _launch_sequential_step(context, payload: dict, step: int) -> None:
         quality=payload.get("quality") or None,
         view=view,
         painted_views=tuple(payload["completed_views"]),
+        exploded_pieces=_explode_pieces(projection),
     )
     job = _turnaround_job(
         request,
@@ -2556,10 +2676,6 @@ def _finish_sequential_step(scene, value: dict, payload: dict) -> None:
     targets = _store_state(payload, ready_state)
     label = f"{len(views)}면도(순차)"
     settings.texture_status = f"{label} 생성 완료 · Diffuse/Albedo를 적용해 주세요"
-    if _part_mapping_pending(payload) and _launch_part_passes(scene, payload, ready_state, targets, label):
-        return
-    if _part_phase_note(payload):
-        settings.texture_status = f"{label} 생성 완료 · {_part_phase_note(payload)}"
     if not settings.auto_apply_diffuse:
         return
     if len(targets) != len(payload["target_keys"]):
@@ -2580,388 +2696,6 @@ def _finish_sequential_step(scene, value: dict, payload: dict) -> None:
             fallback=texture_errors.LOCAL,
         )
         return
-    if _part_phase_note(payload):
-        settings.texture_status = f"{settings.texture_status} · {_part_phase_note(payload)}"
-
-
-def _part_mapping_pending(payload: dict) -> bool:
-    """생성을 시작할 때 파츠별 매핑을 켰고 아직 파츠 단계를 돌지 않았는지."""
-
-    return bool(payload.get("part_mapping")) and not payload.get("part_phase_started")
-
-
-def _part_render_objects(context, objects: tuple, members: Mapping[str, Sequence[str]], uv_layer_names) -> list:
-    """파츠 면만 남긴 임시 객체를 만든다. 가이드 렌더 동안만 씬에 둔다.
-
-    원본 객체의 면 숨김은 렌더에 반영되지 않으므로, 평가 Mesh를 복사해 파츠 밖 면을
-    지운 객체를 따로 만들어 그것만 렌더한다. 원본 Mesh와 머티리얼은 건드리지 않는다.
-    """
-
-    import bmesh
-
-    depsgraph = context.evaluated_depsgraph_get()
-    created: list = []
-    try:
-        for obj, uv_name in zip(objects, uv_layer_names):
-            attributes = tuple(members.get(obj.name, ()))
-            if not attributes:
-                continue
-            evaluated = obj.evaluated_get(depsgraph)
-            mesh = bpy.data.meshes.new_from_object(
-                evaluated, preserve_all_data_layers=True, depsgraph=depsgraph
-            )
-            mask = texture_bake._evaluated_face_mask(mesh, attributes)
-            work = bmesh.new()
-            try:
-                work.from_mesh(mesh)
-                work.faces.ensure_lookup_table()
-                outside = [face for face in work.faces if not mask[face.index]]
-                if outside:
-                    bmesh.ops.delete(work, geom=outside, context="FACES")
-                work.to_mesh(mesh)
-            finally:
-                work.free()
-            uv_layer = mesh.uv_layers.get(uv_name)
-            if uv_layer is not None:
-                # Workbench 텍스처 색은 활성 렌더 UV로 그린다.
-                uv_layer.active = True
-                uv_layer.active_render = True
-            temporary = bpy.data.objects.new(f"UVMapping 파츠 가이드 · {obj.name}", mesh)
-            temporary.matrix_world = obj.matrix_world.copy()
-            context.scene.collection.objects.link(temporary)
-            created.append(temporary)
-    except Exception:
-        _remove_part_render_objects(created)
-        raise
-    return created
-
-
-def _remove_part_render_objects(objects: Sequence) -> None:
-    for obj in tuple(objects):
-        mesh = obj.data
-        bpy.data.objects.remove(obj, do_unlink=True)
-        if mesh is not None and mesh.users == 0:
-            bpy.data.meshes.remove(mesh)
-
-
-def _state_view_paths(state: dict) -> dict[str, Path]:
-    """상태의 시점 결과 경로(대문자 키). 구성에 없는 키는 그대로 둔다."""
-
-    return {str(view).upper(): Path(str(path)) for view, path in (state.get("views") or {}).items()}
-
-
-def _part_phase_note(payload: dict) -> str:
-    """파츠 단계를 시작하지 못한 사유. 자동 적용 뒤 상태 줄에 덧붙인다."""
-
-    return str(payload.get("part_phase_note", ""))
-
-
-def _launch_part_passes(
-    scene, payload: dict, state: dict, targets: tuple, label: str, carry: str = ""
-) -> bool:
-    """전신 결과를 바탕으로 파츠별 매핑 배치 요청을 시작한다.
-
-    파츠마다 전신 결과를 그 파츠에만 입혀(가려 보이지 않던 면은 회색) 파츠 단독으로
-    렌더한 가이드를 만들고, 파츠당 1회씩 한 배치로 동시에 요청한다. 시작하지 못하면
-    상태 줄에 사유를 남기고 거짓을 돌려줘 호출 측이 전신 결과로 마무리하게 한다.
-    """
-
-    settings = scene.uvmapping_settings
-    payload["part_phase_started"] = True
-    if len(targets) != len(payload["target_keys"]):
-        payload["part_phase_note"] = "대상 객체가 바뀌어 파츠별 매핑을 건너뜁니다"
-        return False
-    created_files: list[Path] = []
-    try:
-        with _bake_context(scene) as context:
-            ensure_object_mode(context, targets)
-            plan = part_operators.plan_part_passes(targets)
-            if not plan:
-                payload["part_phase_note"] = "면이 있는 매핑 파츠가 없어 파츠별 매핑을 건너뜁니다"
-                return False
-            skipped = plan[MAX_PART_PASSES:]
-            plan = plan[:MAX_PART_PASSES]
-            composition = state_composition(state)
-            layout = resolve_layout(part_refine_layout_name(composition.views))
-            jobs = tuple(json.loads(obj[TEXTURE_JOB_PROPERTY]) for obj in targets)
-            resolution, padding, uv_layer_names = _bake_parameters(settings, targets, jobs)
-            bake_settings = dict(payload.get("bake_settings") or _bake_settings_from(settings, composition))
-            stem_path = Path(payload["output_stem_path"])
-            base_path = stem_path.with_name(f"{stem_path.stem}_parts_base.png")
-            _set_status(scene, f"파츠별 매핑 · 전신 결과 굽는 중…")
-            # 가려 보이지 않던 면은 회색으로 남겨 AI가 새로 칠할 곳을 알아보게 한다.
-            texture_bake.rasterize_to_png(
-                context,
-                targets,
-                _state_view_paths(state),
-                base_path,
-                min(resolution, MODEL_CAPTURE_RESOLUTION),
-                padding,
-                uv_layer_names=uv_layer_names,
-                unpainted_color=tuple(texture_bake.srgb_to_linear(value) for value in CAPTURE_MODEL_COLOR),
-                occlusion_fallback=False,
-                **_bake_kwargs_from(bake_settings),
-            )
-            created_files.append(base_path)
-            references = tuple(Path(path) for path in payload.get("reference_image_paths", ()))
-            image_size = effective_image_size(
-                payload["model"],
-                resolve_image_size(
-                    layout,
-                    payload.get("turnaround_image_size_setting") or settings.turnaround_image_size,
-                ),
-            )
-            records = []
-            groups = []
-            skipped_reasons: list[str] = [f"{part.label}(한도 초과)" for part in skipped]
-            for index, part in enumerate(plan):
-                _set_status(scene, f"파츠별 매핑 · {part.label} 가이드 렌더 중 ({index + 1}/{len(plan)})…")
-                members: dict[str, list[str]] = {}
-                for object_name, attribute in part.members:
-                    members.setdefault(object_name, []).append(attribute)
-                try:
-                    # 속성을 지우는 Modifier가 있으면 평가 Mesh에서 그 파츠만 비어 있을 수 있다.
-                    projection = texture_bake.part_projection(context, targets, uv_layer_names, members)
-                except ValueError as exc:
-                    skipped_reasons.append(f"{part.label}({exc})")
-                    continue
-                render_objects = _part_render_objects(context, targets, members, uv_layer_names)
-                try:
-                    captures = _render_model_views(
-                        context, tuple(render_objects), projection, layout.views, texture_path=base_path
-                    )
-                finally:
-                    _remove_part_render_objects(render_objects)
-                try:
-                    sheet = _join_grid(
-                        tuple(captures[view] for view in layout.views),
-                        layout,
-                        stem_path.with_name(f"{stem_path.stem}_part{index:02d}_guide.png"),
-                    )
-                finally:
-                    _discard_capture_files(captures)
-                created_files.append(sheet)
-                request = build_part_refine_request(
-                    _contract_image(sheet, CONTACT_SHEET_ROLE),
-                    tuple(_contract_image(path, USER_REFERENCE_ROLE) for path in references),
-                    payload["analysis_payload"],
-                    payload["user_prompt"],
-                    part_label=part.prompt_label,
-                    model=payload["model"],
-                    layout_name=layout.name,
-                    image_size=image_size,
-                    quality=payload.get("quality") or None,
-                )
-                group_name = f"PART_{index:02d}"
-                groups.append(
-                    {
-                        "name": group_name,
-                        "model": request.model,
-                        "prompt": request.prompt,
-                        "image_paths": [str(sheet), *(str(path) for path in references)],
-                        "output_path": str(stem_path.with_name(f"{stem_path.stem}_part{index:02d}.png")),
-                        "aspect_ratio": request.aspect_ratio,
-                        "resolution": request.image_size,
-                        **({"quality": request.quality} if request.quality else {}),
-                    }
-                )
-                records.append(
-                    {
-                        "group": group_name,
-                        "key": part.key,
-                        "label": part.label,
-                        "prompt_label": part.prompt_label,
-                        "members": members,
-                        "signature": part_operators.members_signature(targets, members),
-                        "projection": {
-                            key: projection[key] for key in ("center", "extent", "ortho_scale", "camera_distance")
-                        },
-                        "guide_path": str(sheet),
-                        "guide_sha256": _file_sha256(sheet),
-                    }
-                )
-            if not groups:
-                raise ValueError(f"요청할 파츠가 없습니다: {', '.join(skipped_reasons)}")
-            api_key = resolve_api_key(context)
-        payload["part_phase"] = {
-            "layout": layout.name,
-            "image_size": image_size,
-            "base_path": str(base_path),
-            "records": records,
-            "skipped": skipped_reasons,
-            "carry": carry,
-        }
-        payload["failure_prefix"] = "파츠별 매핑 실패(전신 결과는 남아 있습니다): "
-        payload["on_worker_failure"] = _part_passes_failed
-        _start_worker(
-            scene,
-            {"action": "turnaround_batch", "groups": groups},
-            api_key,
-            f"파츠별 매핑 {len(groups)}개({', '.join(record['label'] for record in records)}) 요청 중…",
-            payload,
-            _finish_part_passes,
-        )
-        return True
-    except Exception as exc:  # noqa: BLE001 - 어떤 실패도 전신 결과 적용을 막지 않는다.
-        for path in created_files:
-            path.unlink(missing_ok=True)
-        payload.pop("on_worker_failure", None)
-        payload["part_phase_note"] = f"파츠별 매핑을 시작하지 못해 전신 결과로 진행했습니다: {exc}"
-        _record_failure(
-            settings,
-            f"{label} 생성 완료 · {payload['part_phase_note']}",
-            detail=str(exc),
-            fallback=texture_errors.LOCAL,
-        )
-        return False
-
-
-def _part_passes_failed(scene, message: str, payload: dict) -> None:
-    """파츠 배치 작업자 자체가 실패하면 임시 파일을 지우고 전신 결과로 마무리한다."""
-
-    settings = scene.uvmapping_settings
-    phase = payload.get("part_phase") or {}
-    if phase.get("base_path"):
-        Path(str(phase["base_path"])).unlink(missing_ok=True)
-    targets = _payload_objects_present(payload)
-    if not settings.auto_apply_diffuse or len(targets) != len(payload["target_keys"]):
-        return
-    with _bake_context(scene) as context:
-        apply_diffuse(context, tuple(targets), bake_settings=payload.get("bake_settings"))
-    # 적용이 실패 표시를 지우므로, 파츠가 빠졌다는 사실을 팝업 없이 다시 남긴다.
-    _record_failure(
-        settings,
-        f"파츠별 매핑 실패로 전신 결과만 적용했습니다 · {settings.texture_status}",
-        detail=message,
-        notify=False,
-    )
-
-
-def _finish_part_passes(scene, value: dict, payload: dict) -> None:
-    """파츠별 매핑 결과를 크롭해 상태에 남기고, 자동 적용이 켜져 있으면 바로 굽는다."""
-
-    settings = scene.uvmapping_settings
-    phase = payload.get("part_phase") or {}
-    layout = resolve_layout(phase.get("layout"))
-    entries = {
-        str(entry.get("name", "")): entry for entry in value.get("groups", ()) if isinstance(entry, dict)
-    }
-    passes = []
-    failures = []
-    for record in phase.get("records", ()):
-        entry = entries.get(record["group"]) or {}
-        output_path = Path(str(entry.get("output_path", "")))
-        if not (entry.get("ok") and str(output_path) and output_path.is_file()):
-            failures.append(f"{record['label']}({entry.get('error') or '결과 파일이 없습니다'})")
-            continue
-        try:
-            crops = _crop_turnaround(output_path, layout)
-        except (OSError, RuntimeError, ValueError) as exc:
-            failures.append(f"{record['label']}({exc})")
-            continue
-        passes.append(
-            {
-                **{key: value for key, value in record.items() if key != "group"},
-                "layout": layout.name,
-                "image_path": str(output_path),
-                "views": {view: str(path) for view, path in crops.items()},
-                "view_sha256": {view: _file_sha256(path) for view, path in crops.items()},
-            }
-        )
-    base_path = phase.get("base_path")
-    if base_path:
-        Path(str(base_path)).unlink(missing_ok=True)
-
-    targets = _payload_objects_present(payload)
-    if not targets:
-        _record_failure(
-            settings,
-            "파츠별 매핑 결과를 받았지만 대상 객체가 사라져 기록하지 못했습니다.",
-            fallback=texture_errors.LOCAL,
-        )
-        return
-    try:
-        state = json.loads(targets[0][TEXTURE_DESIGN_STATE_PROPERTY])
-    except (KeyError, TypeError, json.JSONDecodeError):
-        _record_failure(settings, "파츠별 매핑 결과를 기록할 다면도 상태를 찾지 못했습니다.", fallback=texture_errors.LOCAL)
-        return
-    state["part_passes"] = passes
-    state["part_pass_failures"] = failures
-    state["part_pass_skipped"] = list(phase.get("skipped", ()))
-    targets = _store_state(payload, state)
-    if passes:
-        settings.texture_output_path = str(passes[-1]["image_path"])
-
-    summary = f"파츠별 매핑 {len(passes)}개 완료"
-    if failures:
-        summary += f" · 실패 {len(failures)}개: {', '.join(failures)}"
-    if phase.get("skipped"):
-        summary += f" · 건너뜀: {', '.join(phase['skipped'])}"
-    if phase.get("carry"):
-        summary += f" · {phase['carry']}"
-    settings.texture_status = f"{summary} · Diffuse/Albedo를 적용해 주세요"
-    if failures and not passes:
-        _record_failure(settings, f"파츠별 매핑이 모두 실패했습니다: {', '.join(failures)}")
-    if not settings.auto_apply_diffuse:
-        return
-    if len(targets) != len(payload["target_keys"]):
-        settings.texture_status = (
-            f"{summary} · 대상 객체가 바뀌어 자동 적용을 건너뜁니다. 대상을 다시 지정하고 적용해 주세요."
-        )
-        return
-    try:
-        with _bake_context(scene) as context:
-            apply_diffuse(context, tuple(targets), bake_settings=payload.get("bake_settings"))
-    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-        _record_failure(
-            settings,
-            f"{summary} · 자동 적용 실패: {exc}",
-            detail=str(exc),
-            fallback=texture_errors.LOCAL,
-        )
-        return
-    settings.texture_status = f"{summary} · {settings.texture_status}"
-
-
-def _payload_objects_present(payload: dict) -> tuple:
-    """작업을 시작한 객체 중 아직 남아 있는 것만 돌려준다."""
-
-    objects = []
-    for name, session_uid in payload["target_keys"]:
-        obj = bpy.data.objects.get(name)
-        if obj is not None and obj.session_uid == session_uid:
-            objects.append(obj)
-    return tuple(objects)
-
-
-def _validated_part_passes(state: dict, objects: tuple) -> tuple[list[dict], list[str]]:
-    """상태의 파츠별 결과 중 지금 그대로 쓸 수 있는 것과, 건너뛴 사유 목록.
-
-    생성 뒤 파츠 면을 바꿨거나 결과 파일이 바뀐 파츠는 전신 결과로 두고 경고만 남긴다.
-    """
-
-    usable = []
-    warnings = []
-    for record in state.get("part_passes") or ():
-        label = str(record.get("label", "파츠"))
-        members = {str(name): list(attrs) for name, attrs in dict(record.get("members") or {}).items()}
-        if part_operators.members_signature(objects, members) != record.get("signature"):
-            warnings.append(f"{label}: 생성 뒤 파츠 면이 바뀌어 전신 결과로 둡니다")
-            continue
-        views = {}
-        changed = False
-        expected = record.get("view_sha256") or {}
-        for view, path in dict(record.get("views") or {}).items():
-            candidate = Path(str(path))
-            if not candidate.is_file() or (expected.get(view) and _file_sha256(candidate) != expected[view]):
-                changed = True
-                break
-            views[str(view).upper()] = candidate
-        if changed or not views:
-            warnings.append(f"{label}: 파츠 결과 파일이 없거나 바뀌어 전신 결과로 둡니다")
-            continue
-        usable.append({"label": label, "members": members, "views": views})
-    return usable, warnings
 
 
 @contextmanager
@@ -3018,27 +2752,33 @@ def apply_diffuse(context, objects=None, *, bake_settings: dict | None = None) -
     view_paths = {view: Path(state["views"][view.lower()]) for view in composition.views}
     bake_settings = dict(bake_settings) if bake_settings else _bake_settings_from(settings, composition)
     bake_kwargs = _bake_kwargs_from(bake_settings)
-    part_passes, part_warnings = _validated_part_passes(state, objects)
-    settings.texture_status = (
-        f"{_layout_label(composition)}과 파츠 {len(part_passes)}개에서 Diffuse/Albedo 베이크 중…"
-        if part_passes
-        else f"{_layout_label(composition)}에서 Diffuse/Albedo 베이크 중…"
-    )
+    explode = state["projection"].get("explode")
+    part_state = state.get("part_sequence") if state.get("generation_mode") == PART_SEQUENCE_MODE else None
+    if part_state:
+        settings.texture_status = f"부위 {len(part_state.get('groups', ()))}개 다면도에서 Diffuse/Albedo 베이크 중…"
+    elif explode:
+        settings.texture_status = f"{_layout_label(composition)}(파츠 분해도)에서 Diffuse/Albedo 베이크 중…"
+    else:
+        settings.texture_status = f"{_layout_label(composition)}에서 Diffuse/Albedo 베이크 중…"
     _tag_texture_panels_redraw()
-    result = texture_bake.bake_diffuse(
-        context,
-        objects,
-        view_paths,
-        output_path,
-        resolution,
-        padding,
-        uv_layer_names=uv_layer_names,
-        part_passes=part_passes,
-        part_blend_ratio=float(
-            bake_settings.get("part_blend_ratio", DEFAULT_PART_BLEND_PERCENT / 100.0)
-        ),
-        **bake_kwargs,
-    )
+    if part_state:
+        result = _bake_part_sequence(
+            context, objects, part_state, output_path, resolution, padding, bake_settings, bake_kwargs
+        )
+    else:
+        result = texture_bake.bake_diffuse(
+            context,
+            objects,
+            view_paths,
+            output_path,
+            resolution,
+            padding,
+            uv_layer_names=uv_layer_names,
+            explode=explode,
+            # 파츠가 없으면 객체 전체를 한 묶음으로 맞춘다(빈 매핑). 끄면 None.
+            band_groups=part_operators.part_attribute_map(objects) if bake_settings.get("band_align", True) else None,
+            **bake_kwargs,
+        )
 
     output_path = Path(str(result.get("output_path", output_path)))
     bake_stats = {
@@ -3056,7 +2796,9 @@ def apply_diffuse(context, objects=None, *, bake_settings: dict | None = None) -
             "view_names",
             "view_gains",
             "view_alignment",
-            "part_passes",
+            "exploded",
+            "band_alignment",
+            "layers",
         )
         if key in result
     }
@@ -3079,10 +2821,7 @@ def apply_diffuse(context, objects=None, *, bake_settings: dict | None = None) -
         obj[TEXTURE_DESIGN_STATE_PROPERTY] = encoded_state
     settings.texture_diffuse_path = str(output_path)
 
-    warnings = list(part_warnings)
-    for item in bake_stats.get("part_passes", ()):
-        if not item.get("applied"):
-            warnings.append(f"{item.get('label', '파츠')}: 파츠 결과를 합성하지 못했습니다({item.get('error', '')})")
+    warnings = []
     outside = int(bake_stats.get("outside_atlas_triangles", 0))
     if outside:
         # Mirror·Array의 UV Offset처럼 평가 UV를 0-1 밖으로 미는 설정은
@@ -3091,7 +2830,8 @@ def apply_diffuse(context, objects=None, *, bake_settings: dict | None = None) -
             f"{outside}개 삼각형의 UV가 0-1 밖이라 그 부분이 비었습니다. "
             "Modifier의 UV Offset을 끄거나 UV를 0-1 안으로 옮긴 뒤 다시 실행해 주세요."
         )
-    if settings.verify_after_bake:
+    if settings.verify_after_bake and not part_state:
+        # 부위별 순차는 시점 그림이 부위마다 따로라 전신 렌더와 비교하는 검증을 쓰지 않는다.
         # 적용 결과를 시점별로 다시 렌더해 생성 그림과 대조한다. 로컬 처리라 무과금이다.
         settings.texture_status = "적용 결과를 시점별로 검증 중…"
         _tag_texture_panels_redraw()
@@ -3103,10 +2843,7 @@ def apply_diffuse(context, objects=None, *, bake_settings: dict | None = None) -
         encoded_state = json.dumps(updated, ensure_ascii=False, sort_keys=True)
         for obj in objects:
             obj[TEXTURE_DESIGN_STATE_PROPERTY] = encoded_state
-        verification_warnings = _verification_warnings(verification)
-        if verification_warnings and any(item.get("applied") for item in bake_stats.get("part_passes", ())):
-            verification_warnings.append("파츠별로 다시 그린 영역은 전신 그림과 달라 점수가 낮게 나올 수 있습니다.")
-        warnings.extend(verification_warnings)
+        warnings.extend(_verification_warnings(verification))
     warning = " ".join(warnings)
     status = warning or "Diffuse/Albedo 베이크 및 머티리얼 적용 완료"
     if not warning and updated.get("verification", {}).get("views"):
@@ -3155,6 +2892,7 @@ def _verify_bake(
         uv_layer_names,
         VERIFY_DEPTH_RESOLUTION,
         silhouette_warp=bool(bake_kwargs.get("silhouette_warp", False)),
+        explode=projection.get("explode"),
     )
     rendered = _render_model_views(
         context, objects, projection, composition.views, textured=True, resolution=VERIFY_RENDER_RESOLUTION
@@ -3197,6 +2935,515 @@ def _verify_bake(
         "score_limit": texture_bake.VERIFY_SCORE_LIMIT,
         "passed": passed,
     }
+
+
+# ---------------------------------------------------------------------------
+# 부위별 순차 생성: 몸통·머리·팔·다리 그룹마다 그 부위만 있는 6면도를 생성한다.
+# ---------------------------------------------------------------------------
+
+PART_SEQUENCE_MODE = "PART_SEQUENCE"
+# 부위 단독 다면도는 위·아래 시점까지 담는 6면도로 고정한다(어깨 윗면·발바닥).
+PART_SEQUENCE_LAYOUT = "SIX"
+
+
+def _face_groups_for(mesh, attributes: Sequence[str], kinds: Sequence[str]) -> list[int]:
+    """면마다 드는 부위 그룹 번호. 등록 안 된 면·사용자 지정 파츠는 이어진 그룹을 따른다."""
+
+    part_of_face, _count = texture_bake.explode_face_groups(mesh, attributes)
+    face_vertices = [tuple(polygon.vertices) for polygon in mesh.polygons]
+    return part_sequence.face_group_indices(face_vertices, part_of_face, kinds)
+
+
+def _face_groups_digest(face_groups: Sequence[int]) -> str:
+    return hashlib.sha256(",".join(str(group) for group in face_groups).encode("ascii")).hexdigest()
+
+
+def _part_group_index(key: str) -> int:
+    return next(index for index, group in enumerate(part_sequence.PART_GROUPS) if group.key == key)
+
+
+def _part_sequence_plan(context, objects: tuple, uv_layer_names: Sequence[str]) -> dict:
+    """객체마다 파츠 속성·종류·UV와 면 그룹 지문, 그리고 생성할 그룹 순서."""
+
+    depsgraph = context.evaluated_depsgraph_get()
+    members = []
+    used: set[int] = set()
+    for obj, uv_name in zip(objects, uv_layer_names):
+        parts = [part for _index, part in part_operators.live_parts(obj.data)]
+        attributes = [part.attr for part in parts]
+        kinds = [part.kind for part in parts]
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+        try:
+            face_groups = _face_groups_for(mesh, attributes, kinds)
+        finally:
+            evaluated.to_mesh_clear()
+        used.update(face_groups)
+        members.append(
+            {
+                "object": obj.name,
+                "attributes": attributes,
+                "kinds": kinds,
+                "uv_layer": str(uv_name),
+                "digest": _face_groups_digest(face_groups),
+            }
+        )
+    groups = [group.key for group in part_sequence.used_groups(sorted(used))]
+    return {"members": members, "groups": groups}
+
+
+def _group_attributes(member: Mapping, group_index: int) -> list[str]:
+    """그 그룹에 드는 프리셋 파츠의 면 속성(분해도·띠 높이 맞춤의 파츠 단위)."""
+
+    return [
+        attribute
+        for attribute, kind in zip(member["attributes"], member["kinds"])
+        if part_sequence.group_index_for_kind(kind) == group_index
+    ]
+
+
+def _part_group_objects(context, objects: tuple, plan: Mapping, group_key: str) -> list:
+    """그 그룹 면만 남긴 임시 객체를 만든다. 이름이 생성·베이크 때 같아야 분해도 계약이 맞는다.
+
+    Returns:
+        (임시 객체, 원본 객체의 계획 항목) 목록. 그룹 면이 없는 객체는 빠진다.
+    """
+
+    import bmesh
+
+    group_index = _part_group_index(group_key)
+    by_name = {str(member["object"]): member for member in plan["members"]}
+    depsgraph = context.evaluated_depsgraph_get()
+    created: list = []
+    try:
+        for obj in objects:
+            member = by_name.get(obj.name)
+            if member is None:
+                raise ValueError(f"{obj.name}: 부위별 순차 생성 계획에 없는 객체입니다. 다시 생성해 주세요.")
+            evaluated = obj.evaluated_get(depsgraph)
+            mesh = bpy.data.meshes.new_from_object(evaluated, preserve_all_data_layers=True, depsgraph=depsgraph)
+            face_groups = _face_groups_for(mesh, member["attributes"], member["kinds"])
+            if _face_groups_digest(face_groups) != member["digest"]:
+                bpy.data.meshes.remove(mesh)
+                raise ValueError(f"{obj.name}: 생성 뒤 매핑 파츠 구성이 바뀌었습니다. 다시 생성해 주세요.")
+            if group_index not in face_groups:
+                bpy.data.meshes.remove(mesh)
+                continue
+            work = bmesh.new()
+            try:
+                work.from_mesh(mesh)
+                work.faces.ensure_lookup_table()
+                outside = [face for face in work.faces if face_groups[face.index] != group_index]
+                if outside:
+                    bmesh.ops.delete(work, geom=outside, context="FACES")
+                work.to_mesh(mesh)
+            finally:
+                work.free()
+            name = f"UVMapping 부위 · {group_key} · {obj.name}"
+            stale = bpy.data.objects.get(name)
+            if stale is not None:
+                stale_mesh = stale.data
+                bpy.data.objects.remove(stale, do_unlink=True)
+                if stale_mesh is not None and stale_mesh.users == 0:
+                    bpy.data.meshes.remove(stale_mesh)
+            temporary = bpy.data.objects.new(name, mesh)
+            temporary.matrix_world = obj.matrix_world.copy()
+            for index, slot in enumerate(obj.material_slots):
+                if slot.link == "OBJECT" and index < len(temporary.material_slots):
+                    temporary.material_slots[index].link = "OBJECT"
+                    temporary.material_slots[index].material = slot.material
+            uv_layer = mesh.uv_layers.get(member["uv_layer"])
+            if uv_layer is not None:
+                uv_layer.active = True
+                uv_layer.active_render = True
+            context.scene.collection.objects.link(temporary)
+            created.append((temporary, member))
+    except Exception:
+        _remove_part_group_objects(created)
+        raise
+    if not created:
+        raise ValueError(f"{group_key} 부위에 면이 없습니다.")
+    return created
+
+
+def _remove_part_group_objects(created: Sequence) -> None:
+    for temporary, _member in tuple(created):
+        mesh = temporary.data
+        bpy.data.objects.remove(temporary, do_unlink=True)
+        if mesh is not None and mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+
+
+def _start_part_sequence(context, objects: tuple, payload: dict, output_path: Path) -> None:
+    """그룹마다 가이드를 그리고 첫 그룹(몸통)부터 요청한다."""
+
+    settings = context.scene.uvmapping_settings
+    jobs = tuple(json.loads(obj[TEXTURE_JOB_PROPERTY]) for obj in objects)
+    _resolution, _padding, uv_layer_names = _bake_parameters(settings, objects, jobs)
+    plan = _part_sequence_plan(context, objects, uv_layer_names)
+    layout = resolve_layout(PART_SEQUENCE_LAYOUT)
+    entries = []
+    created_files: list[Path] = []
+    try:
+        for key in plan["groups"]:
+            group = part_sequence.PART_GROUPS[_part_group_index(key)]
+            _set_status(context.scene, f"부위별 순차 · {group.label} 가이드 렌더 중…")
+            parts = _part_group_objects(context, objects, plan, key)
+            try:
+                temporaries = tuple(temporary for temporary, _member in parts)
+                projection = _projection_contract(
+                    context,
+                    temporaries,
+                    explode=True,
+                    part_attributes={
+                        temporary.name: _group_attributes(member, _part_group_index(key)) for temporary, member in parts
+                    },
+                )
+                captures = _render_model_views(context, temporaries, projection, layout.views)
+                try:
+                    sheet = _join_grid(
+                        tuple(captures[view] for view in layout.views),
+                        layout,
+                        output_path.with_name(f"{output_path.stem}_{key.lower()}_geometry.png"),
+                    )
+                finally:
+                    _discard_capture_files(captures)
+            finally:
+                _remove_part_group_objects(parts)
+            created_files.append(sheet)
+            entries.append(
+                {
+                    "key": key,
+                    "label": group.label,
+                    "prompt_label": group.prompt_label,
+                    "projection": projection,
+                    "sheet": str(sheet),
+                    "pieces": _explode_pieces(projection),
+                    "output": str(output_path.with_name(f"{output_path.stem}_{key.lower()}.png")),
+                }
+            )
+        image_size = effective_image_size(
+            payload["model"], resolve_image_size(layout, settings.turnaround_image_size)
+        )
+        payload.update(
+            {
+                "generation_mode": PART_SEQUENCE_MODE,
+                "layout_name": layout.name,
+                "image_size": image_size,
+                "contact_sheet_path": entries[0]["sheet"],
+                "part_sequence": {"plan": plan, "layout": layout.name, "groups": entries, "results": {}},
+            }
+        )
+        api_key = resolve_api_key(context)
+        _launch_part_sequence_round(context.scene, payload, [entries[0]["key"]], api_key)
+    except Exception:
+        for path in created_files:
+            path.unlink(missing_ok=True)
+        raise
+
+
+def _part_sequence_request(payload: dict, entry: Mapping, base_image: Path | None):
+    """그룹 하나의 요청과 첨부 이미지 순서([가이드, 몸통 완성본?, 사용자 참조…])."""
+
+    references = [Path(path) for path in payload.get("reference_image_paths", ())]
+    attachments = ([base_image] if base_image is not None else []) + references
+    request = build_turnaround_request(
+        _contract_image(Path(entry["sheet"]), CONTACT_SHEET_ROLE),
+        tuple(_contract_image(path, USER_REFERENCE_ROLE) for path in attachments),
+        payload["analysis_payload"],
+        payload["user_prompt"],
+        model=payload["model"],
+        layout_name=payload["part_sequence"]["layout"],
+        image_size=payload.get("image_size") or DEFAULT_IMAGE_SIZE,
+        quality=payload.get("quality") or None,
+        exploded_pieces=entry.get("pieces"),
+        part_focus=str(entry["prompt_label"]),
+        base_reference=base_image is not None,
+    )
+    return request, (Path(entry["sheet"]), *attachments)
+
+
+def _launch_part_sequence_round(scene, payload: dict, keys: Sequence[str], api_key: str) -> None:
+    """그룹 한 라운드를 요청한다. 몸통 뒤의 그룹은 몸통 결과를 참조로 붙여 함께 보낸다."""
+
+    sequence = payload["part_sequence"]
+    entries = {entry["key"]: entry for entry in sequence["groups"]}
+    base_key = sequence["groups"][0]["key"]
+    base_result = sequence["results"].get(base_key)
+    base_image = Path(base_result["image_path"]) if base_result else None
+    labels = ", ".join(entries[key]["label"] for key in keys)
+    if len(keys) == 1:
+        request, attachments = _part_sequence_request(payload, entries[keys[0]], base_image)
+        job = _turnaround_job(request, attachments, Path(entries[keys[0]]["output"]))
+    else:
+        groups = []
+        for key in keys:
+            request, attachments = _part_sequence_request(payload, entries[key], base_image)
+            groups.append({"name": key, **_turnaround_job(request, attachments, Path(entries[key]["output"]))})
+        job = {"action": "turnaround_batch", "groups": groups}
+    sequence["round"] = list(keys)
+    payload["failure_prefix"] = "부위별 순차 생성 실패: "
+    _start_worker(scene, job, api_key, f"부위별 순차 · {labels} 생성 중…", payload, _finish_part_sequence_round)
+
+
+def _finish_part_sequence_round(scene, value: dict, payload: dict) -> None:
+    """라운드 결과를 잘라 기록하고, 남은 그룹을 요청하거나 상태를 저장해 적용한다."""
+
+    settings = scene.uvmapping_settings
+    sequence = payload["part_sequence"]
+    layout = resolve_layout(sequence["layout"])
+    keys = list(sequence.get("round", ()))
+    if isinstance(value.get("groups"), list):
+        outputs = {str(item.get("name", "")): item for item in value["groups"] if isinstance(item, dict)}
+    else:
+        outputs = {keys[0]: {"ok": True, "output_path": value.get("output_path", "")}}
+    labels = {entry["key"]: entry["label"] for entry in sequence["groups"]}
+    failures = []
+    for key in keys:
+        item = outputs.get(key) or {}
+        path = Path(str(item.get("output_path", "")))
+        if not (item.get("ok") and str(path) and path.is_file()):
+            failures.append(f"{labels[key]}({item.get('error') or '결과 파일이 없습니다'})")
+            continue
+        crops = _crop_turnaround(path, layout)
+        sequence["results"][key] = {
+            "image_path": str(path),
+            "image_sha256": _file_sha256(path),
+            "views": {view: str(crop) for view, crop in crops.items()},
+            "view_sha256": {view: _file_sha256(crop) for view, crop in crops.items()},
+        }
+    if failures:
+        _record_failure(
+            settings,
+            f"부위별 순차 생성 실패: {', '.join(failures)}",
+            detail=", ".join(failures),
+            fallback=texture_errors.LOCAL,
+        )
+        return
+    remaining = [entry["key"] for entry in sequence["groups"] if entry["key"] not in sequence["results"]]
+    if remaining:
+        try:
+            with _bake_context(scene) as context:
+                api_key = resolve_api_key(context)
+            _launch_part_sequence_round(scene, payload, remaining, api_key)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            _record_failure(
+                settings,
+                f"몸통은 생성했지만 나머지 부위를 요청하지 못했습니다: {exc}",
+                detail=str(exc),
+                fallback=texture_errors.LOCAL,
+            )
+        return
+    state = _part_sequence_state(payload)
+    targets = _store_state(payload, state)
+    label = f"부위 {len(sequence['groups'])}개({', '.join(labels.values())})"
+    settings.texture_output_path = str(state["turnaround_path"])
+    settings.texture_status = f"{label} 생성 완료 · Diffuse/Albedo를 적용해 주세요"
+    if not settings.auto_apply_diffuse:
+        return
+    if len(targets) != len(payload["target_keys"]):
+        settings.texture_status = f"{label}는 생성됐지만 대상 객체가 바뀌어 자동 적용을 건너뜁니다."
+        return
+    try:
+        with _bake_context(scene) as context:
+            apply_diffuse(context, tuple(targets))
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _record_failure(
+            settings,
+            f"{label}는 생성됐지만 자동 적용 실패: {exc}",
+            detail=str(exc),
+            fallback=texture_errors.LOCAL,
+        )
+
+
+def regenerate_part_group(context, key: str, objects=None) -> None:
+    """부위별 순차 결과에서 한 부위만 다시 생성한다(호출 1회).
+
+    몸통이 아닌 부위는 지금 몸통 결과를 참조로 붙인다. 결과는 그 부위 기록만 바꾸고,
+    자동 적용이 켜져 있으면 바로 다시 굽는다.
+    """
+
+    settings = context.scene.uvmapping_settings
+    objects = _validated_texture_targets(context, objects)
+    try:
+        state = json.loads(objects[0][TEXTURE_DESIGN_STATE_PROPERTY])
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("다시 생성할 부위별 순차 결과가 없습니다.") from exc
+    if state.get("generation_mode") != PART_SEQUENCE_MODE:
+        raise ValueError("부위별 순차로 생성한 결과에서만 부위를 다시 생성할 수 있습니다.")
+    sequence = state["part_sequence"]
+    entry = next((item for item in sequence["groups"] if item["key"] == key), None)
+    if entry is None:
+        raise ValueError(f"{key} 부위가 이 결과에 없습니다.")
+    group = part_sequence.PART_GROUPS[_part_group_index(key)]
+    base = sequence["groups"][0]
+    base_image = Path(base["image_path"]) if base["key"] != key else None
+    stem = Path(entry["output"])
+    attempt = 1
+    output = stem.with_name(f"{stem.stem}_retry{attempt:02d}.png")
+    while output.exists():
+        attempt += 1
+        output = stem.with_name(f"{stem.stem}_retry{attempt:02d}.png")
+    references = (
+        [str(item["path"]) for item in state.get("references", ()) if isinstance(item, dict) and item.get("path")]
+        if settings.send_reference_images
+        else []
+    )
+    payload = {
+        "target_keys": tuple((obj.name, obj.session_uid) for obj in objects),
+        "target_names": tuple(obj.name for obj in objects),
+        "model": state["model"],
+        "analysis_payload": state.get("analysis"),
+        "user_prompt": state.get("user_prompt", ""),
+        "image_size": state.get("image_size") or DEFAULT_IMAGE_SIZE,
+        "quality": state.get("quality", ""),
+        "reference_image_paths": references,
+        "part_sequence": {"layout": sequence["layout"]},
+        "regenerate_key": key,
+        "state": state,
+        "failure_prefix": f"{group.label} 다시 생성 실패: ",
+    }
+    # 프롬프트의 부위 설명은 지금 규칙(PART_GROUPS)을 쓴다. 저장된 설명은 예전 것일 수 있다.
+    request, attachments = _part_sequence_request(payload, {**entry, "prompt_label": group.prompt_label}, base_image)
+    job = _turnaround_job(request, attachments, output)
+    _start_worker(
+        context.scene,
+        job,
+        resolve_api_key(context),
+        f"부위별 순차 · {group.label} 다시 생성 중…",
+        payload,
+        _finish_part_group_regeneration,
+    )
+
+
+def _finish_part_group_regeneration(scene, value: dict, payload: dict) -> None:
+    """다시 생성한 부위 그림을 잘라 상태의 그 부위 기록만 바꾸고 적용한다."""
+
+    settings = scene.uvmapping_settings
+    state = payload["state"]
+    sequence = state["part_sequence"]
+    key = payload["regenerate_key"]
+    path = Path(str(value["output_path"]))
+    crops = _crop_turnaround(path, resolve_layout(sequence["layout"]))
+    record = {
+        "image_path": str(path),
+        "image_sha256": _file_sha256(path),
+        "views": {view: str(crop) for view, crop in crops.items()},
+        "view_sha256": {view: _file_sha256(crop) for view, crop in crops.items()},
+    }
+    for entry in sequence["groups"]:
+        if entry["key"] == key:
+            entry.update(record)
+    if sequence["groups"][0]["key"] == key:
+        state.update(
+            {
+                "turnaround_path": record["image_path"],
+                "turnaround_sha256": record["image_sha256"],
+                "views": record["views"],
+                "view_sha256": record["view_sha256"],
+            }
+        )
+    state["status"] = "TURNAROUND_READY"
+    targets = _store_state(payload, state)
+    label = part_sequence.PART_GROUPS[_part_group_index(key)].label
+    settings.texture_status = f"{label} 다시 생성 완료 · Diffuse/Albedo를 적용해 주세요"
+    if not settings.auto_apply_diffuse or len(targets) != len(payload["target_keys"]):
+        return
+    try:
+        with _bake_context(scene) as context:
+            apply_diffuse(context, tuple(targets))
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _record_failure(
+            settings,
+            f"{label}는 다시 생성했지만 자동 적용 실패: {exc}",
+            detail=str(exc),
+            fallback=texture_errors.LOCAL,
+        )
+
+
+def _part_sequence_state(payload: dict) -> dict:
+    """부위별 순차 생성 결과 상태. 대표 시점 그림(views)은 첫 그룹(몸통) 것이다."""
+
+    sequence = payload["part_sequence"]
+    base = sequence["results"][sequence["groups"][0]["key"]]
+    return {
+        "schema_version": "1.3",
+        "status": "TURNAROUND_READY",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "provider": "openrouter",
+        "model": payload["model"],
+        "target_objects": payload["target_names"],
+        "source_jobs": payload["source_jobs"],
+        "projection": payload["projection"],
+        "references": payload["reference_state"],
+        "user_prompt": payload["user_prompt"],
+        "analysis": payload["analysis_payload"],
+        "generation_mode": PART_SEQUENCE_MODE,
+        "geometry_contact_sheet": sequence["groups"][0]["sheet"],
+        "geometry_sha256": _file_sha256(Path(sequence["groups"][0]["sheet"])),
+        "turnaround_path": base["image_path"],
+        "turnaround_sha256": base["image_sha256"],
+        "layout": sequence["layout"],
+        "image_size": payload.get("image_size", ""),
+        "quality": payload.get("quality", ""),
+        "attempt": 0,
+        "regeneration_feedback": [],
+        "views": base["views"],
+        "view_sha256": base["view_sha256"],
+        "part_sequence": {
+            "plan": sequence["plan"],
+            "layout": sequence["layout"],
+            "groups": [{**entry, **sequence["results"][entry["key"]]} for entry in sequence["groups"]],
+        },
+    }
+
+
+def _bake_part_sequence(
+    context,
+    objects: tuple,
+    part_state: Mapping,
+    output_path: Path,
+    resolution: int,
+    padding: int,
+    bake_settings: Mapping,
+    bake_kwargs: Mapping,
+) -> dict:
+    """그룹마다 그 부위 면만 그 그룹 그림으로 투영해 한 Atlas로 합친다."""
+
+    layers = []
+    created: list = []
+    try:
+        for entry in part_state.get("groups", ()):
+            views = {}
+            for view, path in dict(entry.get("views") or {}).items():
+                candidate = Path(str(path))
+                expected = (entry.get("view_sha256") or {}).get(view)
+                if not candidate.is_file() or (expected and _file_sha256(candidate) != expected):
+                    raise ValueError(f"{entry.get('label', '부위')} {view} 그림 파일이 없거나 생성 뒤 바뀌었습니다.")
+                views[str(view).upper()] = candidate
+            parts = _part_group_objects(context, objects, part_state["plan"], entry["key"])
+            created.extend(parts)
+            group_index = _part_group_index(entry["key"])
+            temporaries = tuple(temporary for temporary, _member in parts)
+            layers.append(
+                {
+                    "label": entry.get("label", ""),
+                    "objects": temporaries,
+                    "uv_layer_names": tuple(member["uv_layer"] for _temporary, member in parts),
+                    "views": views,
+                    "explode": (entry.get("projection") or {}).get("explode"),
+                    "band_groups": (
+                        {temporary.name: _group_attributes(member, group_index) for temporary, member in parts}
+                        if bake_settings.get("band_align", True)
+                        else None
+                    ),
+                }
+            )
+        return texture_bake.bake_layered_diffuse(
+            context, objects, layers, output_path, resolution, padding, **bake_kwargs
+        )
+    finally:
+        _remove_part_group_objects(created)
 
 
 def texture_verification_summary(context) -> dict | None:

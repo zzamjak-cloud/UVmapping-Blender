@@ -26,7 +26,7 @@ class BodyPartPreset:
     Attributes:
         kind: 저장·비교용 식별자
         label: 패널에 보이는 한국어 이름(기본 파츠 이름으로도 쓴다)
-        prompt_label: 생성 프롬프트에 넣는 영어 이름
+        prompt_label: 패널 설명에 함께 보이는 영어 이름
         part: 좌우를 뺀 부위 키(매칭 단어 표의 키)
         side: ``"L"``·``"R"`` 또는 좌우가 없는 부위면 ``""``
     """
@@ -219,13 +219,6 @@ def default_part_name(kind: str, existing_names, fallback_index: int) -> str:
     return f"{base}.{number:03d}"
 
 
-def prompt_label(kind: str, name: str) -> str:
-    """생성 프롬프트에 넣을 파츠 설명. 프리셋은 영어 이름, 사용자 지정은 입력한 이름."""
-
-    preset = preset_for_kind(kind)
-    return preset.prompt_label if preset else (name.strip() or "part")
-
-
 def duplicate_kinds(kinds) -> tuple[str, ...]:
     """같은 프리셋 종류가 두 번 이상 등록된 목록(사용자 지정은 제외)."""
 
@@ -240,83 +233,8 @@ def duplicate_kinds(kinds) -> tuple[str, ...]:
     return tuple(duplicates)
 
 
-CUSTOM_KEY_PREFIX = "CUSTOM:"
-
-
-def part_key(kind: str, name: str) -> str:
-    """파츠별 매핑 패스를 묶는 키.
-
-    여러 객체에 같은 종류(예: 머리)가 있으면 한 패스로 함께 투영한다. 사용자 지정
-    파츠는 이름(앞뒤 공백·대소문자 무시)이 같을 때만 묶는다.
-    """
-
-    if preset_for_kind(kind) is not None:
-        return kind
-    return f"{CUSTOM_KEY_PREFIX}{(name or '').strip().casefold()}"
-
-
-@dataclass(frozen=True)
-class PartPass:
-    """파츠별 매핑 한 번(호출 한 번)의 대상.
-
-    Attributes:
-        key: :func:`part_key` 결과
-        label: 패널·상태 줄에 보일 이름
-        prompt_label: 생성 프롬프트에 넣을 부위 설명
-        members: (객체 이름, 면 속성 이름) 목록
-    """
-
-    key: str
-    label: str
-    prompt_label: str
-    members: tuple[tuple[str, str], ...]
-
-
-def plan_part_passes(entries) -> tuple[PartPass, ...]:
-    """등록 파츠 목록을 패스 순서대로 묶는다.
-
-    Args:
-        entries: (객체 이름, 종류, 이름, 면 속성 이름) 반복 가능 객체. 면이 없는
-            파츠는 호출 측에서 미리 뺀다.
-
-    Returns:
-        프리셋 순서(머리 → 몸통 → … → 오른발) 다음 사용자 지정 파츠를 이름순으로
-        나열한 패스 목록
-    """
-
-    grouped: dict[str, list] = {}
-    labels: dict[str, tuple[str, str]] = {}
-    for object_name, kind, name, attr in entries:
-        key = part_key(kind, name)
-        grouped.setdefault(key, []).append((str(object_name), str(attr)))
-        if key not in labels:
-            preset = preset_for_kind(kind)
-            if preset is not None:
-                labels[key] = (preset.label, preset.prompt_label)
-            else:
-                labels[key] = ((name or "").strip() or "파츠", prompt_label(kind, name))
-    preset_order = {preset.kind: index for index, preset in enumerate(BODY_PART_PRESETS)}
-    ordered = sorted(
-        grouped,
-        key=lambda key: (0, preset_order[key], "") if key in preset_order else (1, 0, key),
-    )
-    return tuple(
-        PartPass(
-            key=key,
-            label=labels[key][0],
-            prompt_label=labels[key][1],
-            members=tuple(sorted(set(grouped[key]))),
-        )
-        for key in ordered
-    )
-
-
 __all__ = (
     "BODY_PART_PRESETS",
-    "CUSTOM_KEY_PREFIX",
-    "PartPass",
-    "part_key",
-    "plan_part_passes",
     "BodyPartPreset",
     "CUSTOM_KIND",
     "default_part_name",
@@ -326,5 +244,4 @@ __all__ = (
     "match_body_part",
     "next_unregistered_kind",
     "preset_for_kind",
-    "prompt_label",
 )

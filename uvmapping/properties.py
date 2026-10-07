@@ -32,8 +32,6 @@ from .texture_presets import (
 
 # 투영 블렌딩 기본값. 패널 기본값과 상태에 값이 없을 때의 대체값을 한곳에서 정한다.
 DEFAULT_DOMINANT_VIEW_BLEND = True
-# 파츠별 매핑 경계에서 전신 결과와 섞는 폭(모델 크기 대비 %).
-DEFAULT_PART_BLEND_PERCENT = 4.0
 
 
 def addon_module_id() -> str:
@@ -290,7 +288,9 @@ class UVMAPPING_PG_settings(PropertyGroup):
         description=(
             "SINGLE은 모든 시점을 한 장에 담아 한 번만 호출합니다. "
             "SEQUENTIAL은 시점을 하나씩 생성하며 앞 시점의 투영 결과를 다음 가이드로 넘겨 "
-            "시점 간 색·무늬 일관성을 높이지만, 시점 수만큼 호출하므로 비용이 N배입니다"
+            "시점 간 색·무늬 일관성을 높이지만, 시점 수만큼 호출하므로 비용이 N배입니다. "
+            "PART_SEQUENCE는 등록 파츠를 머리·몸통, 팔·다리로 묶어 부위마다 그 부위만 있는 "
+            "6면도를 생성합니다(최대 2회)"
         ),
         items=(
             ("SINGLE", "한 번 호출 · 다면도 한 장", "모든 시점을 한 캔버스에 담아 1회 호출"),
@@ -298,6 +298,11 @@ class UVMAPPING_PG_settings(PropertyGroup):
                 "SEQUENTIAL",
                 "순차 인페인팅 · 시점 수만큼 호출",
                 "시점마다 1회씩 호출해 앞 시점의 채색을 유지한 채 빈 곳만 채움 · 비용 N배",
+            ),
+            (
+                "PART_SEQUENCE",
+                "부위별 순차 · 머리·몸통 → 팔·다리 최대 2회",
+                "머리·몸통을 먼저 생성하고 팔·다리를 그 그림에 맞춰 생성 · 부위끼리 가림 없음 · 매핑 파츠 필요",
             ),
         ),
         default="SINGLE",
@@ -382,6 +387,15 @@ class UVMAPPING_PG_settings(PropertyGroup):
         description="두 시점이 함께 보는 면의 평균색을 비교해 측면·뒷면의 밝기와 색조를 정면 기준으로 맞춥니다",
         default=True,
     )
+    band_align: BoolProperty(
+        name="시점 간 띠 높이 맞춤",
+        description=(
+            "두 시점이 함께 보는 면에서 측면·뒷면 그림을 위아래로 옮겨 정면과 맞춥니다. "
+            "AI가 시점마다 벨트·소매 띠를 조금 다른 높이에 그려도 모델에서 한 바퀴 정확히 이어집니다. "
+            "색을 섞지 않고 그림 위치만 옮기며, 등록 파츠마다 따로 맞춥니다"
+        ),
+        default=True,
+    )
     silhouette_warp: BoolProperty(
         name="실루엣 행 워프 (실험적)",
         description=(
@@ -392,25 +406,15 @@ class UVMAPPING_PG_settings(PropertyGroup):
         default=False,
     )
     part_mapping: BoolProperty(
-        name="파츠별 매핑",
+        name="파츠 분해도 생성",
         description=(
-            "전신 다면도를 투영한 뒤, 등록한 매핑 파츠마다 다른 부위를 숨기고 파츠만 다시 "
-            "생성해 그 면에 투영합니다. 팔에 가린 옆구리, 다리 안쪽처럼 전신 시점에서 "
-            "보이지 않던 면이 실제 그림으로 채워집니다. 파츠마다 OpenRouter 호출이 1회 늘어납니다"
+            "등록한 매핑 파츠를 시점마다 서로 가리지 않게 벌려 놓은 분해도로 다면도를 생성하고, "
+            "벌린 만큼 되돌려 투영합니다. 팔에 가린 옆구리, 다리 안쪽처럼 전신 시점에서 보이지 "
+            "않던 면도 한 번의 생성으로 채워집니다. OpenRouter 호출 수는 늘지 않습니다. "
+            "등록된 파츠가 없으면 원래 자세 그대로 생성합니다"
         ),
-        default=False,
-    )
-    part_blend_percent: FloatProperty(
-        name="파츠 경계 혼합 폭(%)",
-        description=(
-            "파츠 경계에서 이 거리(모델 크기 대비 %) 안쪽은 전신 결과와 섞어 이음새를 숨깁니다. "
-            "0이면 경계에서 바로 파츠 결과로 바뀝니다"
-        ),
-        default=DEFAULT_PART_BLEND_PERCENT,
-        min=0.0,
-        max=15.0,
-        step=50,
-        precision=1,
+        # 파츠를 등록했다면 파츠 기준으로 생성하려는 의도이므로 기본으로 켠다.
+        default=True,
     )
     target_objects: CollectionProperty(
         name="대상 객체",
@@ -537,7 +541,6 @@ class UVMAPPING_PG_settings(PropertyGroup):
 
 __all__ = (
     "DEFAULT_DOMINANT_VIEW_BLEND",
-    "DEFAULT_PART_BLEND_PERCENT",
     "GPT_IMAGE_25_FLARE_MODELS",
     "GPT_IMAGE_25_SUNBURST_MODELS",
     "GPT_IMAGE_MODELS",

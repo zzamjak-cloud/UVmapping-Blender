@@ -40,9 +40,12 @@ _VIEW_LABELS = {
 }
 _VIEW_DESCRIPTIONS = {
     "FRONT": "FRONT는 정면에서 본 모습입니다.",
-    "RIGHT": "RIGHT SIDE는 모델의 오른쪽 측면에서 본 모습입니다.",
+    "RIGHT": "RIGHT SIDE는 모델의 오른쪽 측면에서 본 모습이며, 모델의 앞(얼굴·가슴 쪽)이 화면 왼쪽, 등이 화면 오른쪽을 향합니다.",
     "BACK": "BACK은 뒷면에서 본 모습입니다.",
-    "LEFT": "LEFT SIDE는 모델의 왼쪽 측면에서 본 모습이며 RIGHT SIDE의 단순 좌우 반전이 아니라 실제 왼쪽 면입니다.",
+    "LEFT": (
+        "LEFT SIDE는 모델의 왼쪽 측면에서 본 모습이며 RIGHT SIDE의 단순 좌우 반전이 아니라 실제 왼쪽 면입니다. "
+        "모델의 앞(얼굴·가슴 쪽)이 화면 오른쪽, 등이 화면 왼쪽을 향합니다."
+    ),
     "TOP": "TOP은 모델 바로 위에서 내려다본 모습이며 정면(FRONT)이 아래쪽, 오른쪽(RIGHT)이 오른쪽에 옵니다.",
     "BOTTOM": "BOTTOM은 모델 바로 아래에서 올려다본 모습이며 정면(FRONT)이 위쪽, 오른쪽(RIGHT)이 오른쪽에 옵니다.",
 }
@@ -888,6 +891,64 @@ def _shape_contract(guide_line: str) -> str:
     )
 
 
+def _exploded_layout_section(pieces: Mapping[str, int], views: Sequence[str]) -> str:
+    """가이드가 파츠를 벌려 놓은 분해도일 때의 배치 계약.
+
+    형상 계약(실루엣 유지)이 그대로 적용되므로, 조각을 다시 붙이거나 모으지 말고
+    떨어진 자리 그대로 칠하라고 못 박는다. 조각 사이 연속성은 색으로만 잇는다.
+    ``pieces``는 시점 → 그 칸에 보이는 떨어진 조각 수다. 이미지 모델이 측면 팔을
+    몸통에 다시 붙이거나 조각을 빼먹는 일이 있어 칸마다 개수를 못 박는다.
+    """
+
+    counted = [
+        f"{_VIEW_LABELS[view]} {int(pieces[view])}개"
+        for view in (str(item).upper() for item in views)
+        if view in pieces and view in _VIEW_LABELS
+    ]
+    count_line = (
+        f"- 칸별 회색 조각 수: {', '.join(counted)}. 결과의 각 칸도 정확히 같은 수의 떨어진 조각이어야 합니다. "
+        "조각을 하나라도 빼먹거나, 다른 조각에 다시 붙이거나, 몸통 안으로 겹쳐 그리지 않습니다.\n"
+        if counted
+        else ""
+    )
+    return (
+        "분해도 배치(형상 계약과 함께 적용):\n"
+        "- 첫 번째 이미지의 회색 모델은 하나의 캐릭터를 부위별 조각(머리, 몸통, 팔, 손, 다리, 발 등)으로 나눠, "
+        "각 시점에서 서로 가리지 않도록 옆으로 벌려 놓은 분해도(exploded view)입니다. "
+        "실제로는 모든 조각이 이어져 있는 한 캐릭터입니다. 위·아래 시점은 벌리지 않은 원래 자세 그대로입니다.\n"
+        "- 각 조각은 놓인 자리, 크기, 방향 그대로 채색합니다. 조각을 다시 붙이거나 옮기거나 빈틈을 메우지 않으며, "
+        "조각 사이의 빈 공간은 배경으로 남깁니다.\n"
+        f"{count_line}"
+        "- 조각마다 잘린 단면이나 구멍이 보여도 새 부품을 그려 넣지 않고 배경으로 둡니다.\n"
+        "- 조각이 맞닿는 경계(목, 어깨, 손목, 허리, 발목)의 색과 무늬는 상대 조각과 같은 위치에서 그대로 이어지게 칠합니다. "
+        "벨트, 소매 끝, 줄무늬처럼 둘레를 감싸는 디자인은 몸통 옆면과 팔·다리 안쪽까지 끊기지 않게 한 바퀴 이어 그립니다.\n"
+        "- 다른 조각에 가려 평소에는 보이지 않는 면(옆구리, 팔 안쪽, 다리 안쪽)도 실제 표면이므로 주변과 같은 디자인으로 빠짐없이 채색합니다."
+    )
+
+
+def _part_focus_section(part_label: str, base_reference: bool) -> str:
+    """부위별 순차 생성에서 가이드에 그 부위만 있다는 계약과, 먼저 완성한 몸통을 따르라는 지시."""
+
+    lines = [
+        "부위 단독 다면도(형상 계약과 함께 적용):",
+        f"- 첫 번째 이미지에는 같은 캐릭터의 '{part_label}'만 있습니다. 나머지 부위는 숨겨져 있으므로 새로 그려 넣지 않습니다.",
+        "- 잘린 단면이나 구멍(목, 어깨, 손목, 허리, 골반, 발목)은 다른 부위와 이어지는 자리입니다. "
+        "구멍 안은 배경으로 남기고, 그 둘레의 색은 연결될 부위와 이어지게 단순하게 칠합니다.",
+        "- 이 부위가 화면을 크게 채우므로 무늬와 부품을 또렷하게 그리되, 같은 높이의 띠·벨트·소매 끝은 "
+        "모든 시점에서 정확히 같은 높이와 두께로 그립니다.",
+        "- 각 칸의 시점을 지킵니다. FRONT 칸은 캐릭터의 앞, BACK 칸은 뒤입니다. 얼굴·바이저·가슴 장식처럼 "
+        "앞을 향한 디자인은 FRONT 칸에 보이는 쪽에, 뒤통수·등 장비는 BACK 칸에 보이는 쪽에 그립니다.",
+    ]
+    if base_reference:
+        lines.append(
+            "- 두 번째 입력 이미지는 같은 캐릭터의 머리와 몸통을 먼저 완성한 다면도입니다. 팔레트, 재질 표현, 무늬 스타일을 "
+            "이 이미지와 일치시키고, 몸통과 맞닿는 연결부(어깨, 골반)의 색과 띠는 몸통 그림의 같은 위치에 있는 "
+            "색과 띠를 그대로 이어 받습니다. 몸통 그림은 색과 스타일의 기준일 뿐이므로, 몸통의 외곽 모양·구멍·"
+            "가슴 패널을 이 부위에 옮겨 그리지 않고 첫 번째 이미지의 형상 그대로 이 부위답게 칠합니다."
+        )
+    return "\n".join(lines)
+
+
 def _common_output_rules() -> str:
     """레이아웃과 무관하게 모든 생성 결과에 적용하는 출력 규칙."""
 
@@ -895,7 +956,7 @@ def _common_output_rules() -> str:
         "- 원근을 제거한 orthographic view처럼 표현하고 물체가 잘리지 않게 충분한 여백을 둡니다.\n"
         "- 조명 사진이나 렌더가 아니라 diffuse/albedo에 옮길 수 있는 손으로 그린 색과 명암을 표현합니다. "
         "강한 그림자, 하이라이트, 반사는 넣지 않습니다.\n"
-        "- 배경은 투명 또는 완전히 균일한 단색으로 만듭니다.\n"
+        "- 배경은 완전히 균일한 순백(#FFFFFF) 단색으로 칠합니다. 투명 배경이나 투명을 흉내 낸 회색 체크무늬를 그리지 않습니다.\n"
         "- 텍스트, 라벨, 구분선, 숫자, 로고, 워터마크, 받침대, 그림자는 넣지 않습니다."
     )
 
@@ -1003,6 +1064,9 @@ def compile_turnaround_prompt(
     layout: TurnaroundLayout | str | None = None,
     regeneration_feedback: Sequence[str] = (),
     front_reference: bool = False,
+    exploded_pieces: Mapping[str, int] | None = None,
+    part_focus: str | None = None,
+    base_reference: bool = False,
 ) -> str:
     """모델 형상과 참조 스타일(또는 프롬프트만)을 한 장의 그리드 시점도에 결합하도록 지시한다.
 
@@ -1011,7 +1075,10 @@ def compile_turnaround_prompt(
     ``layout``이 ``None``이면 3열 21:9 레이아웃이다. ``regeneration_feedback``에
     시점 이름이 있으면 그 시점의 실루엣 불일치를 교정하는 문단을 덧붙인다.
     ``front_reference``가 참이면 두 번째 입력 이미지가 앞 라운드의 FRONT 완성본이라고
-    보고 색 기준 문단을 넣고 사용자 참조 번호를 한 칸 민다.
+    보고 색 기준 문단을 넣고 사용자 참조 번호를 한 칸 민다. ``exploded_pieces``(시점 →
+    떨어진 조각 수)가 있으면 가이드가 파츠를 벌려 놓은 분해도라고 알리는 문단을 형상
+    계약 바로 뒤에 넣는다. ``part_focus``는 부위별 순차 생성에서 가이드에 담긴 부위
+    설명이고, ``base_reference``가 참이면 참조 첫 장을 먼저 완성한 몸통 다면도로 소개한다.
     """
 
     resolved_layout = resolve_layout(layout)
@@ -1025,6 +1092,12 @@ def compile_turnaround_prompt(
         front_reference=front_reference,
     )
     front_section = f"\n{_front_color_reference_section()}\n" if front_reference else ""
+    exploded_section = (
+        f"\n{_exploded_layout_section(exploded_pieces, resolved_layout.views)}\n" if exploded_pieces else ""
+    )
+    if part_focus:
+        # 부위별 순차 생성: 그 부위만 있는 가이드라는 계약을 분해도 문단 앞에 둔다.
+        exploded_section = f"\n{_part_focus_section(part_focus, base_reference)}\n{exploded_section}"
     view_count = len(resolved_layout.views)
     if view_count == 1:
         title_noun = "단일 시점도"
@@ -1038,7 +1111,7 @@ def compile_turnaround_prompt(
 {role_section}
 
 {_shape_contract("첫 번째 이미지는 흰 배경 위의 회색 3D 모델입니다.")}
-{front_section}
+{exploded_section}{front_section}
 {feedback_section}{style_section}
 
 사용자 한 줄 지시:
@@ -1058,6 +1131,7 @@ def compile_sequential_view_prompt(
     view: str,
     painted_views: tuple[str, ...] = (),
     reference_image_count: int = 0,
+    exploded_pieces: Mapping[str, int] | None = None,
 ) -> str:
     """순차 생성 모드에서 한 시점을 채색(또는 미채색 영역만 보완)하도록 지시한다.
 
@@ -1091,6 +1165,9 @@ def compile_sequential_view_prompt(
     role_section, style_section = _style_sections(
         analysis, user_prompt, reference_image_count, guide_description
     )
+    exploded_section = (
+        f"\n{_exploded_layout_section(exploded_pieces, layout.views)}\n" if exploded_pieces else ""
+    )
     return f"""캐주얼 게임용 스타일리시 손맵 diffuse/albedo 제작을 위한 단일 시점 채색 한 장을 생성하세요.
 {task_line}
 
@@ -1098,7 +1175,7 @@ def compile_sequential_view_prompt(
 {role_section}
 
 {_shape_contract(guide_line)}
-
+{exploded_section}
 시점 설명:
 - {_VIEW_DESCRIPTIONS[view_name]}
 
@@ -1128,11 +1205,17 @@ def build_turnaround_request(
     painted_views: tuple[str, ...] = (),
     regeneration_feedback: Sequence[str] = (),
     front_reference: bool = False,
+    exploded_pieces: Mapping[str, int] | None = None,
+    part_focus: str | None = None,
+    base_reference: bool = False,
 ) -> TurnaroundImageRequest:
     """비용 계약이 고정된 단일 이미지 요청을 만든다.
 
     ``layout_name``이 SINGLE_VIEW면 ``view``가 필수이며 순차 생성용 프롬프트를 쓴다.
     ``regeneration_feedback``은 그리드 레이아웃 재생성 때 불일치 시점 이름을 넘긴다.
+    ``exploded_pieces``는 형상 가이드가 분해도일 때 시점별 떨어진 조각 수다.
+    ``part_focus``·``base_reference``는 부위별 순차 생성용이다(:func:`compile_turnaround_prompt`).
+    ``base_reference``가 참이면 참조 목록의 첫 장이 먼저 완성한 몸통 다면도여야 한다.
     """
 
     if layout_name.upper() == SINGLE_VIEW_LAYOUT_NAME:
@@ -1145,12 +1228,13 @@ def build_turnaround_request(
             view=layout.views[0],
             painted_views=painted_views,
             reference_image_count=len(reference_images),
+            exploded_pieces=exploded_pieces,
         )
     else:
         layout = resolve_layout(layout_name)
-        palette_reference_count = len(reference_images) - (1 if front_reference else 0)
+        palette_reference_count = len(reference_images) - (1 if front_reference or base_reference else 0)
         if palette_reference_count < 0:
-            raise ValueError("FRONT 색 참조를 쓰려면 참조 이미지 목록의 첫 장이 그 참조여야 합니다.")
+            raise ValueError("FRONT·몸통 참조를 쓰려면 참조 이미지 목록의 첫 장이 그 참조여야 합니다.")
         prompt = compile_turnaround_prompt(
             analysis,
             user_instruction,
@@ -1158,109 +1242,10 @@ def build_turnaround_request(
             layout=layout,
             regeneration_feedback=regeneration_feedback,
             front_reference=front_reference,
+            exploded_pieces=exploded_pieces,
+            part_focus=part_focus,
+            base_reference=base_reference,
         )
-    return TurnaroundImageRequest(
-        prompt=prompt,
-        contact_sheet=contact_sheet,
-        reference_images=tuple(reference_images),
-        model=model,
-        aspect_ratio=layout.aspect_ratio,
-        image_size=image_size,
-        quality=quality,
-        views=layout.views,
-        layout_name=layout.name,
-    )
-
-
-# 파츠별 매핑 한 번에 보낼 수 있는 최대 파츠 수(파츠당 Provider 1회 호출).
-MAX_PART_PASSES = 12
-
-
-def part_refine_layout_name(views: Sequence[str]) -> str:
-    """파츠별 매핑 캔버스 레이아웃. 본 생성이 상·하면까지 그렸으면 6면, 아니면 3면."""
-
-    return "SIX" if "TOP" in {str(view).upper() for view in views} else "THREE"
-
-
-def compile_part_refine_prompt(
-    analysis: ReferenceAnalysis | Mapping[str, Any] | None,
-    user_prompt: str = "",
-    *,
-    part_label: str,
-    layout: TurnaroundLayout | str,
-    reference_image_count: int = 0,
-) -> str:
-    """다른 부위를 숨긴 파츠 하나를 다시 채색하도록 지시한다.
-
-    가이드는 전신 생성 결과를 그 파츠에만 입혀 파츠 단독으로 렌더한 것이다. 전신
-    시점에서 다른 부위에 가려 보이지 않던 면은 회색으로 남아 있으므로, 색이 있는
-    곳은 디자인을 유지하며 다듬고 회색 영역만 주변과 이어지게 새로 칠하게 한다.
-    """
-
-    resolved_layout = resolve_layout(layout)
-    instruction = user_prompt.strip() or "추가 지시 없음"
-    part = part_label.strip() or "part"
-    guide_description = (
-        f"같은 캐릭터의 '{part}' 부위만 남기고 나머지 부위를 숨긴 실제 3D 모델이며, "
-        "전신 채색 결과가 입혀져 있습니다."
-    )
-    guide_line = (
-        f"첫 번째 이미지는 같은 캐릭터에서 '{part}' 부위만 분리해 각 시점에서 본 모습입니다. "
-        "색이 있는 영역은 전신 채색에서 정해진 디자인이고, 회색 영역은 전신 시점에서 다른 부위에 "
-        "가려 보이지 않던 면입니다."
-    )
-    role_section, style_section = _style_sections(
-        analysis, user_prompt, reference_image_count, guide_description
-    )
-    return f"""캐주얼 게임용 스타일리시 손맵 diffuse/albedo 제작을 위해, 분리된 부위 하나의 다면도 한 장을 다시 채색하세요.
-대상 부위: {part}
-
-입력 이미지 역할:
-{role_section}
-
-{_shape_contract(guide_line)}
-
-부위 재채색 계약:
-- 색이 있는 영역의 팔레트, 각 부위의 색상과 명도, 무늬, 재질 경계는 그대로 유지하며 번짐·늘어짐·얼룩만 깔끔하게 다듬습니다.
-- 회색 영역은 비어 있는 곳이 아니라 칠해야 할 실제 표면입니다. 인접한 색·무늬·명암과 자연스럽게 이어지도록 빠짐없이 채색합니다.
-- 이 부위는 몸의 다른 부위와 이어지는 경계가 있습니다. 경계 근처의 색은 입력 이미지의 색을 그대로 따라 다른 부위와 어긋나지 않게 합니다.
-- 숨겨진 다른 부위를 새로 그려 넣지 않습니다. 보이는 부위만 채색합니다.
-
-{style_section}
-
-사용자 한 줄 지시:
-{instruction}
-
-출력 계약:
-- Provider 호출 한 번에서 최종 이미지 정확히 한 장만 생성합니다.
-{_layout_output_contract(resolved_layout)}
-{_common_output_rules()}"""
-
-
-def build_part_refine_request(
-    contact_sheet: InlineImage,
-    reference_images: Sequence[InlineImage],
-    analysis: ReferenceAnalysis | Mapping[str, Any] | None,
-    user_instruction: str = "",
-    *,
-    part_label: str,
-    model: str = DEFAULT_IMAGE_MODEL,
-    layout_name: str = DEFAULT_LAYOUT_NAME,
-    image_size: str = DEFAULT_IMAGE_SIZE,
-    quality: str | None = None,
-) -> TurnaroundImageRequest:
-    """파츠 하나를 다시 채색하는 단일 캔버스 요청. 비용 계약은 다면도 요청과 같다."""
-
-    layout = resolve_layout(layout_name)
-    if layout.name not in TURNAROUND_LAYOUTS:
-        raise ValueError("파츠별 매핑은 3면 또는 6면 단일 캔버스만 지원합니다.")
-    prompt = compile_part_refine_prompt(
-        analysis,
-        user_instruction,
-        part_label=part_label,
-        layout=layout,
-        reference_image_count=len(reference_images),
-    )
     return TurnaroundImageRequest(
         prompt=prompt,
         contact_sheet=contact_sheet,
@@ -1356,6 +1341,7 @@ def build_turnaround_batch_request(
     quality: str | None = None,
     front_reference: InlineImage | None = None,
     regeneration_feedback: Mapping[str, Sequence[str]] | None = None,
+    exploded_pieces: Mapping[str, int] | None = None,
 ) -> TurnaroundBatchRequest:
     """구성의 그룹마다 요청 하나씩을 만들어 묶는다.
 
@@ -1395,6 +1381,7 @@ def build_turnaround_batch_request(
                 quality=quality,
                 regeneration_feedback=feedback.get(group.name, ()),
                 front_reference=use_front,
+                exploded_pieces=exploded_pieces,
             )
         )
     return TurnaroundBatchRequest(resolved.name, tuple(requests))
