@@ -72,6 +72,15 @@
       "size": 191033,
       "sha256": "3012b79c5bcd3f59c0aa3e59a11c49131f8ea780d22e0dbbef80fdad21dc97db",
       "target_commit": "2da166f72d61370175a74dfd85a2ee598d687bc9"
+    },
+    {
+      "tag": "v2.7.0",
+      "version": "2.7.0",
+      "asset_name": "uvmapping_blender-v2.7.0.zip",
+      "url": "https://github.com/zzamjak-cloud/UVmapping-Blender/releases/download/v2.7.0/uvmapping_blender-v2.7.0.zip",
+      "size": 210004,
+      "sha256": "c4e2acabbcb685ea48d38903f846094551e06b81826acd256c583d34a3675d2d",
+      "target_commit": "3744eea3cf8fb2c3af35a71bdf867b054ec0680f"
     }
   ]
 }
